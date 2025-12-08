@@ -149,12 +149,6 @@ focused: bool = true,
 /// Used to determine whether to continuously scroll.
 selection_scroll_active: bool = false,
 
-/// True if the surface is in read-only mode. When read-only, no input
-/// is sent to the PTY but terminal-level operations like selections,
-/// (native) scrolling, and copy keybinds still work. Warn before quit is
-/// always enabled in this state.
-readonly: bool = false,
-
 /// Used to send notifications that long running commands have finished.
 /// Requires that shell integration be active. Should represent a nanosecond
 /// precision timestamp. It does not necessarily need to correspond to the
@@ -620,32 +614,60 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env internal_os.getEnvMap(alloc) catch
-                std.process.EnvMap.init(alloc);
+        // Determine which backend to use based on the runtime surface.
+        // Embedded surfaces can specify an external backend for SSH/serial.
+        const uses_external = if (@hasDecl(apprt.runtime.Surface, "usesExternalBackend"))
+            rt_surface.usesExternalBackend()
+        else
+            false;
+
+        // Initialize the appropriate backend
+        var io_backend: termio.Backend = if (uses_external) backend: {
+            // Use external backend (SSH, serial, etc.)
+            if (@hasDecl(apprt.runtime.Surface, "getTermioBackend")) {
+                break :backend try rt_surface.getTermioBackend(alloc);
+            } else {
+                return error.ExternalBackendNotSupported;
+            }
+        } else backend: {
+            // Use exec backend (subprocess with PTY)
+            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                // If an error occurs, we don't want to block surface startup.
+                log.warn("error getting env map for surface err={}", .{err});
+                break :env internal_os.getEnvMap(alloc) catch
+                    std.process.EnvMap.init(alloc);
+            };
+            errdefer env.deinit();
+
+            // don't leak GHOSTTY_LOG to any subprocesses
+            env.remove("GHOSTTY_LOG");
+
+            const io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = config.@"working-directory",
+                .resources_dir = global_state.resources_dir.host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+
+                // Get the cgroup if we're on linux and have the decl. I'd love
+                // to change this from a decl to a surface options struct because
+                // then we can do memory management better (don't need to retain
+                // the string around).
+                .linux_cgroup = if (comptime builtin.os.tag == .linux and
+                    @hasDecl(apprt.runtime.Surface, "cgroup"))
+                    rt_surface.cgroup()
+                else
+                    Command.linux_cgroup_default,
+            });
+            break :backend .{ .exec = io_exec };
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        env.remove("GHOSTTY_LOG");
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = config.@"working-directory",
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        errdefer io_backend.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -655,7 +677,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = io_backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -836,30 +858,6 @@ inline fn surfaceMailbox(self: *Surface) Mailbox {
     };
 }
 
-/// Queue a message for the IO thread.
-///
-/// We centralize all our logic into this spot so we can intercept
-/// messages for example in readonly mode.
-fn queueIo(
-    self: *Surface,
-    msg: termio.Message,
-    mutex: termio.Termio.MutexState,
-) void {
-    // In readonly mode, we don't allow any writes through to the pty.
-    if (self.readonly) {
-        switch (msg) {
-            .write_small,
-            .write_stable,
-            .write_alloc,
-            => return,
-
-            else => {},
-        }
-    }
-
-    self.io.queueMessage(msg, mutex);
-}
-
 /// Forces the surface to render. This is useful for when the surface
 /// is in the middle of animation (such as a resize, etc.) or when
 /// the render timer is managed manually by the apprt.
@@ -893,7 +891,7 @@ pub fn activateInspector(self: *Surface) !void {
 
     // Notify our components we have an inspector active
     _ = self.renderer_thread.mailbox.push(.{ .inspector = true }, .{ .forever = {} });
-    self.queueIo(.{ .inspector = true }, .unlocked);
+    self.io.queueMessage(.{ .inspector = true }, .unlocked);
 }
 
 /// Deactivate the inspector and stop collecting any information.
@@ -910,7 +908,7 @@ pub fn deactivateInspector(self: *Surface) void {
 
     // Notify our components we have deactivated inspector
     _ = self.renderer_thread.mailbox.push(.{ .inspector = false }, .{ .forever = {} });
-    self.queueIo(.{ .inspector = false }, .unlocked);
+    self.io.queueMessage(.{ .inspector = false }, .unlocked);
 
     // Deinit the inspector
     insp.deinit(self.alloc);
@@ -921,9 +919,6 @@ pub fn deactivateInspector(self: *Surface) void {
 /// True if the surface requires confirmation to quit. This should be called
 /// by apprt to determine if the surface should confirm before quitting.
 pub fn needsConfirmQuit(self: *Surface) bool {
-    // If the surface is in read-only mode, always require confirmation
-    if (self.readonly) return true;
-
     // If the child has exited, then our process is certainly not alive.
     // We check this first to avoid the locking overhead below.
     if (self.child_exited) return false;
@@ -982,7 +977,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             // We always use an allocating message because we don't know
             // the length of the title and this isn't a performance critical
             // path.
-            self.queueIo(.{
+            self.io.queueMessage(.{
                 .write_alloc = .{
                     .alloc = self.alloc,
                     .data = data,
@@ -1031,7 +1026,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 return;
             }
 
-            _ = try self.startClipboardRequest(.standard, .{ .osc_52_read = clipboard });
+            try self.startClipboardRequest(.standard, .{ .osc_52_read = clipboard });
         },
 
         .clipboard_write => |w| switch (w.req) {
@@ -1172,7 +1167,7 @@ fn selectionScrollTick(self: *Surface) !void {
     // If our screen changed while this is happening, we stop our
     // selection scroll.
     if (self.mouse.left_click_screen != t.screens.active_key) {
-        self.queueIo(
+        self.io.queueMessage(
             .{ .selection_scroll = false },
             .locked,
         );
@@ -1225,7 +1220,7 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
             break :gui false;
         }) return;
 
-        // If a native GUI notification was not shown, update our terminal to
+        // If a native GUI notification was not showm. update our terminal to
         // note the abnormal exit.
         self.childExitedAbnormally(info) catch |err| {
             log.err("error handling abnormal child exit err={}", .{err});
@@ -1235,7 +1230,7 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
         return;
     }
 
-    // We output a message so that the user knows what's going on and
+    // We output a message so that the user knows whats going on and
     // doesn't think their terminal just froze. We show this unconditionally
     // on close even if `wait_after_command` is false and the surface closes
     // immediately because if a user does an `undo` to restore a closed
@@ -1291,6 +1286,8 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+        // External backend has no subprocess command
+        .external => &[_][]const u8{"(external)"},
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
@@ -1765,7 +1762,7 @@ pub fn updateConfig(
     errdefer termio_config_ptr.deinit();
 
     _ = self.renderer_thread.mailbox.push(renderer_message, .{ .forever = {} });
-    self.queueIo(.{
+    self.io.queueMessage(.{
         .change_config = .{
             .alloc = self.alloc,
             .ptr = termio_config_ptr,
@@ -2354,7 +2351,7 @@ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
     self.balancePaddingIfNeeded();
 
     // Notify the terminal
-    self.queueIo(.{ .resize = self.size }, .unlocked);
+    self.io.queueMessage(.{ .resize = self.size }, .unlocked);
 
     // Update our terminal default size if necessary.
     self.recomputeInitialSize() catch |err| {
@@ -2457,7 +2454,7 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     }
 
     // Mail the IO thread
-    self.queueIo(.{ .resize = self.size }, .unlocked);
+    self.io.queueMessage(.{ .resize = self.size }, .unlocked);
 }
 
 /// Recalculate the balanced padding if needed.
@@ -2762,7 +2759,7 @@ pub fn keyCallback(
         }
 
         errdefer write_req.deinit();
-        self.queueIo(switch (write_req) {
+        self.io.queueMessage(switch (write_req) {
             .small => |v| .{ .write_small = v },
             .stable => |v| .{ .write_stable = v },
             .alloc => |v| .{ .write_alloc = v },
@@ -2830,20 +2827,13 @@ fn maybeHandleBinding(
 
             // No entry found. We need to encode everything up to this
             // point and send to the pty since we're in a sequence.
-
-            // We ignore modifiers so that nested sequences such as
+            //
+            // We also ignore modifiers so that nested sequences such as
             // ctrl+a>ctrl+b>c work.
-            if (event.key.modifier()) return null;
-
-            // If we have a catch-all of ignore, then we special case our
-            // invalid sequence handling to ignore it.
-            if (self.catchAllIsIgnore()) {
-                self.endKeySequence(.drop, .retain);
-                return .ignored;
+            if (!event.key.modifier()) {
+                // Encode everything up to this point
+                self.endKeySequence(.flush, .retain);
             }
-
-            // Encode everything up to this point
-            self.endKeySequence(.flush, .retain);
 
             return null;
         }
@@ -3051,34 +3041,6 @@ fn deactivateAllKeyTables(self: *Surface) !bool {
     return true;
 }
 
-/// This checks if the current keybinding sets have a catch_all binding
-/// with `ignore`. This is used to determine some special input cases.
-fn catchAllIsIgnore(self: *Surface) bool {
-    // Get our catch all
-    const entry: input.Binding.Set.Entry = entry: {
-        const trigger: input.Binding.Trigger = .{ .key = .catch_all };
-
-        const table_items = self.keyboard.table_stack.items;
-        for (0..table_items.len) |i| {
-            const rev_i: usize = table_items.len - 1 - i;
-            const entry = table_items[rev_i].set.get(trigger) orelse continue;
-            break :entry entry;
-        }
-
-        break :entry self.config.keybind.set.get(trigger) orelse
-            return false;
-    };
-
-    // We have a catch-all entry, see if its an ignore
-    return switch (entry.value_ptr.*) {
-        .leader => false,
-        .leaf => |leaf| leaf.action == .ignore,
-        .leaf_chained => |leaf| chained: for (leaf.actions.items) |action| {
-            if (action == .ignore) break :chained true;
-        } else false,
-    };
-}
-
 const KeySequenceQueued = enum { flush, drop };
 const KeySequenceMemory = enum { retain, free };
 
@@ -3107,26 +3069,23 @@ fn endKeySequence(
     // the set we look at to the root set.
     self.keyboard.sequence_set = null;
 
-    // If we have no queued data, there is nothing else to do.
-    if (self.keyboard.sequence_queued.items.len == 0) return;
+    if (self.keyboard.sequence_queued.items.len > 0) {
+        switch (action) {
+            .flush => for (self.keyboard.sequence_queued.items) |write_req| {
+                self.io.queueMessage(switch (write_req) {
+                    .small => |v| .{ .write_small = v },
+                    .stable => |v| .{ .write_stable = v },
+                    .alloc => |v| .{ .write_alloc = v },
+                }, .unlocked);
+            },
 
-    // Run the proper action first
-    switch (action) {
-        .flush => for (self.keyboard.sequence_queued.items) |write_req| {
-            self.queueIo(switch (write_req) {
-                .small => |v| .{ .write_small = v },
-                .stable => |v| .{ .write_stable = v },
-                .alloc => |v| .{ .write_alloc = v },
-            }, .unlocked);
-        },
+            .drop => for (self.keyboard.sequence_queued.items) |req| req.deinit(),
+        }
 
-        .drop => for (self.keyboard.sequence_queued.items) |req| req.deinit(),
-    }
-
-    // Memory handling of the sequence after the action
-    switch (mem) {
-        .free => self.keyboard.sequence_queued.clearAndFree(self.alloc),
-        .retain => self.keyboard.sequence_queued.clearRetainingCapacity(),
+        switch (mem) {
+            .free => self.keyboard.sequence_queued.clearAndFree(self.alloc),
+            .retain => self.keyboard.sequence_queued.clearRetainingCapacity(),
+        }
     }
 }
 
@@ -3339,7 +3298,7 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
         self.renderer_state.mutex.lock();
         self.io.terminal.flags.focused = focused;
         self.renderer_state.mutex.unlock();
-        self.queueIo(.{ .focused = focused }, .unlocked);
+        self.io.queueMessage(.{ .focused = focused }, .unlocked);
     }
 }
 
@@ -3503,7 +3462,7 @@ pub fn scrollCallback(
                     };
                 };
                 for (0..y.magnitude()) |_| {
-                    self.queueIo(.{ .write_stable = seq }, .locked);
+                    self.io.queueMessage(.{ .write_stable = seq }, .locked);
                 }
             }
 
@@ -3724,7 +3683,7 @@ fn mouseReport(
             data[5] = 32 + @as(u8, @intCast(viewport_point.y)) + 1;
 
             // Ask our IO thread to write the data
-            self.queueIo(.{ .write_small = .{
+            self.io.queueMessage(.{ .write_small = .{
                 .data = data,
                 .len = 6,
             } }, .locked);
@@ -3747,7 +3706,7 @@ fn mouseReport(
             i += try std.unicode.utf8Encode(@intCast(32 + viewport_point.y + 1), data[i..]);
 
             // Ask our IO thread to write the data
-            self.queueIo(.{ .write_small = .{
+            self.io.queueMessage(.{ .write_small = .{
                 .data = data,
                 .len = @intCast(i),
             } }, .locked);
@@ -3768,7 +3727,7 @@ fn mouseReport(
             });
 
             // Ask our IO thread to write the data
-            self.queueIo(.{ .write_small = .{
+            self.io.queueMessage(.{ .write_small = .{
                 .data = data,
                 .len = @intCast(resp.len),
             } }, .locked);
@@ -3785,7 +3744,7 @@ fn mouseReport(
             });
 
             // Ask our IO thread to write the data
-            self.queueIo(.{ .write_small = .{
+            self.io.queueMessage(.{ .write_small = .{
                 .data = data,
                 .len = @intCast(resp.len),
             } }, .locked);
@@ -3814,7 +3773,7 @@ fn mouseReport(
             });
 
             // Ask our IO thread to write the data
-            self.queueIo(.{ .write_small = .{
+            self.io.queueMessage(.{ .write_small = .{
                 .data = data,
                 .len = @intCast(resp.len),
             } }, .locked);
@@ -3938,7 +3897,7 @@ pub fn mouseButtonCallback(
         // Stop selection scrolling when releasing the left mouse button
         // but only when selection scrolling is active.
         if (self.selection_scroll_active) {
-            self.queueIo(
+            self.io.queueMessage(
                 .{ .selection_scroll = false },
                 .unlocked,
             );
@@ -4157,7 +4116,7 @@ pub fn mouseButtonCallback(
             .selection
         else
             .standard;
-        _ = try self.startClipboardRequest(clipboard, .{ .paste = {} });
+        try self.startClipboardRequest(clipboard, .{ .paste = {} });
     }
 
     // Right-click down selects word for context menus. If the apprt
@@ -4240,7 +4199,7 @@ pub fn mouseButtonCallback(
                 // request so we need to unlock.
                 self.renderer_state.mutex.unlock();
                 defer self.renderer_state.mutex.lock();
-                _ = try self.startClipboardRequest(.standard, .paste);
+                try self.startClipboardRequest(.standard, .paste);
 
                 // We don't need to clear selection because we didn't have
                 // one to begin with.
@@ -4255,7 +4214,7 @@ pub fn mouseButtonCallback(
                 // request so we need to unlock.
                 self.renderer_state.mutex.unlock();
                 defer self.renderer_state.mutex.lock();
-                _ = try self.startClipboardRequest(.standard, .paste);
+                try self.startClipboardRequest(.standard, .paste);
             },
         }
 
@@ -4677,7 +4636,7 @@ pub fn cursorPosCallback(
     // Stop selection scrolling when inside the viewport within a 1px buffer
     // for fullscreen windows, but only when selection scrolling is active.
     if (pos.y >= 1 and self.selection_scroll_active) {
-        self.queueIo(
+        self.io.queueMessage(
             .{ .selection_scroll = false },
             .locked,
         );
@@ -4777,7 +4736,7 @@ pub fn cursorPosCallback(
         if ((pos.y <= 1 or pos.y > max_y - 1) and
             !self.selection_scroll_active)
         {
-            self.queueIo(
+            self.io.queueMessage(
                 .{ .selection_scroll = true },
                 .locked,
             );
@@ -5158,7 +5117,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 .esc => try std.fmt.bufPrint(&buf, "\x1b{s}", .{data}),
                 else => unreachable,
             };
-            self.queueIo(try termio.Message.writeReq(
+            self.io.queueMessage(try termio.Message.writeReq(
                 self.alloc,
                 full_data,
             ), .unlocked);
@@ -5185,7 +5144,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 );
                 return true;
             };
-            self.queueIo(try termio.Message.writeReq(
+            self.io.queueMessage(try termio.Message.writeReq(
                 self.alloc,
                 text,
             ), .unlocked);
@@ -5218,9 +5177,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             };
 
             if (normal) {
-                self.queueIo(.{ .write_stable = ck.normal }, .unlocked);
+                self.io.queueMessage(.{ .write_stable = ck.normal }, .unlocked);
             } else {
-                self.queueIo(.{ .write_stable = ck.application }, .unlocked);
+                self.io.queueMessage(.{ .write_stable = ck.application }, .unlocked);
             }
         },
 
@@ -5409,12 +5368,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
-        .paste_from_clipboard => return try self.startClipboardRequest(
+        .paste_from_clipboard => try self.startClipboardRequest(
             .standard,
             .{ .paste = {} },
         ),
 
-        .paste_from_selection => return try self.startClipboardRequest(
+        .paste_from_selection => try self.startClipboardRequest(
             .selection,
             .{ .paste = {} },
         ),
@@ -5473,13 +5432,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .prompt_surface_title => return try self.rt_app.performAction(
             .{ .surface = self },
             .prompt_title,
-            .surface,
-        ),
-
-        .prompt_tab_title => return try self.rt_app.performAction(
-            .{ .surface = self },
-            .prompt_title,
-            .tab,
+            {},
         ),
 
         .clear_screen => {
@@ -5494,19 +5447,19 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 if (self.io.terminal.screens.active_key == .alternate) return false;
             }
 
-            self.queueIo(.{
+            self.io.queueMessage(.{
                 .clear_screen = .{ .history = true },
             }, .unlocked);
         },
 
         .scroll_to_top => {
-            self.queueIo(.{
+            self.io.queueMessage(.{
                 .scroll_viewport = .{ .top = {} },
             }, .unlocked);
         },
 
         .scroll_to_bottom => {
-            self.queueIo(.{
+            self.io.queueMessage(.{
                 .scroll_viewport = .{ .bottom = {} },
             }, .unlocked);
         },
@@ -5536,14 +5489,14 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
         .scroll_page_up => {
             const rows: isize = @intCast(self.size.grid().rows);
-            self.queueIo(.{
+            self.io.queueMessage(.{
                 .scroll_viewport = .{ .delta = -1 * rows },
             }, .unlocked);
         },
 
         .scroll_page_down => {
             const rows: isize = @intCast(self.size.grid().rows);
-            self.queueIo(.{
+            self.io.queueMessage(.{
                 .scroll_viewport = .{ .delta = rows },
             }, .unlocked);
         },
@@ -5551,19 +5504,19 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .scroll_page_fractional => |fraction| {
             const rows: f32 = @floatFromInt(self.size.grid().rows);
             const delta: isize = @intFromFloat(@trunc(fraction * rows));
-            self.queueIo(.{
+            self.io.queueMessage(.{
                 .scroll_viewport = .{ .delta = delta },
             }, .unlocked);
         },
 
         .scroll_page_lines => |lines| {
-            self.queueIo(.{
+            self.io.queueMessage(.{
                 .scroll_viewport = .{ .delta = lines },
             }, .unlocked);
         },
 
         .jump_to_prompt => |delta| {
-            self.queueIo(.{
+            self.io.queueMessage(.{
                 .jump_to_prompt = @intCast(delta),
             }, .unlocked);
         },
@@ -5647,15 +5600,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             },
         ),
 
-        .goto_window => |direction| return try self.rt_app.performAction(
-            .{ .surface = self },
-            .goto_window,
-            switch (direction) {
-                .previous => .previous,
-                .next => .next,
-            },
-        ),
-
         .resize_split => |value| return try self.rt_app.performAction(
             .{ .surface = self },
             .resize_split,
@@ -5681,16 +5625,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .toggle_split_zoom,
             {},
         ),
-
-        .toggle_readonly => {
-            self.readonly = !self.readonly;
-            _ = try self.rt_app.performAction(
-                .{ .surface = self },
-                .readonly,
-                if (self.readonly) .on else .off,
-            );
-            return true;
-        },
 
         .reset_window_size => return try self.rt_app.performAction(
             .{ .surface = self },
@@ -5873,14 +5807,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             return try self.deactivateAllKeyTables();
         },
 
-        .end_key_sequence => {
-            // End the key sequence and flush queued keys to the terminal,
-            // but don't encode the key that triggered this action. This
-            // will do that because leaf keys (keys with bindings) aren't
-            // in the queued encoding list.
-            self.endKeySequence(.flush, .retain);
-        },
-
         .crash => |location| switch (location) {
             .main => @panic("crash binding action, crashing intentionally"),
 
@@ -5892,7 +5818,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 };
             },
 
-            .io => self.queueIo(.{ .crash = {} }, .unlocked),
+            .io => self.io.queueMessage(.{ .crash = {} }, .unlocked),
         },
 
         .adjust_selection => |direction| {
@@ -6090,7 +6016,7 @@ fn writeScreenFile(
             },
             .url = path,
         }),
-        .paste => self.queueIo(try termio.Message.writeReq(
+        .paste => self.io.queueMessage(try termio.Message.writeReq(
             self.alloc,
             path,
         ), .unlocked),
@@ -6136,15 +6062,11 @@ pub fn completeClipboardRequest(
 
 /// This starts a clipboard request, with some basic validation. For example,
 /// an OSC 52 request is not actually requested if OSC 52 is disabled.
-///
-/// Returns true if the request was started, false if it was not (e.g., clipboard
-/// doesn't contain text for paste requests). This allows performable keybinds
-/// to pass through when the action cannot be performed.
 fn startClipboardRequest(
     self: *Surface,
     loc: apprt.Clipboard,
     req: apprt.ClipboardRequest,
-) !bool {
+) !void {
     switch (req) {
         .paste => {}, // always allowed
         .osc_52_read => if (self.config.clipboard_read == .deny) {
@@ -6152,14 +6074,14 @@ fn startClipboardRequest(
                 "application attempted to read clipboard, but 'clipboard-read' is set to deny",
                 .{},
             );
-            return false;
+            return;
         },
 
         // No clipboard write code paths travel through this function
         .osc_52_write => unreachable,
     }
 
-    return try self.rt_surface.clipboardRequest(loc, req);
+    try self.rt_surface.clipboardRequest(loc, req);
 }
 
 fn completeClipboardPaste(
@@ -6234,7 +6156,7 @@ fn completeClipboardPaste(
     };
 
     for (vecs) |vec| if (vec.len > 0) {
-        self.queueIo(try termio.Message.writeReq(
+        self.io.queueMessage(try termio.Message.writeReq(
             self.alloc,
             vec,
         ), .unlocked);
@@ -6280,7 +6202,7 @@ fn completeClipboardReadOSC52(
     const encoded = enc.encode(buf[prefix.len..], data);
     assert(encoded.len == size);
 
-    self.queueIo(try termio.Message.writeReq(
+    self.io.queueMessage(try termio.Message.writeReq(
         self.alloc,
         buf,
     ), .unlocked);
