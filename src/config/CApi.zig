@@ -99,6 +99,23 @@ export fn ghostty_config_load_file(
     return true;
 }
 
+/// Load configuration from a string in the same format as the file-based
+/// syntax. This is useful for platforms like iOS where you want to pass
+/// configuration directly without writing to a file.
+export fn ghostty_config_load_string(
+    self: *Config,
+    str: [*]const u8,
+    len: usize,
+) void {
+    const cli = @import("../cli.zig");
+    const str_slice = str[0..len];
+    var reader: std.Io.Reader = .fixed(str_slice);
+    var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "<string>" };
+    cli.args.parse(Config, state.alloc, self, &iter) catch |err| {
+        log.err("error loading config from string err={}", .{err});
+    };
+}
+
 export fn ghostty_config_finalize(self: *Config) void {
     self.finalize() catch |err| {
         log.err("error finalizing config err={}", .{err});
