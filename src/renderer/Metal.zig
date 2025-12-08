@@ -126,7 +126,8 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
         },
 
         .ios => {
-            const view_layer = objc.Object.fromId(info.view.getProperty(?*anyopaque, "layer"));
+            // Get the view's backing layer and add our IOSurfaceLayer as a sublayer
+            const view_layer = info.view.getProperty(objc.Object, "layer");
             view_layer.msgSend(void, objc.sel("addSublayer:"), .{layer.layer.value});
         },
 
