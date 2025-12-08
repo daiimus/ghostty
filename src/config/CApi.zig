@@ -83,6 +83,22 @@ export fn ghostty_config_load_recursive_files(self: *Config) void {
     };
 }
 
+/// Load configuration from a specific file path. This is useful for
+/// platforms like iOS where the default config file locations don't
+/// exist. Returns true if the file was loaded successfully, false otherwise.
+export fn ghostty_config_load_file(
+    self: *Config,
+    path: [*]const u8,
+    len: usize,
+) bool {
+    const path_slice = path[0..len];
+    self.loadFile(state.alloc, path_slice) catch |err| {
+        log.err("error loading config file path={s} err={}", .{ path_slice, err });
+        return false;
+    };
+    return true;
+}
+
 export fn ghostty_config_finalize(self: *Config) void {
     self.finalize() catch |err| {
         log.err("error finalizing config err={}", .{err});
