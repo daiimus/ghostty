@@ -15,6 +15,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -414,9 +415,27 @@ pub const Surface = struct {
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
 
+    /// The backend type for the terminal I/O.
+    backend_type: BackendType = .exec,
+
+    /// Write callback for external backend.
+    write_callback: ?*const fn (
+        surface: *Surface,
+        data: [*]const u8,
+        len: usize,
+    ) callconv(.c) void = null,
+
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
+
+    /// The backend type for the terminal I/O.
+    pub const BackendType = enum(c_int) {
+        /// Execute a subprocess with a PTY (default).
+        exec = 0,
+        /// External data source (e.g., SSH, serial). Data is fed via API.
+        external = 1,
+    };
 
     /// Surface initialization options.
     pub const Options = extern struct {
@@ -459,6 +478,20 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// The backend type for the terminal I/O.
+        /// Default is exec (subprocess with PTY).
+        backend_type: BackendType = .exec,
+
+        /// Callback for the external backend when the terminal wants to
+        /// send data (e.g., user keyboard input). The embedder should send
+        /// this data to the external source (e.g., SSH connection).
+        /// Only used when backend_type is .external.
+        write_callback: ?*const fn (
+            surface: *Surface,
+            data: [*]const u8,
+            len: usize,
+        ) callconv(.c) void = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -473,6 +506,8 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .backend_type = opts.backend_type,
+            .write_callback = opts.write_callback,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -595,6 +630,31 @@ pub const Surface = struct {
 
         // Clean up our core surface so that all the rendering and IO stop.
         self.core_surface.deinit();
+    }
+
+    /// Returns the termio backend configuration for this surface.
+    /// This is called by the core Surface during initialization.
+    pub fn getTermioBackend(self: *Surface, alloc: std.mem.Allocator) !termio.Backend {
+        return switch (self.backend_type) {
+            .exec => .{ .exec = undefined }, // Exec requires separate initialization
+            .external => .{
+                .external = try termio.External.init(alloc, .{
+                    .write_callback = if (self.write_callback != null) struct {
+                        fn wrapper(data: []const u8, userdata: ?*anyopaque) void {
+                            const surface: *Surface = @ptrCast(@alignCast(userdata));
+                            const callback = surface.write_callback.?;
+                            callback(surface, data.ptr, data.len);
+                        }
+                    }.wrapper else null,
+                    .write_userdata = self,
+                }),
+            },
+        };
+    }
+
+    /// Returns true if this surface uses an external backend.
+    pub fn usesExternalBackend(self: *const Surface) bool {
+        return self.backend_type == .external;
     }
 
     /// Initialize the inspector instance. A surface can only have one
@@ -1778,6 +1838,27 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.textCallback(ptr[0..len]);
+    }
+
+    /// Write data directly to the terminal output. This feeds data to the
+    /// terminal emulator as if it came from a subprocess/PTY. This is the
+    /// counterpart to ghostty_surface_text (which sends input TO a subprocess).
+    ///
+    /// Use this for external data sources like SSH connections, serial ports,
+    /// or any scenario where terminal output data comes from outside the
+    /// normal subprocess flow.
+    ///
+    /// The data should be raw terminal output including any escape sequences.
+    /// This function processes the data through the terminal emulator and
+    /// triggers a render.
+    export fn ghostty_surface_write_output(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        log.debug("ghostty_surface_write_output called with {d} bytes", .{len});
+        surface.core_surface.io.processOutput(ptr[0..len]);
+        log.debug("ghostty_surface_write_output completed", .{});
     }
 
     /// Set the preedit text for the surface. This is used for IME

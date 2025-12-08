@@ -418,6 +418,16 @@ typedef struct {
   const char* value;
 } ghostty_env_var_s;
 
+// Backend type for terminal I/O
+typedef enum {
+  GHOSTTY_BACKEND_EXEC = 0,      // Execute subprocess with PTY (default)
+  GHOSTTY_BACKEND_EXTERNAL = 1,  // External data source (SSH, serial)
+} ghostty_backend_type_e;
+
+// Write callback for external backend - called when terminal wants to send data
+// Note: ghostty_surface_t is already typedef'd as void* above
+typedef void (*ghostty_write_callback_fn)(ghostty_surface_t surface, const char* data, size_t len);
+
 typedef struct {
   void* nsview;
 } ghostty_platform_macos_s;
@@ -450,6 +460,8 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  ghostty_backend_type_e backend_type;          // Backend type (exec or external)
+  ghostty_write_callback_fn write_callback;     // Write callback for external backend
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1078,6 +1090,7 @@ bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                     ghostty_input_key_s,
                                     ghostty_binding_flags_e*);
 void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
+void ghostty_surface_write_output(ghostty_surface_t, const char*, uintptr_t);
 void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 bool ghostty_surface_mouse_captured(ghostty_surface_t);
 bool ghostty_surface_mouse_button(ghostty_surface_t,

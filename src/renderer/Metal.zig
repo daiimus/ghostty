@@ -77,9 +77,11 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
 
     // Grab metadata about the device.
     const default_storage_mode: mtl.MTLResourceOptions.StorageMode = switch (comptime builtin.os.tag) {
-        // manage mode is not supported by iOS
+        // iOS only supports .shared and .private storage modes.
+        // .managed is macOS-only and causes crashes on iOS/iOS Simulator.
         .ios => .shared,
-        else => if (device.getProperty(bool, "hasUnifiedMemory")) .shared else .managed,
+        .macos => if (device.getProperty(bool, "hasUnifiedMemory")) .shared else .managed,
+        else => .shared,
     };
     const max_texture_size = queryMaxTextureSize(device);
     log.debug(
@@ -126,8 +128,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
         },
 
         .ios => {
-            const view_layer = objc.Object.fromId(info.view.getProperty(?*anyopaque, "layer"));
-            view_layer.msgSend(void, objc.sel("addSublayer:"), .{layer.layer.value});
+            info.view.msgSend(void, objc.sel("addSublayer"), .{layer.layer.value});
         },
 
         else => @compileError("unsupported target for Metal"),
