@@ -30,6 +30,76 @@ comptime {
 /// Global options so we can log. This is identical to main.
 pub const std_options = main.std_options;
 
+/// Custom panic handler for iOS that provides useful stack traces.
+/// iOS doesn't have native Zig debug info support, so we provide our own.
+pub const panic = if (builtin.os.tag == .ios or builtin.os.tag == .watchos or builtin.os.tag == .tvos)
+    std.debug.FullPanic(iosPanic)
+else
+    std.debug.FullPanic(std.debug.defaultPanic);
+
+fn iosPanic(msg: []const u8, return_address: ?usize) noreturn {
+    @branchHint(.cold);
+
+    // Use a fixed buffer to format output
+    var buf: [4096]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const writer = fbs.writer();
+
+    writer.print("\n=== GHOSTTY PANIC ===\n", .{}) catch {};
+    writer.print("PANIC: {s}\n", .{msg}) catch {};
+
+    // Try to get return address info
+    if (return_address) |ra| {
+        writer.print("Return address: 0x{x}\n", .{ra}) catch {};
+    }
+
+    // Walk the stack manually using frame pointers
+    var frame_index: usize = 0;
+    const initial_fp = @frameAddress();
+    var fp: ?[*]const usize = if (initial_fp != 0) @ptrFromInt(initial_fp) else null;
+
+    writer.print("Stack trace:\n", .{}) catch {};
+    while (fp) |frame_ptr| : (frame_index += 1) {
+        if (frame_index > 30) break; // Limit depth
+
+        // On ARM64, return address is at fp+8 (frame_ptr[1])
+        const ret_addr = frame_ptr[1];
+        if (ret_addr == 0) break;
+
+        writer.print("  [{d}] 0x{x}\n", .{ frame_index, ret_addr }) catch {};
+
+        // Next frame pointer is at fp+0 (frame_ptr[0])
+        const next_fp = frame_ptr[0];
+        if (next_fp == 0) break;
+        fp = @ptrFromInt(next_fp);
+    }
+
+    writer.print("=== END PANIC ===\n", .{}) catch {};
+
+    // Use NSLog to output (works on iOS)
+    const output = fbs.getWritten();
+    if (output.len > 0) {
+        // Call NSLog via C - it's linked from Foundation
+        const c = @cImport({
+            @cInclude("CoreFoundation/CoreFoundation.h");
+        });
+        const cf_str = c.CFStringCreateWithBytes(
+            null,
+            output.ptr,
+            @intCast(output.len),
+            c.kCFStringEncodingUTF8,
+            0,
+        );
+        if (cf_str) |s| {
+            c.CFShow(s);
+            c.CFRelease(s);
+        }
+    }
+
+    // Abort
+    posix.abort();
+}
+
 comptime {
     // These structs need to be referenced so the `export` functions
     // are truly exported by the C API lib.
