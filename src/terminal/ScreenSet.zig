@@ -37,6 +37,7 @@ pub fn init(
     const screen = try alloc.create(Screen);
     errdefer alloc.destroy(screen);
     screen.* = try .init(alloc, opts);
+    
     return .{
         .active_key = .primary,
         .active = screen,

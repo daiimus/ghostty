@@ -429,6 +429,19 @@ pub const Surface = struct {
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
 
+    /// iOS sync search state - used instead of xev-based search thread
+    /// Only available on Darwin (macOS/iOS)
+    ios_sync_search: if (builtin.os.tag.isDarwin()) ?IosSyncSearch else void = if (builtin.os.tag.isDarwin()) null else {},
+
+    /// iOS Sync Search State - wraps ScreenSearch for use without xev
+    pub const IosSyncSearch = struct {
+        search: terminal.search.Screen,
+
+        pub fn deinit(self: *IosSyncSearch) void {
+            self.search.deinit();
+        }
+    };
+
     /// The backend type for the terminal I/O.
     pub const BackendType = enum(c_int) {
         /// Execute a subprocess with a PTY (default).
@@ -619,6 +632,14 @@ pub const Surface = struct {
     }
 
     pub fn deinit(self: *Surface) void {
+        // Clean up iOS sync search if active (Darwin only)
+        if (comptime builtin.os.tag.isDarwin()) {
+            if (self.ios_sync_search) |*s| {
+                s.deinit();
+                self.ios_sync_search = null;
+            }
+        }
+
         // Shut down our inspector
         self.freeInspector();
 
@@ -1856,9 +1877,22 @@ pub const CAPI = struct {
         ptr: [*]const u8,
         len: usize,
     ) void {
-        log.debug("ghostty_surface_write_output called with {d} bytes", .{len});
         surface.core_surface.io.processOutput(ptr[0..len]);
-        log.debug("ghostty_surface_write_output completed", .{});
+    }
+
+    /// Debug: Get terminal state for debugging scrollback issues
+    export fn ghostty_surface_debug_terminal_state(surface: *Surface) Darwin.TerminalDebugState {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+        const term = surface.core_surface.renderer_state.terminal;
+        const screen = term.screens.active;
+        return .{
+            .total_rows = @intCast(screen.pages.total_rows),
+            .visible_rows = @intCast(screen.pages.rows),
+            .cols = @intCast(screen.pages.cols),
+            .total_pages = @intCast(screen.pages.totalPages()),
+            .screen_key = if (term.screens.active_key == .primary) 0 else 1,
+        };
     }
 
     /// Set the preedit text for the surface. This is used for IME
@@ -2169,6 +2203,360 @@ pub const CAPI = struct {
 
     // Darwin-only C APIs.
     const Darwin = struct {
+        /// Result from iOS sync search operations
+        pub const SearchResult = extern struct {
+            /// Total matches found (-1 if error/incomplete)
+            total: isize,
+            /// Currently selected match index (-1 if none)
+            selected: isize,
+            /// True if operation was successful
+            success: bool,
+            /// Screen type: 0 = primary (has scrollback), 1 = alternate (no scrollback, e.g. tmux)
+            screen_type: isize = 0,
+            /// Total rows in screen (scrollback + visible)
+            total_rows: isize = 0,
+            /// Visible rows
+            visible_rows: isize = 0,
+        };
+
+        /// Debug state for terminal
+        pub const TerminalDebugState = extern struct {
+            total_rows: isize,
+            visible_rows: isize,
+            cols: isize,
+            total_pages: isize,
+            screen_key: isize, // 0 = primary, 1 = alternate
+        };
+
+        /// Start a new search session. This initializes ScreenSearch on the surface.
+        /// Returns total match count (or -1 on error).
+        /// Swift must call ghostty_surface_search_end to clean up.
+        export fn ghostty_surface_search_start(
+            ptr: *Surface,
+            needle_ptr: [*]const u8,
+            needle_len: usize,
+        ) SearchResult {
+            const surface = &ptr.core_surface;
+
+            // Lock terminal for search - we need the lock for cleanup too
+            // since ScreenSearch.deinit accesses screen state (untrackPin, etc.)
+            surface.renderer_state.mutex.lock();
+            defer surface.renderer_state.mutex.unlock();
+
+            const term = surface.renderer_state.terminal;
+            const screen = term.screens.active;
+            
+            // Get screen info for result
+            const screen_key = term.screens.active_key;
+            const screen_type: isize = if (screen_key == .primary) 0 else 1;
+            const total_rows: isize = @intCast(screen.pages.total_rows);
+            const visible_rows: isize = @intCast(screen.pages.rows);
+
+            // End any existing search first (must be done with lock held)
+            if (ptr.ios_sync_search) |*s| {
+                s.deinit();
+                ptr.ios_sync_search = null;
+            }
+
+            if (needle_len == 0) {
+                // Clear highlights
+                _ = surface.renderer_thread.mailbox.push(
+                    .{ .search_viewport_matches = .{
+                        .arena = .init(surface.alloc),
+                        .matches = &.{},
+                    } },
+                    .forever,
+                );
+                _ = surface.renderer_thread.mailbox.push(
+                    .{ .search_selected_match = null },
+                    .forever,
+                );
+                surface.renderer_thread.wakeup.notify() catch {};
+
+                return .{ 
+                    .total = 0, 
+                    .selected = -1, 
+                    .success = true, 
+                    .screen_type = screen_type,
+                    .total_rows = total_rows, 
+                    .visible_rows = visible_rows,
+                };
+            }
+
+            const needle = needle_ptr[0..needle_len];
+
+            // Initialize ScreenSearch
+            var screen_search = terminal.search.Screen.init(
+                surface.alloc,
+                screen,
+                needle,
+            ) catch {
+                return .{ .total = -1, .selected = -1, .success = false, .screen_type = screen_type };
+            };
+            errdefer screen_search.deinit();
+
+            // Run the full search synchronously
+            screen_search.searchAll() catch {
+                screen_search.deinit();
+                return .{ .total = -1, .selected = -1, .success = false, .screen_type = screen_type };
+            };
+
+            const total = screen_search.matchesLen();
+
+            // Update viewport highlights
+            updateViewportHighlights(surface, &screen_search);
+
+            // Store on surface
+            ptr.ios_sync_search = .{ .search = screen_search };
+
+            // Select first match and scroll to it (if any matches found)
+            if (total > 0) {
+                const selected = ptr.ios_sync_search.?.search.select(.next) catch {
+                    return .{
+                        .total = @intCast(total),
+                        .selected = -1,
+                        .success = true,
+                        .screen_type = screen_type,
+                        .total_rows = total_rows,
+                        .visible_rows = visible_rows,
+                    };
+                };
+
+                if (selected) {
+                    // Notify renderer of selected match
+                    if (ptr.ios_sync_search.?.search.selectedMatch()) |match| {
+                        notifySelectedMatch(surface, match);
+                    }
+
+                    // Scroll to match using tracked pin (like Thread.zig does)
+                    if (ptr.ios_sync_search.?.search.selected) |sel| {
+                        screen.scroll(.{ .pin = sel.highlight.start.* });
+                        surface.renderer_thread.wakeup.notify() catch {};
+                    }
+                }
+
+                const sel_idx: isize = if (ptr.ios_sync_search.?.search.selected) |s|
+                    @intCast(s.idx)
+                else
+                    -1;
+
+                return .{
+                    .total = @intCast(total),
+                    .selected = sel_idx,
+                    .success = true,
+                    .screen_type = screen_type,
+                    .total_rows = total_rows,
+                    .visible_rows = visible_rows,
+                };
+            }
+
+            return .{
+                .total = @intCast(total),
+                .selected = -1,
+                .success = true,
+                .screen_type = screen_type,
+                .total_rows = total_rows,
+                .visible_rows = visible_rows,
+            };
+        }
+
+        /// Navigate to next match. Returns updated selected index.
+        export fn ghostty_surface_search_next(ptr: *Surface) SearchResult {
+            const surface = &ptr.core_surface;
+            const sync_search = if (ptr.ios_sync_search) |*s| s else {
+                std.log.warn("ios_search: search_next called but no search active", .{});
+                return .{ .total = -1, .selected = -1, .success = false };
+            };
+
+            std.log.info("ios_search: search_next called, total={d}", .{sync_search.search.matchesLen()});
+
+            // Lock terminal for selection
+            surface.renderer_state.mutex.lock();
+            defer surface.renderer_state.mutex.unlock();
+
+            // Select next match
+            const selected = sync_search.search.select(.next) catch {
+                std.log.err("ios_search: select(.next) failed", .{});
+                return .{ .total = -1, .selected = -1, .success = false };
+            };
+
+            std.log.info("ios_search: select(.next) returned selected={}", .{selected});
+
+            if (!selected) {
+                // No more matches or wrapped - return current state
+                const sel_idx: isize = if (sync_search.search.selected) |s|
+                    @intCast(s.idx)
+                else
+                    -1;
+                return .{
+                    .total = @intCast(sync_search.search.matchesLen()),
+                    .selected = sel_idx,
+                    .success = true,
+                };
+            }
+
+            // Notify renderer of selected match
+            if (sync_search.search.selectedMatch()) |match| {
+                std.log.info("ios_search: notifying renderer of selected match", .{});
+                notifySelectedMatch(surface, match);
+            }
+
+            // Scroll to match using tracked pin (like Thread.zig does)
+            if (sync_search.search.selected) |sel| {
+                const screen = surface.renderer_state.terminal.screens.active;
+                std.log.info("ios_search: scrolling to match, pin.y={d}, viewport_before={s}", .{
+                    sel.highlight.start.y,
+                    @tagName(screen.pages.viewport),
+                });
+                screen.scroll(.{ .pin = sel.highlight.start.* });
+                std.log.info("ios_search: viewport_after={s}", .{@tagName(screen.pages.viewport)});
+                surface.renderer_thread.wakeup.notify() catch {};
+            }
+
+            const sel_idx: isize = if (sync_search.search.selected) |s|
+                @intCast(s.idx)
+            else
+                -1;
+
+            return .{
+                .total = @intCast(sync_search.search.matchesLen()),
+                .selected = sel_idx,
+                .success = true,
+            };
+        }
+
+        /// Navigate to previous match. Returns updated selected index.
+        export fn ghostty_surface_search_prev(ptr: *Surface) SearchResult {
+            const surface = &ptr.core_surface;
+            const sync_search = if (ptr.ios_sync_search) |*s| s else {
+                return .{ .total = -1, .selected = -1, .success = false };
+            };
+
+            // Lock terminal for selection
+            surface.renderer_state.mutex.lock();
+            defer surface.renderer_state.mutex.unlock();
+
+            // Select previous match
+            const selected = sync_search.search.select(.prev) catch {
+                return .{ .total = -1, .selected = -1, .success = false };
+            };
+
+            if (!selected) {
+                // No more matches - return current state
+                const sel_idx: isize = if (sync_search.search.selected) |s|
+                    @intCast(s.idx)
+                else
+                    -1;
+                return .{
+                    .total = @intCast(sync_search.search.matchesLen()),
+                    .selected = sel_idx,
+                    .success = true,
+                };
+            }
+
+            // Notify renderer of selected match
+            if (sync_search.search.selectedMatch()) |match| {
+                notifySelectedMatch(surface, match);
+            }
+
+            // Scroll to match using tracked pin (like Thread.zig does)
+            if (sync_search.search.selected) |sel| {
+                const screen = surface.renderer_state.terminal.screens.active;
+                screen.scroll(.{ .pin = sel.highlight.start.* });
+                surface.renderer_thread.wakeup.notify() catch {};
+            }
+
+            const sel_idx: isize = if (sync_search.search.selected) |s|
+                @intCast(s.idx)
+            else
+                -1;
+
+            return .{
+                .total = @intCast(sync_search.search.matchesLen()),
+                .selected = sel_idx,
+                .success = true,
+            };
+        }
+
+        /// End the search session and clean up.
+        export fn ghostty_surface_search_end(ptr: *Surface) void {
+            const surface = &ptr.core_surface;
+
+            // Lock terminal - ScreenSearch.deinit accesses screen state (untrackPin, etc.)
+            surface.renderer_state.mutex.lock();
+            defer surface.renderer_state.mutex.unlock();
+
+            if (ptr.ios_sync_search) |*s| {
+                s.deinit();
+                ptr.ios_sync_search = null;
+            }
+
+            // Clear highlights
+            _ = surface.renderer_thread.mailbox.push(
+                .{ .search_viewport_matches = .{
+                    .arena = .init(surface.alloc),
+                    .matches = &.{},
+                } },
+                .forever,
+            );
+            _ = surface.renderer_thread.mailbox.push(
+                .{ .search_selected_match = null },
+                .forever,
+            );
+            surface.renderer_thread.wakeup.notify() catch {};
+        }
+
+        /// Helper: Update viewport highlights from search results
+        fn updateViewportHighlights(surface: *CoreSurface, search: *terminal.search.Screen) void {
+            var arena: std.heap.ArenaAllocator = .init(surface.alloc);
+            errdefer arena.deinit();
+            const arena_alloc = arena.allocator();
+
+            // Get viewport matches using ViewportSearch for highlight rendering
+            var viewport_search = terminal.search.Viewport.init(
+                surface.alloc,
+                search.needle(),
+            ) catch return;
+            defer viewport_search.deinit();
+
+            const t = surface.renderer_state.terminal;
+            _ = viewport_search.update(&t.screens.active.pages) catch return;
+
+            var matches: std.ArrayList(terminal.highlight.Flattened) = .empty;
+            while (viewport_search.next()) |hl| {
+                const cloned = hl.clone(arena_alloc) catch continue;
+                matches.append(arena_alloc, cloned) catch continue;
+            }
+
+            _ = surface.renderer_thread.mailbox.push(
+                .{ .search_viewport_matches = .{
+                    .arena = arena,
+                    .matches = matches.items,
+                } },
+                .forever,
+            );
+            surface.renderer_thread.wakeup.notify() catch {};
+        }
+
+        /// Helper: Notify renderer about selected match (using Flattened highlight)
+        fn notifySelectedMatch(surface: *CoreSurface, hl: terminal.highlight.Flattened) void {
+            var arena: std.heap.ArenaAllocator = .init(surface.alloc);
+            errdefer arena.deinit();
+            const arena_alloc = arena.allocator();
+
+            // Clone the flattened highlight
+            const cloned = hl.clone(arena_alloc) catch return;
+
+            _ = surface.renderer_thread.mailbox.push(
+                .{ .search_selected_match = .{
+                    .arena = arena,
+                    .match = cloned,
+                } },
+                .forever,
+            );
+            surface.renderer_thread.wakeup.notify() catch {};
+        }
+
         export fn ghostty_surface_set_display_id(ptr: *Surface, display_id: u32) void {
             const surface = &ptr.core_surface;
             _ = surface.renderer_thread.mailbox.push(

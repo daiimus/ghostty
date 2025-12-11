@@ -390,8 +390,16 @@ pub const SlidingWindow = struct {
                     };
                 }
             } else {
-                // Precondition that the start index is within the data buffer.
-                unreachable;
+                // Start index not found in any meta's cell_map.
+                // This can happen due to race conditions or edge cases.
+                // Log and return empty highlight rather than crashing.
+                std.log.warn("sliding_window: start index {d} not found in meta (data_len={d}, data_offset={d}, meta_len={d})", .{
+                    start,
+                    self.data.len(),
+                    self.data_offset,
+                    self.meta.len(),
+                });
+                return .empty;
             }
         };
 
@@ -428,8 +436,15 @@ pub const SlidingWindow = struct {
                 });
                 break;
             } else {
-                // Precondition that the end index is within the data buffer.
-                unreachable;
+                // End index not found in any meta's cell_map.
+                // This can happen due to race conditions or edge cases.
+                // Log and return empty highlight rather than crashing.
+                std.log.warn("sliding_window: end index {d} not found in meta (data_len={d}, meta_len={d})", .{
+                    end,
+                    self.data.len(),
+                    self.meta.len(),
+                });
+                return .empty;
             }
         }
 

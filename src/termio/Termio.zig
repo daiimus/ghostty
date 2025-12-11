@@ -224,10 +224,16 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
     // Create our terminal
     var term = try terminalpkg.Terminal.init(alloc, opts: {
         const grid_size = opts.size.grid();
+        const scrollback_limit = opts.full_config.@"scrollback-limit";
+        log.err("ios_termio: Creating terminal with max_scrollback={d}, rows={d}, cols={d}", .{
+            scrollback_limit,
+            grid_size.rows,
+            grid_size.columns,
+        });
         break :opts .{
             .cols = grid_size.columns,
             .rows = grid_size.rows,
-            .max_scrollback = opts.full_config.@"scrollback-limit",
+            .max_scrollback = scrollback_limit,
             .default_modes = default_modes,
             .colors = .{
                 .background = .init(opts.config.background.toTerminalRGB()),

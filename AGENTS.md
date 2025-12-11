@@ -99,3 +99,17 @@ ghostty_surface_write_output(surface, ssh_data, ssh_data_len);
 3. **Metal renderer** - iOS uses Metal, not OpenGL
 4. **CoreText fonts** - Font discovery via CoreText
 5. **libxev fork** - Uses kevent instead of kevent64 on iOS
+
+### Debugging iOS Builds
+
+When debugging Ghostty changes in the context of Bodak (iOS app):
+
+```bash
+# After rebuilding GhosttyKit, deploy to device and watch logs:
+xcrun devicectl device process launch --device <device-id> --console com.bodak.app
+
+# Filter for Ghostty-specific logs:
+xcrun devicectl device process launch --device <device-id> --console com.bodak.app 2>&1 | grep -E "(Ghostty|Terminal|SCREEN)" --line-buffered
+```
+
+See `../bodak/AGENTS.md` for full debugging workflow.
