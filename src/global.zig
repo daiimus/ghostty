@@ -104,7 +104,18 @@ pub const GlobalState = struct {
         // If we have an action executing, we disable logging by default
         // since we write to stderr we don't want logs messing up our
         // output.
-        if (self.action != null) self.logging.stderr = false;
+        if (self.action != null) self.logging = .{ .disabled = {} };
+
+        // For lib mode we always disable stderr logging by default.
+        // BUT for debug builds, enable it so we can debug issues.
+        if (comptime build_config.app_runtime == .none) {
+            if (comptime builtin.mode == .Debug) {
+                // Keep logging enabled for debug builds
+                self.logging = .{ .stderr = {} };
+            } else {
+                self.logging = .{ .disabled = {} };
+            }
+        }
 
         // I don't love the env var name but I don't have it in my heart
         // to parse CLI args 3 times (once for actions, once for config,

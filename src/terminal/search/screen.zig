@@ -312,8 +312,11 @@ pub const ScreenSearch = struct {
             .history_feed => self.state = .history,
 
             // If we're complete then the feed call above should always
-            // return false and we can't reach this.
-            .complete => unreachable,
+            // return false and we can't reach this. Log and force complete state.
+            .complete => {
+                log.err("feed() called in complete state - this should not happen", .{});
+                self.state = .complete;
+            },
         }
     }
 
