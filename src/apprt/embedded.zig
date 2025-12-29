@@ -1880,6 +1880,75 @@ pub const CAPI = struct {
         surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
+    // =========================================================================
+    // tmux Pane API
+    // =========================================================================
+
+    /// Get the number of tmux panes in the current session.
+    /// Returns 0 if not in tmux control mode.
+    export fn ghostty_surface_tmux_pane_count(surface: *Surface) usize {
+        const handler = &surface.core_surface.io.terminal_stream.handler;
+        if (comptime !@TypeOf(handler.*).tmux_enabled) return 0;
+        const viewer = handler.tmux_viewer orelse return 0;
+        return viewer.panes.count();
+    }
+
+    /// Get the IDs of tmux panes.
+    /// Writes up to max_count pane IDs to out_ids and returns the number written.
+    /// Returns 0 if not in tmux control mode.
+    export fn ghostty_surface_tmux_pane_ids(
+        surface: *Surface,
+        out_ids: [*]usize,
+        max_count: usize,
+    ) usize {
+        const handler = &surface.core_surface.io.terminal_stream.handler;
+        if (comptime !@TypeOf(handler.*).tmux_enabled) return 0;
+        const viewer = handler.tmux_viewer orelse return 0;
+        var count: usize = 0;
+        var it = viewer.panes.iterator();
+        while (it.next()) |kv| {
+            if (count >= max_count) break;
+            out_ids[count] = kv.key_ptr.*;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Set the active tmux pane for rendering.
+    /// Returns true if successful, false if pane_id not found or not in tmux mode.
+    export fn ghostty_surface_tmux_set_active_pane(
+        surface: *Surface,
+        pane_id: usize,
+    ) bool {
+        const handler = &surface.core_surface.io.terminal_stream.handler;
+        if (comptime !@TypeOf(handler.*).tmux_enabled) return false;
+        const viewer = handler.tmux_viewer orelse return false;
+        const pane = viewer.panes.getPtr(pane_id) orelse return false;
+
+        // Lock the renderer state and swap the terminal pointer
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        surface.core_surface.renderer_state.terminal = &pane.terminal;
+
+        // Trigger a redraw
+        surface.core_surface.renderer_thread.wakeup.notify() catch {};
+        return true;
+    }
+
+    /// Reset to render the main terminal (not a tmux pane).
+    export fn ghostty_surface_tmux_reset_active_pane(surface: *Surface) void {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        // Reset to the main termio terminal
+        surface.core_surface.renderer_state.terminal = &surface.core_surface.io.terminal;
+
+        // Trigger a redraw
+        surface.core_surface.renderer_thread.wakeup.notify() catch {};
+    }
+
+
     /// Debug: Get terminal state for debugging scrollback issues
     export fn ghostty_surface_debug_terminal_state(surface: *Surface) Darwin.TerminalDebugState {
         surface.core_surface.renderer_state.mutex.lock();

@@ -1102,6 +1102,8 @@ bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                     ghostty_binding_flags_e*);
 void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
 void ghostty_surface_write_output(ghostty_surface_t, const char*, uintptr_t);
+
+
 void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 bool ghostty_surface_mouse_captured(ghostty_surface_t);
 bool ghostty_surface_mouse_button(ghostty_surface_t,
@@ -1200,6 +1202,14 @@ size_t ghostty_surface_tmux_window_count(ghostty_surface_t);
 size_t ghostty_surface_tmux_windows(ghostty_surface_t,
                                     ghostty_tmux_window_s* out,
                                     size_t max_windows);
+
+// Simple API: Set which pane the current surface renders.
+// Returns true if successful, false if pane_id not found or not in tmux mode.
+bool ghostty_surface_tmux_set_active_pane(ghostty_surface_t, size_t pane_id);
+
+// Reset to render the main terminal (not a tmux pane).
+void ghostty_surface_tmux_reset_active_pane(ghostty_surface_t);
+
 
 // Create a new surface that renders a specific tmux pane's Terminal.
 // The new surface shares the Terminal owned by the tmux viewer but has
