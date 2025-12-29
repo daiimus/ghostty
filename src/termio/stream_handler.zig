@@ -428,10 +428,8 @@ pub const StreamHandler = struct {
                     log.info("tmux viewer action={f}", .{action});
                     switch (action) {
                         .exit => {
-                            // We ignore this because we will fully exit when
-                            // our DCS connection ends. We may want to handle
-                            // this in the future to notify our GUI we're
-                            // disconnected though.
+                            // Notify the surface that tmux control mode has exited
+                            self.surfaceMessageWriter(.tmux_exit);
                         },
 
                         .command => |command| {
@@ -443,8 +441,26 @@ pub const StreamHandler = struct {
                             ));
                         },
 
-                        .windows => {
-                            // TODO
+                        .windows => |windows| {
+                            // Build tmux state snapshot to send to surface
+                            var state: apprt.surface.Message.TmuxState = .{
+                                .window_count = windows.len,
+                                .pane_count = 0,
+                                .pane_ids = undefined,
+                                .pane_ids_len = 0,
+                            };
+
+                            // Count panes and collect IDs
+                            var panes_it = viewer.panes.iterator();
+                            while (panes_it.next()) |kv| {
+                                state.pane_count += 1;
+                                if (state.pane_ids_len < state.pane_ids.len) {
+                                    state.pane_ids[state.pane_ids_len] = kv.key_ptr.*;
+                                    state.pane_ids_len += 1;
+                                }
+                            }
+
+                            self.surfaceMessageWriter(.{ .tmux_state_changed = state });
                         },
                     }
                 }
