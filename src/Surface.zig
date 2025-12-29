@@ -1168,6 +1168,33 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{ .selected = v },
             );
         },
+
+        .tmux_state_changed => |state| {
+            log.info("tmux state changed: {} windows, {} panes", .{ state.window_count, state.pane_count });
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_state_changed,
+                .{
+                    .window_count = state.window_count,
+                    .pane_count = state.pane_count,
+                    .pane_ids = &state.pane_ids,
+                    .pane_ids_len = state.pane_ids_len,
+                },
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux state change err={}", .{err});
+            };
+        },
+
+        .tmux_exit => {
+            log.info("tmux control mode exited", .{});
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_exit,
+                {},
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux exit err={}", .{err});
+            };
+        },
     }
 }
 

@@ -330,6 +330,12 @@ pub const Action = union(Key) {
     /// The readonly state of the surface has changed.
     readonly: Readonly,
 
+    /// tmux control mode: state changed (windows/panes updated)
+    tmux_state_changed: TmuxStateChanged,
+
+    /// tmux control mode: exited
+    tmux_exit: void,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -395,6 +401,8 @@ pub const Action = union(Key) {
         search_total,
         search_selected,
         readonly,
+        tmux_state_changed,
+        tmux_exit,
     };
 
     /// Sync with: ghostty_action_u
@@ -562,6 +570,29 @@ pub const QuitTimer = enum(c_int) {
 pub const Readonly = enum(c_int) {
     off,
     on,
+};
+
+/// tmux control mode state change notification
+pub const TmuxStateChanged = struct {
+    window_count: usize,
+    pane_count: usize,
+    pane_ids: *const [32]usize,
+    pane_ids_len: usize,
+
+    // Sync with: ghostty_action_tmux_state_changed_s
+    // Note: This is kept small to fit within the CValue size constraint.
+    // For detailed pane info, use the dedicated tmux C API functions.
+    pub const C = extern struct {
+        window_count: u32,
+        pane_count: u32,
+    };
+
+    pub fn cval(self: TmuxStateChanged) C {
+        return .{
+            .window_count = @intCast(self.window_count),
+            .pane_count = @intCast(self.pane_count),
+        };
+    }
 };
 
 pub const MouseVisibility = enum(c_int) {

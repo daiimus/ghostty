@@ -108,10 +108,31 @@ pub const Message = union(enum) {
     /// Selected search index change
     search_selected: ?usize,
 
+    /// tmux control mode: windows/panes changed
+    /// This is sent when the tmux viewer detects window or pane changes.
+    /// The data contains the list of windows and their layouts.
+    tmux_state_changed: TmuxState,
+
+    /// tmux control mode: session exited
+    tmux_exit: void,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
         // This enum is a placeholder for future title styles.
+    };
+
+    /// tmux control mode state that can be sent to the surface.
+    /// This is a snapshot of the current tmux viewer state.
+    pub const TmuxState = struct {
+        /// Number of windows in the session
+        window_count: usize,
+        /// Number of panes across all windows
+        pane_count: usize,
+        /// Pane IDs (limited to first 32 panes)
+        pane_ids: [32]usize,
+        /// Actual number of pane IDs in the array
+        pane_ids_len: usize,
     };
 
     pub const ChildExited = extern struct {
