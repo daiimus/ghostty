@@ -659,7 +659,6 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     // We always notify our backend of focus changes.
     try self.backend.focusGained(td, focused);
 }
-
 /// Process output from the pty. This is the manual API that users can
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.

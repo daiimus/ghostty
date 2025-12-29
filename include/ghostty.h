@@ -1090,6 +1090,7 @@ void ghostty_surface_draw(ghostty_surface_t);
 void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 void ghostty_surface_set_focus(ghostty_surface_t, bool);
 void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+
 void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 void ghostty_surface_set_color_scheme(ghostty_surface_t,
@@ -1164,82 +1165,23 @@ void ghostty_surface_search_end(ghostty_surface_t);
 // These APIs expose Ghostty's native tmux control mode viewer for iOS apps.
 // When a surface enters tmux control mode (via tmux -CC), Ghostty internally
 // creates Terminal instances for each pane with full scrollback support.
-// These APIs allow iOS to create surfaces that render those pane Terminals.
-
-// Tmux pane info structure
-typedef struct {
-    size_t pane_id;      // tmux pane ID (e.g., %0, %1)
-    size_t window_id;    // tmux window ID this pane belongs to
-    uint16_t x;          // x position in window layout (cells)
-    uint16_t y;          // y position in window layout (cells)
-    uint16_t width;      // pane width (cells)
-    uint16_t height;     // pane height (cells)
-} ghostty_tmux_pane_s;
-
-// Tmux window info structure
-typedef struct {
-    size_t window_id;    // tmux window ID
-    uint16_t width;      // window width (cells)
-    uint16_t height;     // window height (cells)
-} ghostty_tmux_window_s;
-
-// Check if surface is in tmux control mode
-bool ghostty_surface_tmux_active(ghostty_surface_t);
+// These APIs allow iOS to query and render those pane Terminals.
 
 // Get number of tmux panes (returns 0 if not in tmux mode)
 size_t ghostty_surface_tmux_pane_count(ghostty_surface_t);
 
-// Get tmux pane info. Returns number of panes written to out array.
-// Pass NULL for out to just get the count.
-size_t ghostty_surface_tmux_panes(ghostty_surface_t,
-                                  ghostty_tmux_pane_s* out,
-                                  size_t max_panes);
+// Get tmux pane IDs. Returns number of IDs written to out_ids array.
+// Returns 0 if not in tmux control mode.
+size_t ghostty_surface_tmux_pane_ids(ghostty_surface_t,
+                                     size_t* out_ids,
+                                     size_t max_count);
 
-// Get number of tmux windows
-size_t ghostty_surface_tmux_window_count(ghostty_surface_t);
-
-// Get tmux window info. Returns number of windows written to out array.
-size_t ghostty_surface_tmux_windows(ghostty_surface_t,
-                                    ghostty_tmux_window_s* out,
-                                    size_t max_windows);
-
-// Simple API: Set which pane the current surface renders.
+// Set which tmux pane this surface renders.
 // Returns true if successful, false if pane_id not found or not in tmux mode.
 bool ghostty_surface_tmux_set_active_pane(ghostty_surface_t, size_t pane_id);
 
 // Reset to render the main terminal (not a tmux pane).
 void ghostty_surface_tmux_reset_active_pane(ghostty_surface_t);
-
-
-// Create a new surface that renders a specific tmux pane's Terminal.
-// The new surface shares the Terminal owned by the tmux viewer but has
-// its own renderer. Returns NULL if pane_id doesn't exist or tmux not active.
-// The parent surface must remain valid for the lifetime of the pane surface.
-ghostty_surface_t ghostty_surface_new_tmux_pane(ghostty_surface_t parent,
-                                                 size_t pane_id,
-                                                 const ghostty_surface_config_s* config);
-
-// Callback type for tmux state changes
-typedef enum {
-    GHOSTTY_TMUX_EVENT_ENTERED,         // Entered tmux control mode
-    GHOSTTY_TMUX_EVENT_EXITED,          // Exited tmux control mode
-    GHOSTTY_TMUX_EVENT_PANES_CHANGED,   // Pane list changed (add/remove/resize)
-    GHOSTTY_TMUX_EVENT_WINDOWS_CHANGED, // Window list changed
-} ghostty_tmux_event_e;
-
-typedef void (*ghostty_tmux_callback_fn)(ghostty_surface_t surface,
-                                         ghostty_tmux_event_e event,
-                                         void* userdata);
-
-// Set callback for tmux events. Pass NULL to clear.
-void ghostty_surface_tmux_set_callback(ghostty_surface_t,
-                                       ghostty_tmux_callback_fn callback,
-                                       void* userdata);
-
-// Send a tmux command from the pane surface (user input goes to tmux)
-void ghostty_surface_tmux_send_command(ghostty_surface_t,
-                                       const char* cmd,
-                                       size_t len);
 #endif
 
 ghostty_inspector_t ghostty_surface_inspector(ghostty_surface_t);
