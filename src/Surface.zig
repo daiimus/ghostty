@@ -1050,7 +1050,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 return;
             }
 
-            try self.startClipboardRequest(.standard, .{ .osc_52_read = clipboard });
+            _ = try self.startClipboardRequest(.standard, .{ .osc_52_read = clipboard });
         },
 
         .clipboard_write => |w| switch (w.req) {
@@ -4163,7 +4163,7 @@ pub fn mouseButtonCallback(
             .selection
         else
             .standard;
-        try self.startClipboardRequest(clipboard, .{ .paste = {} });
+        _ = try self.startClipboardRequest(clipboard, .{ .paste = {} });
     }
 
     // Right-click down selects word for context menus. If the apprt
@@ -4246,7 +4246,7 @@ pub fn mouseButtonCallback(
                 // request so we need to unlock.
                 self.renderer_state.mutex.unlock();
                 defer self.renderer_state.mutex.lock();
-                try self.startClipboardRequest(.standard, .paste);
+                _ = try self.startClipboardRequest(.standard, .paste);
 
                 // We don't need to clear selection because we didn't have
                 // one to begin with.
@@ -4261,7 +4261,7 @@ pub fn mouseButtonCallback(
                 // request so we need to unlock.
                 self.renderer_state.mutex.unlock();
                 defer self.renderer_state.mutex.lock();
-                try self.startClipboardRequest(.standard, .paste);
+                _ = try self.startClipboardRequest(.standard, .paste);
             },
         }
 
@@ -5421,12 +5421,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             return true;
         },
 
-        .paste_from_clipboard => try self.startClipboardRequest(
+        .paste_from_clipboard => return try self.startClipboardRequest(
             .standard,
             .{ .paste = {} },
         ),
 
-        .paste_from_selection => try self.startClipboardRequest(
+        .paste_from_selection => return try self.startClipboardRequest(
             .selection,
             .{ .paste = {} },
         ),
@@ -5885,6 +5885,14 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             return try self.deactivateAllKeyTables();
         },
 
+        .end_key_sequence => {
+            // End the key sequence and flush queued keys to the terminal,
+            // but don't encode the key that triggered this action. This
+            // will do that because leaf keys (keys with bindings) aren't
+            // in the queued encoding list.
+            self.endKeySequence(.flush, .retain);
+        },
+
         .crash => |location| switch (location) {
             .main => @panic("crash binding action, crashing intentionally"),
 
@@ -6140,11 +6148,15 @@ pub fn completeClipboardRequest(
 
 /// This starts a clipboard request, with some basic validation. For example,
 /// an OSC 52 request is not actually requested if OSC 52 is disabled.
+///
+/// Returns true if the request was started, false if it was not (e.g., clipboard
+/// doesn't contain text for paste requests). This allows performable keybinds
+/// to pass through when the action cannot be performed.
 fn startClipboardRequest(
     self: *Surface,
     loc: apprt.Clipboard,
     req: apprt.ClipboardRequest,
-) !void {
+) !bool {
     switch (req) {
         .paste => {}, // always allowed
         .osc_52_read => if (self.config.clipboard_read == .deny) {
@@ -6152,14 +6164,14 @@ fn startClipboardRequest(
                 "application attempted to read clipboard, but 'clipboard-read' is set to deny",
                 .{},
             );
-            return;
+            return false;
         },
 
         // No clipboard write code paths travel through this function
         .osc_52_write => unreachable,
     }
 
-    try self.rt_surface.clipboardRequest(loc, req);
+    return try self.rt_surface.clipboardRequest(loc, req);
 }
 
 fn completeClipboardPaste(
