@@ -83,10 +83,11 @@ export fn ghostty_config_load_recursive_files(self: *Config) void {
     };
 }
 
-/// Load configuration from a specific file path. This is useful for
-/// platforms like iOS where the default config file locations don't
-/// exist. Returns true if the file was loaded successfully, false otherwise.
-export fn ghostty_config_load_file(
+/// Load configuration from a specific file path with explicit length.
+/// This is useful for platforms like iOS where the default config file
+/// locations don't exist. Returns true if the file was loaded successfully,
+/// false otherwise.
+export fn ghostty_config_load_file_len(
     self: *Config,
     path: [*]const u8,
     len: usize,
