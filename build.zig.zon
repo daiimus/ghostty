@@ -8,8 +8,9 @@
         // Zig libs
 
         .libxev = .{
-            // Local fork with iOS support
-            .path = "../libxev-ios",
+            // mitchellh/libxev (includes iOS mach_port fix, PR #204)
+            .url = "https://github.com/mitchellh/libxev/archive/42d4ead.tar.gz",
+            .hash = "libxev-0.0.0-86vtc0IbEwBzMSXa-ZPZ8JpcV4Mw1SrsTuvtJmFAQ7Uu",
         },
         .vaxis = .{
             // rockorager/libvaxis
