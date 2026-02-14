@@ -414,6 +414,25 @@ pub const Surface = struct {
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
 
+    /// The backend type for the terminal I/O.
+    backend_type: BackendType = .exec,
+
+    /// Write callback for external backend.
+    write_callback: ?*const fn (
+        surface: *Surface,
+        data: [*]const u8,
+        len: usize,
+    ) callconv(.c) void = null,
+
+    /// Resize callback for external backend.
+    resize_callback: ?*const fn (
+        surface: *Surface,
+        cols: u16,
+        rows: u16,
+        width_px: u32,
+        height_px: u32,
+    ) callconv(.c) void = null,
+
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
@@ -479,6 +498,32 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// The backend type for the terminal I/O.
+        /// Default is exec (subprocess with PTY).
+        backend_type: BackendType = .exec,
+
+        /// Callback for the external backend when the terminal wants to
+        /// send data (e.g., user keyboard input). The embedder should send
+        /// this data to the external source (e.g., SSH connection).
+        /// Only used when backend_type is .external.
+        write_callback: ?*const fn (
+            surface: *Surface,
+            data: [*]const u8,
+            len: usize,
+        ) callconv(.c) void = null,
+
+        /// Callback for the external backend when the terminal is resized.
+        /// The embedder should use this to resize the external source
+        /// (e.g., SSH PTY window change request).
+        /// Only used when backend_type is .external.
+        resize_callback: ?*const fn (
+            surface: *Surface,
+            cols: u16,
+            rows: u16,
+            width_px: u32,
+            height_px: u32,
+        ) callconv(.c) void = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -493,6 +538,9 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .backend_type = opts.backend_type,
+            .write_callback = opts.write_callback,
+            .resize_callback = opts.resize_callback,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -623,6 +671,39 @@ pub const Surface = struct {
 
         // Clean up our core surface so that all the rendering and IO stop.
         self.core_surface.deinit();
+    }
+
+    /// Returns the termio backend configuration for this surface.
+    /// This is called by the core Surface during initialization.
+    pub fn getTermioBackend(self: *Surface, alloc: std.mem.Allocator) !termio.Backend {
+        return switch (self.backend_type) {
+            .exec => .{ .exec = undefined }, // Exec requires separate initialization
+            .external => .{
+                .external = try termio.External.init(alloc, .{
+                    .write_callback = if (self.write_callback != null) struct {
+                        fn wrapper(data: []const u8, userdata: ?*anyopaque) void {
+                            const surface: *Surface = @ptrCast(@alignCast(userdata));
+                            const callback = surface.write_callback.?;
+                            callback(surface, data.ptr, data.len);
+                        }
+                    }.wrapper else null,
+                    .write_userdata = self,
+                    .resize_callback = if (self.resize_callback != null) struct {
+                        fn wrapper(cols: u16, rows: u16, width_px: u32, height_px: u32, userdata: ?*anyopaque) void {
+                            const surface: *Surface = @ptrCast(@alignCast(userdata));
+                            const callback = surface.resize_callback.?;
+                            callback(surface, cols, rows, width_px, height_px);
+                        }
+                    }.wrapper else null,
+                    .resize_userdata = self,
+                }),
+            },
+        };
+    }
+
+    /// Returns true if this surface uses an external backend.
+    pub fn usesExternalBackend(self: *const Surface) bool {
+        return self.backend_type == .external;
     }
 
     /// Initialize the inspector instance. A surface can only have one
