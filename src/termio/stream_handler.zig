@@ -454,7 +454,10 @@ pub const StreamHandler = struct {
                         .command => |command| {
                             assert(command.len > 0);
                             assert(command[command.len - 1] == '\n');
-                            self.messageWriter(try termio.Message.writeReq(
+                            // Use writeReqDirect so the IO thread sends
+                            // this as raw bytes to tmux stdin, bypassing
+                            // the send-keys wrapping in queueWrite.
+                            self.messageWriter(try termio.Message.writeReqDirect(
                                 self.alloc,
                                 command,
                             ));
@@ -465,9 +468,12 @@ pub const StreamHandler = struct {
                             // bypassing the command queue. The %begin/%end
                             // response will be discarded as unexpected block
                             // output by the viewer's nextCommand().
+                            // Use writeReqDirect because this is already a
+                            // formatted send-keys command — it must NOT be
+                            // re-wrapped by queueWrite's tmux intercept.
                             assert(send_keys.len > 0);
                             assert(send_keys[send_keys.len - 1] == '\n');
-                            self.messageWriter(try termio.Message.writeReq(
+                            self.messageWriter(try termio.Message.writeReqDirect(
                                 self.alloc,
                                 send_keys,
                             ));
