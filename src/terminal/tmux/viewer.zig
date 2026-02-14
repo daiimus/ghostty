@@ -1048,6 +1048,13 @@ pub const Viewer = struct {
             // Determine which screen to use based on alternate_on
             const screen_key: ScreenSet.Key = if (data.alternate_on) .alternate else .primary;
 
+            // Switch the terminal to the correct active screen. The capture-pane
+            // sequence leaves the terminal on the alternate screen (because it
+            // captures alternate last), so we must restore the correct screen here.
+            // Without this, the renderer would show the alternate screen (blank for
+            // a normal shell), and subsequent %output would write to the wrong screen.
+            _ = try t.switchScreen(screen_key);
+
             // Set cursor position on the appropriate screen (tmux uses 0-based)
             if (t.screens.get(screen_key)) |screen| {
                 cursor: {
@@ -2401,6 +2408,8 @@ test "two pane flow with pane state" {
                         try testing.expect(!t.modes.get(.origin));
                         try testing.expect(!t.modes.get(.keypad_keys));
                         try testing.expect(!t.modes.get(.cursor_keys));
+                        // alternate_on=0 → active screen should be primary
+                        try testing.expectEqual(.primary, t.screens.active_key);
                     }
                     // Pane 4: cursor at (10, 5), cursor visible, wraparound on
                     {
@@ -2415,6 +2424,8 @@ test "two pane flow with pane state" {
                         try testing.expect(!t.modes.get(.origin));
                         try testing.expect(!t.modes.get(.keypad_keys));
                         try testing.expect(!t.modes.get(.cursor_keys));
+                        // alternate_on=0 → active screen should be primary
+                        try testing.expectEqual(.primary, t.screens.active_key);
                     }
                 }
             }).check,
@@ -2561,4 +2572,49 @@ test "sendKeys stale pane clears active and returns null" {
     // sendKeys should detect the stale pane, clear active_pane_id, return null.
     try testing.expectEqual(null, viewer.sendKeys("x"));
     try testing.expectEqual(null, viewer.active_pane_id);
+}
+
+test "sendKeys after setActivePaneId round-trip" {
+    // Verify the exact sequence that the C API performs:
+    // 1. Create viewer with panes (via processOutput/startup)
+    // 2. setActivePaneId (via ghostty_surface_tmux_set_active_pane)
+    // 3. sendKeys (via queueWrite on IO thread)
+    // Both 2 and 3 should be protected by renderer_state.mutex
+    // in production; this test verifies the logical correctness.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Simulate viewer startup populating two panes.
+    var t1: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t1.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 2, .{ .terminal = t1 });
+
+    var t2: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t2.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 5, .{ .terminal = t2 });
+
+    // Before activation, sendKeys returns null.
+    try testing.expectEqual(null, viewer.sendKeys("a"));
+
+    // Activate pane %5.
+    viewer.setActivePaneId(5);
+    try testing.expectEqual(@as(?usize, 5), viewer.active_pane_id);
+
+    // sendKeys should now format for pane %5.
+    const action = viewer.sendKeys("a");
+    try testing.expect(action != null);
+    try testing.expectEqualStrings("send-keys -H -t %5 61\n", action.?.send_keys);
+
+    // Switch to pane %2.
+    viewer.setActivePaneId(2);
+    try testing.expectEqual(@as(?usize, 2), viewer.active_pane_id);
+
+    const action2 = viewer.sendKeys("b");
+    try testing.expect(action2 != null);
+    try testing.expectEqualStrings("send-keys -H -t %2 62\n", action2.?.send_keys);
+
+    // Set active to a non-existent pane — should be ignored.
+    viewer.setActivePaneId(99);
+    // active_pane_id should remain %2 (the setActivePaneId no-ops).
+    try testing.expectEqual(@as(?usize, 2), viewer.active_pane_id);
 }
