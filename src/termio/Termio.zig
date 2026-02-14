@@ -413,6 +413,34 @@ pub inline fn queueWrite(
     data: []const u8,
     linefeed: bool,
 ) !void {
+    // When a tmux control mode viewer is active, user input must be
+    // wrapped in `send-keys -H` commands targeting the active pane.
+    // Raw bytes written to tmux stdin would be interpreted as tmux
+    // commands, not forwarded to the pane's shell.
+    if (comptime StreamHandler.tmux_enabled) {
+        if (self.terminal_stream.handler.tmux_viewer) |viewer| {
+            if (viewer.sendKeys(data)) |action| {
+                try self.backend.queueWrite(
+                    self.alloc,
+                    td,
+                    action.send_keys,
+                    false,
+                );
+            }
+            // Handle linefeed as a separate send-keys for CR.
+            if (linefeed) {
+                if (viewer.sendKeys(&[_]u8{'\r'})) |action| {
+                    try self.backend.queueWrite(
+                        self.alloc,
+                        td,
+                        action.send_keys,
+                        false,
+                    );
+                }
+            }
+            return;
+        }
+    }
     try self.backend.queueWrite(self.alloc, td, data, linefeed);
 }
 

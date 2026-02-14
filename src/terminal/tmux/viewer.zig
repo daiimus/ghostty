@@ -196,6 +196,12 @@ pub const Viewer = struct {
     /// when the queue drains again (e.g., after layout changes).
     initial_ready_sent: bool,
 
+    /// The currently active pane ID for user input routing. This is set
+    /// by the apprt (e.g., when a user focuses a pane in the GUI) and
+    /// is used by `sendKeys` to target `send-keys` commands. When null,
+    /// no pane is active and `sendKeys` will return null.
+    active_pane_id: ?usize,
+
     pub const CommandQueue = CircBuf(Command, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, Pane);
 
@@ -224,6 +230,13 @@ pub const Viewer = struct {
         /// user input is safe to send without interleaving with viewer
         /// commands.
         ready,
+
+        /// Send a `send-keys` command directly to tmux stdin for user
+        /// input routing. Unlike `command`, this is fire-and-forget and
+        /// must NOT go through the command queue (which would serialize
+        /// every keystroke behind `%begin/%end` responses). The caller
+        /// writes this directly to the backend. Includes trailing newline.
+        send_keys: []const u8,
 
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
@@ -298,6 +311,7 @@ pub const Viewer = struct {
             .action_arena = .{},
             .action_single = undefined,
             .initial_ready_sent = false,
+            .active_pane_id = null,
         };
     }
 
@@ -320,6 +334,81 @@ pub const Viewer = struct {
             self.alloc.free(self.tmux_version);
         }
         self.action_arena.promote(self.alloc).deinit();
+    }
+
+    /// Set the active pane for user input routing. The pane_id must
+    /// refer to a pane that exists in our panes map, or be null to
+    /// clear the active pane. If the pane_id is not null and does not
+    /// exist, this is a no-op (the active pane remains unchanged).
+    pub fn setActivePaneId(self: *Viewer, pane_id: ?usize) void {
+        if (pane_id) |id| {
+            if (!self.panes.contains(id)) {
+                log.warn("setActivePaneId: pane %{} not found, ignoring", .{id});
+                return;
+            }
+        }
+        self.active_pane_id = pane_id;
+    }
+
+    /// Format a `send-keys -H` command for the given data bytes,
+    /// targeting the active pane. Returns a `send_keys` action whose
+    /// payload is the formatted command with trailing newline, or null
+    /// if there is no active pane or the data is empty.
+    ///
+    /// The returned slice is arena-allocated and valid until the next
+    /// call to `next()` (which resets the action arena).
+    pub fn sendKeys(self: *Viewer, data: []const u8) ?Action {
+        if (data.len == 0) return null;
+
+        const pane_id = self.active_pane_id orelse return null;
+
+        // Verify the pane still exists (it may have been removed).
+        if (!self.panes.contains(pane_id)) {
+            self.active_pane_id = null;
+            return null;
+        }
+
+        // Format: "send-keys -H -t %{id} {hex}...\n"
+        // Each byte becomes "XX " (3 chars), last byte "XX\n" (3 chars).
+        // Prefix: "send-keys -H -t %" + digits + " " = ~25 + digits chars.
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        const arena_alloc = arena.allocator();
+
+        // Calculate the pane ID digit count.
+        var id_digits: usize = 1;
+        {
+            var n = pane_id;
+            while (n >= 10) : (n /= 10) {
+                id_digits += 1;
+            }
+        }
+
+        const prefix_len = "send-keys -H -t %".len + id_digits + " ".len;
+        const hex_len = data.len * 3; // "XX " per byte (last space becomes \n)
+        const total_len = prefix_len + hex_len;
+
+        const buf = arena_alloc.alloc(u8, total_len) catch return null;
+
+        // Write prefix.
+        var pos: usize = 0;
+        const prefix = std.fmt.bufPrint(buf[0..prefix_len], "send-keys -H -t %{d} ", .{pane_id}) catch return null;
+        pos = prefix.len;
+
+        // Write hex bytes.
+        const hex_upper = "0123456789ABCDEF";
+        for (data, 0..) |byte, i| {
+            buf[pos] = hex_upper[byte >> 4];
+            buf[pos + 1] = hex_upper[byte & 0x0F];
+            if (i < data.len - 1) {
+                buf[pos + 2] = ' ';
+            } else {
+                buf[pos + 2] = '\n';
+            }
+            pos += 3;
+        }
+
+        return .{ .send_keys = buf[0..pos] };
     }
 
     /// Send in an input event (such as a tmux protocol notification,
@@ -1460,16 +1549,20 @@ const TestStep = struct {
     input: Viewer.Input,
     contains_tags: []const std.meta.Tag(Viewer.Action) = &.{},
     contains_command: []const u8 = "",
+    contains_send_keys: []const u8 = "",
     check: ?*const fn (viewer: *Viewer, []const Viewer.Action) anyerror!void = null,
     check_command: ?*const fn (viewer: *Viewer, []const u8) anyerror!void = null,
 
     fn run(self: TestStep, viewer: *Viewer) !void {
         const actions = viewer.next(self.input);
 
-        // Common mistake, forgetting the newline on a command.
+        // Common mistake, forgetting the newline on a command or send_keys.
         for (actions) |action| {
             if (action == .command) {
                 try testing.expect(std.mem.endsWith(u8, action.command, "\n"));
+            }
+            if (action == .send_keys) {
+                try testing.expect(std.mem.endsWith(u8, action.send_keys, "\n"));
             }
         }
 
@@ -1489,6 +1582,19 @@ const TestStep = struct {
             for (actions) |action| {
                 if (action == .command and
                     std.mem.startsWith(u8, action.command, self.contains_command))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            try testing.expect(found);
+        }
+
+        if (self.contains_send_keys.len > 0) {
+            var found = false;
+            for (actions) |action| {
+                if (action == .send_keys and
+                    std.mem.startsWith(u8, action.send_keys, self.contains_send_keys))
                 {
                     found = true;
                     break;
@@ -2318,4 +2424,141 @@ test "two pane flow with pane state" {
             .contains_tags = &.{.exit},
         },
     });
+}
+
+test "setActivePaneId valid pane" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Manually create a pane in the panes map.
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 5, .{ .terminal = t });
+
+    try testing.expectEqual(null, viewer.active_pane_id);
+    viewer.setActivePaneId(5);
+    try testing.expectEqual(5, viewer.active_pane_id);
+}
+
+test "setActivePaneId invalid pane is no-op" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Manually create a pane in the panes map.
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 5, .{ .terminal = t });
+
+    viewer.setActivePaneId(5);
+    try testing.expectEqual(5, viewer.active_pane_id);
+
+    // Setting to an invalid pane should not change active_pane_id.
+    viewer.setActivePaneId(99);
+    try testing.expectEqual(5, viewer.active_pane_id);
+}
+
+test "setActivePaneId null clears" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 5, .{ .terminal = t });
+
+    viewer.setActivePaneId(5);
+    try testing.expectEqual(5, viewer.active_pane_id);
+
+    viewer.setActivePaneId(null);
+    try testing.expectEqual(null, viewer.active_pane_id);
+}
+
+test "sendKeys basic formatting" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Create pane 2.
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 2, .{ .terminal = t });
+    viewer.setActivePaneId(2);
+
+    // "ls\r" = 0x6C 0x73 0x0D
+    const action = viewer.sendKeys("ls\r");
+    try testing.expect(action != null);
+    try testing.expect(action.? == .send_keys);
+    try testing.expectEqualStrings("send-keys -H -t %2 6C 73 0D\n", action.?.send_keys);
+}
+
+test "sendKeys single byte" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 0, .{ .terminal = t });
+    viewer.setActivePaneId(0);
+
+    // Single byte: 'a' = 0x61
+    const action = viewer.sendKeys("a");
+    try testing.expect(action != null);
+    try testing.expectEqualStrings("send-keys -H -t %0 61\n", action.?.send_keys);
+}
+
+test "sendKeys escape sequence" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 10, .{ .terminal = t });
+    viewer.setActivePaneId(10);
+
+    // ESC [ A (cursor up) = 0x1B 0x5B 0x41
+    const action = viewer.sendKeys("\x1B[A");
+    try testing.expect(action != null);
+    try testing.expectEqualStrings("send-keys -H -t %10 1B 5B 41\n", action.?.send_keys);
+}
+
+test "sendKeys empty data returns null" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 0, .{ .terminal = t });
+    viewer.setActivePaneId(0);
+
+    try testing.expectEqual(null, viewer.sendKeys(""));
+}
+
+test "sendKeys no active pane returns null" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 0, .{ .terminal = t });
+
+    // active_pane_id is null by default.
+    try testing.expectEqual(null, viewer.sendKeys("hello"));
+}
+
+test "sendKeys stale pane clears active and returns null" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 3, .{ .terminal = t });
+    viewer.setActivePaneId(3);
+
+    // Remove the pane (simulating tmux pane removal).
+    if (viewer.panes.fetchSwapRemove(3)) |entry_const| {
+        var entry = entry_const;
+        entry.value.deinit(testing.allocator);
+    }
+
+    // sendKeys should detect the stale pane, clear active_pane_id, return null.
+    try testing.expectEqual(null, viewer.sendKeys("x"));
+    try testing.expectEqual(null, viewer.active_pane_id);
 }

@@ -3237,7 +3237,12 @@ fn encodeKey(
 fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    const t = &self.io.terminal;
+
+    // Use renderer_state.terminal rather than self.io.terminal so that
+    // when a tmux pane is active, we read modes (cursor_keys, keypad_keys,
+    // bracketed_paste, etc.) from the pane's terminal, not the host
+    // terminal running `tmux -CC`.
+    const t = self.renderer_state.terminal;
 
     var opts: input.key_encode.Options = .fromTerminal(t);
     if (comptime builtin.os.tag != .macos) return opts;
