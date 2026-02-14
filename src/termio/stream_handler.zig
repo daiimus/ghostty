@@ -395,12 +395,31 @@ pub const StreamHandler = struct {
                     },
 
                     .exit => {
+                        // Reset the renderer terminal pointer back to the main
+                        // terminal BEFORE freeing the viewer. The renderer may
+                        // currently be pointing at a pane terminal inside the
+                        // viewer; freeing the viewer without resetting this
+                        // pointer first would cause a use-after-free crash
+                        // (SIGSEGV) on the renderer thread.
+                        //
+                        // We already hold renderer_state.mutex here (the stream
+                        // handler holds it for the duration of processOutput),
+                        // so this is safe.
+                        self.renderer_state.terminal = self.terminal;
+
                         // Free our viewer state if we have one
                         if (self.tmux_viewer) |viewer| {
                             viewer.deinit();
                             self.alloc.destroy(viewer);
                             self.tmux_viewer = null;
                         }
+
+                        // Notify the surface that tmux control mode
+                        // has exited. The viewer's action-based exit
+                        // path (from viewer.next()) also sends this,
+                        // but we bypass viewer.next() entirely here
+                        // since we're handling the raw DCS %exit event.
+                        self.surfaceMessageWriter(.tmux_exit);
 
                         // And always break since we assert below
                         // that we're not handling an exit command.
