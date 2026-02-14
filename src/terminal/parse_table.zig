@@ -244,6 +244,18 @@ fn genTable() Table {
         range(&result, 0x1C, 0x1F, source, source, .put);
         range(&result, 0x20, 0x7E, source, source, .put);
         single(&result, 0x7F, source, source, .ignore);
+
+        // C1 control codes (0x80-0x9F): override "anywhere" transitions to stay
+        // in dcs_passthrough. tmux control mode protocol data can contain raw
+        // 8-bit bytes (UTF-8 continuation bytes in %output pane content) that
+        // fall in the C1 range. Without these overrides, any such byte would
+        // kick the parser out of dcs_passthrough, terminating tmux control mode
+        // and causing all subsequent protocol data to render as terminal garbage.
+        //
+        // 0x9C (C1 ST) is NOT overridden — it is the legitimate 8-bit DCS
+        // string terminator and must still transition to ground.
+        range(&result, 0x80, 0x9B, source, source, .put);
+        range(&result, 0x9D, 0x9F, source, source, .put);
     }
 
     // csi_param
@@ -407,6 +419,27 @@ test "dcs_passthrough: CAN stays in dcs_passthrough with put" {
 test "dcs_passthrough: SUB stays in dcs_passthrough with put" {
     const t = table;
     const entry = t[0x1A][@intFromEnum(State.dcs_passthrough)];
+    try @import("std").testing.expectEqual(State.dcs_passthrough, entry.state);
+    try @import("std").testing.expectEqual(Action.put, entry.action);
+}
+
+test "dcs_passthrough: C1 0x80 stays in dcs_passthrough with put" {
+    const t = table;
+    const entry = t[0x80][@intFromEnum(State.dcs_passthrough)];
+    try @import("std").testing.expectEqual(State.dcs_passthrough, entry.state);
+    try @import("std").testing.expectEqual(Action.put, entry.action);
+}
+
+test "dcs_passthrough: C1 0x9B (CSI) stays in dcs_passthrough with put" {
+    const t = table;
+    const entry = t[0x9B][@intFromEnum(State.dcs_passthrough)];
+    try @import("std").testing.expectEqual(State.dcs_passthrough, entry.state);
+    try @import("std").testing.expectEqual(Action.put, entry.action);
+}
+
+test "dcs_passthrough: C1 0x9D (OSC) stays in dcs_passthrough with put" {
+    const t = table;
+    const entry = t[0x9D][@intFromEnum(State.dcs_passthrough)];
     try @import("std").testing.expectEqual(State.dcs_passthrough, entry.state);
     try @import("std").testing.expectEqual(Action.put, entry.action);
 }
