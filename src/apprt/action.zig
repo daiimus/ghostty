@@ -336,6 +336,9 @@ pub const Action = union(Key) {
     /// tmux control mode: exited
     tmux_exit: void,
 
+    /// tmux control mode: viewer startup complete, user input safe to send
+    tmux_ready: void,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -403,6 +406,7 @@ pub const Action = union(Key) {
         readonly,
         tmux_state_changed,
         tmux_exit,
+        tmux_ready,
     };
 
     /// Sync with: ghostty_action_u

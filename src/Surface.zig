@@ -1195,6 +1195,17 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 log.warn("apprt failed to notify tmux exit err={}", .{err});
             };
         },
+
+        .tmux_ready => {
+            log.info("tmux viewer startup complete, user input safe", .{});
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_ready,
+                {},
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux ready err={}", .{err});
+            };
+        },
     }
 }
 

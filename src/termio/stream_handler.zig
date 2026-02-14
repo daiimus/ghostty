@@ -481,6 +481,11 @@ pub const StreamHandler = struct {
 
                             self.surfaceMessageWriter(.{ .tmux_state_changed = state });
                         },
+
+                        .ready => {
+                            // Viewer startup complete — user input is safe to send
+                            self.surfaceMessageWriter(.tmux_ready);
+                        },
                     }
                 }
             },
