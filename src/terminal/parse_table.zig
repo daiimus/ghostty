@@ -238,6 +238,9 @@ fn genTable() Table {
         // events
         single(&result, 0x19, source, source, .put);
         range(&result, 0, 0x17, source, source, .put);
+        single(&result, 0x18, source, source, .put); // CAN: override "anywhere" → ground
+        single(&result, 0x1A, source, source, .put); // SUB: override "anywhere" → ground
+        single(&result, 0x1B, source, source, .put); // ESC: override "anywhere" → escape
         range(&result, 0x1C, 0x1F, source, source, .put);
         range(&result, 0x20, 0x7E, source, source, .put);
         single(&result, 0x7F, source, source, .ignore);
@@ -385,4 +388,45 @@ test {
     // This forces comptime-evaluation of table, so we're just testing
     // that it succeeds in creation.
     _ = table;
+}
+
+test "dcs_passthrough: ESC stays in dcs_passthrough with put" {
+    const t = table;
+    const entry = t[0x1B][@intFromEnum(State.dcs_passthrough)];
+    try @import("std").testing.expectEqual(State.dcs_passthrough, entry.state);
+    try @import("std").testing.expectEqual(Action.put, entry.action);
+}
+
+test "dcs_passthrough: CAN stays in dcs_passthrough with put" {
+    const t = table;
+    const entry = t[0x18][@intFromEnum(State.dcs_passthrough)];
+    try @import("std").testing.expectEqual(State.dcs_passthrough, entry.state);
+    try @import("std").testing.expectEqual(Action.put, entry.action);
+}
+
+test "dcs_passthrough: SUB stays in dcs_passthrough with put" {
+    const t = table;
+    const entry = t[0x1A][@intFromEnum(State.dcs_passthrough)];
+    try @import("std").testing.expectEqual(State.dcs_passthrough, entry.state);
+    try @import("std").testing.expectEqual(Action.put, entry.action);
+}
+
+test "dcs_passthrough: C1 ST (0x9C) still transitions to ground" {
+    const t = table;
+    const entry = t[0x9C][@intFromEnum(State.dcs_passthrough)];
+    try @import("std").testing.expectEqual(State.ground, entry.state);
+    try @import("std").testing.expectEqual(Action.none, entry.action);
+}
+
+test "dcs_passthrough: regular bytes still produce put" {
+    const t = table;
+    // Printable ASCII
+    const entry_a = t['A'][@intFromEnum(State.dcs_passthrough)];
+    try @import("std").testing.expectEqual(State.dcs_passthrough, entry_a.state);
+    try @import("std").testing.expectEqual(Action.put, entry_a.action);
+
+    // Control byte in put range
+    const entry_0 = t[0x00][@intFromEnum(State.dcs_passthrough)];
+    try @import("std").testing.expectEqual(State.dcs_passthrough, entry_0.state);
+    try @import("std").testing.expectEqual(Action.put, entry_0.action);
 }
