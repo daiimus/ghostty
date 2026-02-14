@@ -460,6 +460,19 @@ pub const StreamHandler = struct {
                             ));
                         },
 
+                        .send_keys => |send_keys| {
+                            // Fire-and-forget: write directly to tmux stdin,
+                            // bypassing the command queue. The %begin/%end
+                            // response will be discarded as unexpected block
+                            // output by the viewer's nextCommand().
+                            assert(send_keys.len > 0);
+                            assert(send_keys[send_keys.len - 1] == '\n');
+                            self.messageWriter(try termio.Message.writeReq(
+                                self.alloc,
+                                send_keys,
+                            ));
+                        },
+
                         .windows => |windows| {
                             // Build tmux state snapshot to send to surface
                             var state: apprt.surface.Message.TmuxState = .{

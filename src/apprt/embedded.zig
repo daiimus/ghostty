@@ -1884,6 +1884,9 @@ pub const CAPI = struct {
         const viewer = handler.tmux_viewer orelse return false;
         const pane = viewer.panes.getPtr(pane_id) orelse return false;
 
+        // Set the active pane for user input routing (send-keys).
+        viewer.setActivePaneId(pane_id);
+
         // Lock the renderer state and swap the terminal pointer
         surface.core_surface.renderer_state.mutex.lock();
         defer surface.core_surface.renderer_state.mutex.unlock();
@@ -1897,6 +1900,14 @@ pub const CAPI = struct {
 
     /// Reset to render the main terminal (not a tmux pane).
     export fn ghostty_surface_tmux_reset_active_pane(surface: *Surface) void {
+        // Clear the active pane for user input routing.
+        const handler = &surface.core_surface.io.terminal_stream.handler;
+        if (comptime @TypeOf(handler.*).tmux_enabled) {
+            if (handler.tmux_viewer) |viewer| {
+                viewer.setActivePaneId(null);
+            }
+        }
+
         surface.core_surface.renderer_state.mutex.lock();
         defer surface.core_surface.renderer_state.mutex.unlock();
 
@@ -1906,7 +1917,6 @@ pub const CAPI = struct {
         // Trigger a redraw
         surface.core_surface.renderer_thread.wakeup.notify() catch {};
     }
-
 
     /// Debug: Get terminal state for debugging scrollback issues
     export fn ghostty_surface_debug_terminal_state(surface: *Surface) Darwin.TerminalDebugState {
