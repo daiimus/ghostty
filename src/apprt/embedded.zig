@@ -425,6 +425,15 @@ pub const Surface = struct {
         len: usize,
     ) callconv(.c) void = null,
 
+    /// Resize callback for external backend.
+    resize_callback: ?*const fn (
+        surface: *Surface,
+        cols: u16,
+        rows: u16,
+        width_px: u32,
+        height_px: u32,
+    ) callconv(.c) void = null,
+
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
@@ -505,6 +514,18 @@ pub const Surface = struct {
             data: [*]const u8,
             len: usize,
         ) callconv(.c) void = null,
+
+        /// Callback for the external backend when the terminal is resized.
+        /// The embedder should use this to resize the external source
+        /// (e.g., SSH PTY window change request).
+        /// Only used when backend_type is .external.
+        resize_callback: ?*const fn (
+            surface: *Surface,
+            cols: u16,
+            rows: u16,
+            width_px: u32,
+            height_px: u32,
+        ) callconv(.c) void = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -521,6 +542,7 @@ pub const Surface = struct {
             .cursor_pos = .{ .x = -1, .y = -1 },
             .backend_type = opts.backend_type,
             .write_callback = opts.write_callback,
+            .resize_callback = opts.resize_callback,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -668,6 +690,14 @@ pub const Surface = struct {
                         }
                     }.wrapper else null,
                     .write_userdata = self,
+                    .resize_callback = if (self.resize_callback != null) struct {
+                        fn wrapper(cols: u16, rows: u16, width_px: u32, height_px: u32, userdata: ?*anyopaque) void {
+                            const surface: *Surface = @ptrCast(@alignCast(userdata));
+                            const callback = surface.resize_callback.?;
+                            callback(surface, cols, rows, width_px, height_px);
+                        }
+                    }.wrapper else null,
+                    .resize_userdata = self,
                 }),
             },
         };
