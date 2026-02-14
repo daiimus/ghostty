@@ -417,19 +417,35 @@ pub inline fn queueWrite(
     // wrapped in `send-keys -H` commands targeting the active pane.
     // Raw bytes written to tmux stdin would be interpreted as tmux
     // commands, not forwarded to the pane's shell.
+    //
+    // The renderer_state mutex must be held while reading tmux_viewer,
+    // calling sendKeys, AND writing the result to the backend. The
+    // viewer is created/destroyed by processOutput on a different
+    // thread (main thread for the External backend, read thread for
+    // Exec). Without the lock, the IO thread could see a stale null
+    // pointer or dereference a freed viewer (use-after-free). The
+    // lock must extend through backend.queueWrite because sendKeys
+    // returns a slice from the viewer's action_arena, which
+    // processOutput can reset via viewer.next() on the other thread.
     if (comptime StreamHandler.tmux_enabled) {
-        if (self.terminal_stream.handler.tmux_viewer) |viewer| {
-            if (viewer.sendKeys(data)) |action| {
+        self.renderer_state.mutex.lock();
+        const viewer = self.terminal_stream.handler.tmux_viewer;
+        if (viewer) |v| {
+            defer self.renderer_state.mutex.unlock();
+
+            if (v.sendKeys(data)) |action| {
                 try self.backend.queueWrite(
                     self.alloc,
                     td,
                     action.send_keys,
                     false,
                 );
+            } else {
+                log.warn("tmux send-keys returned null for {} byte(s), input dropped", .{data.len});
             }
             // Handle linefeed as a separate send-keys for CR.
             if (linefeed) {
-                if (viewer.sendKeys(&[_]u8{'\r'})) |action| {
+                if (v.sendKeys(&[_]u8{'\r'})) |action| {
                     try self.backend.queueWrite(
                         self.alloc,
                         td,
@@ -440,6 +456,7 @@ pub inline fn queueWrite(
             }
             return;
         }
+        self.renderer_state.mutex.unlock();
     }
     try self.backend.queueWrite(self.alloc, td, data, linefeed);
 }

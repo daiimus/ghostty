@@ -1885,9 +1885,17 @@ pub const CAPI = struct {
 
     /// Get the number of tmux panes in the current session.
     /// Returns 0 if not in tmux control mode.
+    ///
+    /// Acquires renderer_state.mutex to synchronize with processOutput,
+    /// which creates/destroys the viewer and modifies the panes map on
+    /// the read/main thread.
     export fn ghostty_surface_tmux_pane_count(surface: *Surface) usize {
         const handler = &surface.core_surface.io.terminal_stream.handler;
         if (comptime !@TypeOf(handler.*).tmux_enabled) return 0;
+
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
         const viewer = handler.tmux_viewer orelse return 0;
         return viewer.panes.count();
     }
@@ -1895,6 +1903,8 @@ pub const CAPI = struct {
     /// Get the IDs of tmux panes.
     /// Writes up to max_count pane IDs to out_ids and returns the number written.
     /// Returns 0 if not in tmux control mode.
+    ///
+    /// Acquires renderer_state.mutex to synchronize with processOutput.
     export fn ghostty_surface_tmux_pane_ids(
         surface: *Surface,
         out_ids: [*]usize,
@@ -1902,6 +1912,10 @@ pub const CAPI = struct {
     ) usize {
         const handler = &surface.core_surface.io.terminal_stream.handler;
         if (comptime !@TypeOf(handler.*).tmux_enabled) return 0;
+
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
         const viewer = handler.tmux_viewer orelse return 0;
         var count: usize = 0;
         var it = viewer.panes.iterator();
@@ -1915,22 +1929,28 @@ pub const CAPI = struct {
 
     /// Set the active tmux pane for rendering.
     /// Returns true if successful, false if pane_id not found or not in tmux mode.
+    ///
+    /// Acquires renderer_state.mutex for the entire operation to synchronize
+    /// viewer state (panes map, active_pane_id) with both processOutput
+    /// (which modifies the viewer) and queueWrite (which reads active_pane_id
+    /// via sendKeys on the IO thread).
     export fn ghostty_surface_tmux_set_active_pane(
         surface: *Surface,
         pane_id: usize,
     ) bool {
         const handler = &surface.core_surface.io.terminal_stream.handler;
         if (comptime !@TypeOf(handler.*).tmux_enabled) return false;
+
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
         const viewer = handler.tmux_viewer orelse return false;
         const pane = viewer.panes.getPtr(pane_id) orelse return false;
 
         // Set the active pane for user input routing (send-keys).
         viewer.setActivePaneId(pane_id);
 
-        // Lock the renderer state and swap the terminal pointer
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
-
+        // Swap the terminal pointer for rendering.
         surface.core_surface.renderer_state.terminal = &pane.terminal;
 
         // Trigger a redraw
@@ -1939,17 +1959,20 @@ pub const CAPI = struct {
     }
 
     /// Reset to render the main terminal (not a tmux pane).
+    ///
+    /// Acquires renderer_state.mutex for the entire operation.
     export fn ghostty_surface_tmux_reset_active_pane(surface: *Surface) void {
-        // Clear the active pane for user input routing.
         const handler = &surface.core_surface.io.terminal_stream.handler;
+
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        // Clear the active pane for user input routing.
         if (comptime @TypeOf(handler.*).tmux_enabled) {
             if (handler.tmux_viewer) |viewer| {
                 viewer.setActivePaneId(null);
             }
         }
-
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
 
         // Reset to the main termio terminal
         surface.core_surface.renderer_state.terminal = &surface.core_surface.io.terminal;
