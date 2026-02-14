@@ -1215,6 +1215,16 @@ fn selectionScrollTick(self: *Surface) !void {
     defer self.renderer_state.mutex.unlock();
     const t: *terminal.Terminal = self.renderer_state.terminal;
 
+    // In tmux control mode, skip selection scroll for the same reason
+    // as the left-click guard: pin/terminal mismatch.
+    if (t != &self.io.terminal) {
+        self.queueIo(
+            .{ .selection_scroll = false },
+            .locked,
+        );
+        return;
+    }
+
     // If our screen changed while this is happening, we stop our
     // selection scroll.
     if (self.mouse.left_click_screen != t.screens.active_key) {
@@ -4033,6 +4043,15 @@ pub fn mouseButtonCallback(
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
         const t: *terminal.Terminal = self.renderer_state.terminal;
+
+        // In tmux control mode, renderer_state.terminal points to a pane
+        // terminal while self.io.terminal is the main terminal. Selection
+        // operations use self.io.terminal but pins come from the pane
+        // terminal — these have different page memory so dereferencing
+        // pins across terminals is a use-after-free. Skip selection until
+        // the architecture supports pane-terminal selection.
+        if (t != &self.io.terminal) break :click;
+
         const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
 
         const pos = try self.rt_surface.getCursorPos();
@@ -4174,6 +4193,10 @@ pub fn mouseButtonCallback(
     if (button == .right and action == .press) sel: {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
+
+        // In tmux control mode, skip right-click selection for the same
+        // reason as the left-click guard: pin/terminal mismatch.
+        if (self.renderer_state.terminal != &self.io.terminal) break :sel;
 
         // Get our viewport pin
         const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
@@ -4763,6 +4786,10 @@ pub fn cursorPosCallback(
         // back then we can continue our selection.
         const t: *terminal.Terminal = self.renderer_state.terminal;
         if (self.mouse.left_click_screen != t.screens.active_key) break :select;
+
+        // In tmux control mode, skip drag selection for the same reason
+        // as the left-click guard: pin/terminal mismatch.
+        if (t != &self.io.terminal) break :select;
 
         // All roads lead to requiring a re-render at this point.
         try self.queueRender();
