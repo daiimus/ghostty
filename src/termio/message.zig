@@ -82,6 +82,15 @@ pub const Message = union(enum) {
     /// Write where the data is allocated and must be freed.
     write_alloc: WriteReq.Alloc,
 
+    /// Direct write variants bypass tmux send-keys wrapping in
+    /// queueWrite. These are used for tmux protocol commands (e.g.
+    /// display-message, list-windows) and pre-formatted send-keys
+    /// commands that the tmux viewer itself generates. These must
+    /// be sent as raw bytes to tmux's stdin, not re-wrapped.
+    write_small_direct: WriteReq.Small,
+    write_stable_direct: WriteReq.Stable,
+    write_alloc_direct: WriteReq.Alloc,
+
     /// Return a write request for the given data. This will use
     /// write_small if it fits or write_alloc otherwise. This should NOT
     /// be used for stable pointers which can be manually set to write_stable.
@@ -90,6 +99,17 @@ pub const Message = union(enum) {
             .stable => unreachable,
             .small => |v| Message{ .write_small = v },
             .alloc => |v| Message{ .write_alloc = v },
+        };
+    }
+
+    /// Like writeReq, but produces a "direct" message that bypasses
+    /// tmux send-keys wrapping. Use this for tmux protocol commands
+    /// and pre-formatted send-keys that must reach tmux stdin as-is.
+    pub fn writeReqDirect(alloc: Allocator, data: anytype) !Message {
+        return switch (try WriteReq.init(alloc, data)) {
+            .stable => unreachable,
+            .small => |v| Message{ .write_small_direct = v },
+            .alloc => |v| Message{ .write_alloc_direct = v },
         };
     }
 
@@ -110,4 +130,25 @@ test {
     // Ensure we don't grow our IO message size without explicitly wanting to.
     const testing = std.testing;
     try testing.expectEqual(@as(usize, 40), @sizeOf(Message));
+}
+
+test "writeReq produces non-direct variants" {
+    const testing = std.testing;
+    const msg = try Message.writeReq(testing.allocator, @as([]const u8, "hello"));
+    try testing.expect(msg == .write_small);
+}
+
+test "writeReqDirect produces direct variants" {
+    const testing = std.testing;
+    const msg = try Message.writeReqDirect(testing.allocator, @as([]const u8, "hello"));
+    try testing.expect(msg == .write_small_direct);
+}
+
+test "writeReqDirect alloc path for large data" {
+    const testing = std.testing;
+    // Create data larger than WriteReq.Small.Max (38 bytes)
+    const large = "X" ** 50;
+    const msg = try Message.writeReqDirect(testing.allocator, @as([]const u8, large));
+    defer msg.write_alloc_direct.alloc.free(msg.write_alloc_direct.data);
+    try testing.expect(msg == .write_alloc_direct);
 }

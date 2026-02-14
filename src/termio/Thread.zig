@@ -351,6 +351,32 @@ fn drainMailbox(
                     self.flags.linefeed_mode,
                 );
             },
+
+            // Direct writes bypass tmux send-keys wrapping in
+            // queueWrite. These go straight to the backend (pty/SSH
+            // channel) as raw bytes — used for tmux protocol commands
+            // and pre-formatted send-keys from the viewer.
+            .write_small_direct => |v| try io.backend.queueWrite(
+                io.alloc,
+                data,
+                v.data[0..v.len],
+                false,
+            ),
+            .write_stable_direct => |v| try io.backend.queueWrite(
+                io.alloc,
+                data,
+                v,
+                false,
+            ),
+            .write_alloc_direct => |v| {
+                defer v.alloc.free(v.data);
+                try io.backend.queueWrite(
+                    io.alloc,
+                    data,
+                    v.data,
+                    false,
+                );
+            },
         }
     }
 
