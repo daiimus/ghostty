@@ -190,6 +190,12 @@ pub const Viewer = struct {
     /// errors on single-action returns, especially those such as `.exit`.
     action_single: [1]Action,
 
+    /// Whether the initial `.ready` action has been sent. This is set
+    /// to true the first time the command queue drains after entering
+    /// the `command_queue` state. It prevents duplicate ready signals
+    /// when the queue drains again (e.g., after layout changes).
+    initial_ready_sent: bool,
+
     pub const CommandQueue = CircBuf(Command, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, Pane);
 
@@ -210,6 +216,14 @@ pub const Viewer = struct {
         /// are guaranteed to be stable. Additionally, tmux (as of Dec 2025)
         /// never reuses window IDs within a server process lifetime.
         windows: []const Window,
+
+        /// The initial command queue has drained after startup. This is
+        /// emitted once after the viewer finishes processing all startup
+        /// commands (tmux_version, list_windows, capture-pane for each
+        /// pane, pane_state). The apprt can use this signal to know that
+        /// user input is safe to send without interleaving with viewer
+        /// commands.
+        ready,
 
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
@@ -283,6 +297,7 @@ pub const Viewer = struct {
             .panes = .empty,
             .action_arena = .{},
             .action_single = undefined,
+            .initial_ready_sent = false,
         };
     }
 
@@ -549,6 +564,20 @@ pub const Viewer = struct {
                 actions.append(
                     arena_alloc,
                     .{ .command = builder.writer.buffered() },
+                ) catch return self.defunct();
+            } else if (!self.initial_ready_sent) {
+                // The command queue has drained for the first time after
+                // startup. Signal that the viewer is ready — user input
+                // is now safe to send without interleaving with viewer
+                // commands.
+                self.initial_ready_sent = true;
+
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+
+                actions.append(
+                    arena.allocator(),
+                    .ready,
                 ) catch return self.defunct();
             }
         }

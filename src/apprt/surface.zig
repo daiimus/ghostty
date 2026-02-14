@@ -116,6 +116,9 @@ pub const Message = union(enum) {
     /// tmux control mode: session exited
     tmux_exit: void,
 
+    /// tmux control mode: viewer startup complete, user input safe to send
+    tmux_ready: void,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
