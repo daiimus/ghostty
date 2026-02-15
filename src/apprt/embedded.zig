@@ -2024,6 +2024,121 @@ pub const CAPI = struct {
         surface.core_surface.renderer_thread.wakeup.notify() catch {};
     }
 
+    // =========================================================================
+    // tmux Window API
+    // =========================================================================
+
+    /// Info about a tmux window, returned by ghostty_surface_tmux_window_info.
+    pub const TmuxWindowInfo = extern struct {
+        /// The tmux window ID (e.g., 0 for @0).
+        id: usize,
+        /// Window width in columns.
+        width: usize,
+        /// Window height in rows.
+        height: usize,
+        /// Actual length of the window name in bytes. May exceed name_buf_len
+        /// if the caller's buffer was too small (name was truncated).
+        name_len: usize,
+    };
+
+    /// Get the number of tmux windows in the current session.
+    /// Returns 0 if not in tmux control mode.
+    ///
+    /// Acquires renderer_state.mutex to synchronize with processOutput.
+    export fn ghostty_surface_tmux_window_count(surface: *Surface) usize {
+        const handler = &surface.core_surface.io.terminal_stream.handler;
+        if (comptime !@TypeOf(handler.*).tmux_enabled) return 0;
+
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const viewer = handler.tmux_viewer orelse return 0;
+        return viewer.windows.items.len;
+    }
+
+    /// Get info about a tmux window by index.
+    /// Copies the window name into out_name (up to name_buf_len bytes).
+    /// Returns a TmuxWindowInfo struct with id, dimensions, and actual name_len.
+    /// Returns zeroed struct if index is out of bounds or not in tmux mode.
+    ///
+    /// Acquires renderer_state.mutex to synchronize with processOutput.
+    export fn ghostty_surface_tmux_window_info(
+        surface: *Surface,
+        index: usize,
+        out_name: ?[*]u8,
+        name_buf_len: usize,
+    ) TmuxWindowInfo {
+        const handler = &surface.core_surface.io.terminal_stream.handler;
+        if (comptime !@TypeOf(handler.*).tmux_enabled) return std.mem.zeroes(TmuxWindowInfo);
+
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const viewer = handler.tmux_viewer orelse return std.mem.zeroes(TmuxWindowInfo);
+        const windows = viewer.windows.items;
+        if (index >= windows.len) return std.mem.zeroes(TmuxWindowInfo);
+
+        const win = windows[index];
+        const copy_len = @min(win.name.len, name_buf_len);
+        if (out_name) |buf| {
+            @memcpy(buf[0..copy_len], win.name[0..copy_len]);
+        }
+
+        return .{
+            .id = win.id,
+            .width = win.width,
+            .height = win.height,
+            .name_len = win.name.len,
+        };
+    }
+
+    /// Get the raw tmux layout string for a window by index.
+    /// Copies the layout string into out_buf (up to buf_len bytes).
+    /// Returns the actual layout string length (may exceed buf_len if truncated).
+    /// Returns 0 if index is out of bounds or not in tmux mode.
+    ///
+    /// Acquires renderer_state.mutex to synchronize with processOutput.
+    export fn ghostty_surface_tmux_window_layout(
+        surface: *Surface,
+        index: usize,
+        out_buf: ?[*]u8,
+        buf_len: usize,
+    ) usize {
+        const handler = &surface.core_surface.io.terminal_stream.handler;
+        if (comptime !@TypeOf(handler.*).tmux_enabled) return 0;
+
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const viewer = handler.tmux_viewer orelse return 0;
+        const windows = viewer.windows.items;
+        if (index >= windows.len) return 0;
+
+        const layout = windows[index].raw_layout;
+        const copy_len = @min(layout.len, buf_len);
+        if (out_buf) |buf| {
+            @memcpy(buf[0..copy_len], layout[0..copy_len]);
+        }
+
+        return layout.len;
+    }
+
+    /// Get the active tmux window ID.
+    /// Returns -1 if not in tmux mode or no active window is set.
+    ///
+    /// Acquires renderer_state.mutex to synchronize with processOutput.
+    export fn ghostty_surface_tmux_active_window_id(surface: *Surface) isize {
+        const handler = &surface.core_surface.io.terminal_stream.handler;
+        if (comptime !@TypeOf(handler.*).tmux_enabled) return -1;
+
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const viewer = handler.tmux_viewer orelse return -1;
+        const id = viewer.active_window_id orelse return -1;
+        return @intCast(id);
+    }
+
     /// Debug: Get terminal state for debugging scrollback issues
     export fn ghostty_surface_debug_terminal_state(surface: *Surface) Darwin.TerminalDebugState {
         surface.core_surface.renderer_state.mutex.lock();
