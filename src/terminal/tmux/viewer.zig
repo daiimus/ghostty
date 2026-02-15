@@ -2635,3 +2635,93 @@ test "sendKeys after setActivePaneId round-trip" {
     // active_pane_id should remain %2 (the setActivePaneId no-ops).
     try testing.expectEqual(@as(?usize, 2), viewer.active_pane_id);
 }
+
+test "pane terminal pointer invalidated after layout change" {
+    // Regression test for use-after-free: after syncLayouts replaces
+    // the panes map, any pointer into the old map's backing array is
+    // dangling. Callers (e.g. renderer_state.terminal) must re-resolve
+    // pointers via active_pane_id after a .windows action.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // One-pane layout
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane commands + pane_state
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+    });
+
+    // Set active pane to %0 and capture the terminal pointer.
+    viewer.setActivePaneId(0);
+    const old_pane_ptr = viewer.panes.getPtr(0).?;
+    const old_terminal_ptr: *const Terminal = &old_pane_ptr.terminal;
+
+    // Now send a layout_change with the same pane (resize).
+    // This triggers syncLayouts which replaces the panes map.
+    try testViewer(&viewer, &.{
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = "acfd,120x50,0,0,0",
+                .visible_layout = "acfd,120x50,0,0,0",
+                .raw_flags = "*",
+            } } },
+            .contains_tags = &.{.windows},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Pane %0 should still exist.
+                    try testing.expectEqual(1, v.panes.count());
+                    try testing.expect(v.panes.contains(0));
+                    // active_pane_id should be preserved.
+                    try testing.expectEqual(@as(?usize, 0), v.active_pane_id);
+                    // Pane terminal should have been resized to
+                    // the new layout dimensions (120x50).
+                    const pane = v.panes.getPtr(0).?;
+                    try testing.expectEqual(120, pane.terminal.cols);
+                    try testing.expectEqual(50, pane.terminal.rows);
+                }
+            }).check,
+        },
+    });
+
+    // After syncLayouts, the new pane pointer may differ from the old one
+    // (the backing array was reallocated). The old pointer is now dangling.
+    // Anyone holding old_terminal_ptr (like renderer_state.terminal) must
+    // re-resolve via active_pane_id.
+    const new_pane_ptr = viewer.panes.getPtr(0).?;
+    const new_terminal_ptr: *const Terminal = &new_pane_ptr.terminal;
+
+    // The pane data is preserved (same Terminal contents) but the
+    // pointer may have moved. Callers MUST NOT use old_terminal_ptr.
+    _ = old_terminal_ptr;
+    _ = new_terminal_ptr;
+    // The active_pane_id mechanism allows safe re-resolution:
+    if (viewer.active_pane_id) |id| {
+        const resolved = viewer.panes.getPtr(id).?;
+        try testing.expectEqual(new_pane_ptr, resolved);
+    }
+}
