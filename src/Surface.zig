@@ -918,6 +918,14 @@ pub fn deactivateInspector(self: *Surface) void {
     self.inspector = null;
 }
 
+/// Return the terminal that represents the currently visible content.
+/// In tmux control mode this is the active pane's terminal (set via
+/// `ghostty_surface_tmux_set_active_pane`); otherwise it is the main
+/// termio terminal. The caller MUST hold `renderer_state.mutex`.
+inline fn activeTerminal(self: *const Surface) *terminal.Terminal {
+    return self.renderer_state.terminal;
+}
+
 /// True if the surface requires confirmation to quit. This should be called
 /// by apprt to determine if the surface should confirm before quitting.
 pub fn needsConfirmQuit(self: *Surface) bool {
@@ -935,7 +943,7 @@ pub fn needsConfirmQuit(self: *Surface) bool {
         .true => true: {
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
-            break :true !self.io.terminal.cursorIsAtPrompt();
+            break :true !self.activeTerminal().cursorIsAtPrompt();
         },
     };
 }
@@ -1205,17 +1213,7 @@ fn selectionScrollTick(self: *Surface) !void {
     // We need our locked state for the remainder
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    const t: *terminal.Terminal = self.renderer_state.terminal;
-
-    // In tmux control mode, skip selection scroll for the same reason
-    // as the left-click guard: pin/terminal mismatch.
-    if (t != &self.io.terminal) {
-        self.queueIo(
-            .{ .selection_scroll = false },
-            .locked,
-        );
-        return;
-    }
+    const t: *terminal.Terminal = self.activeTerminal();
 
     // If our screen changed while this is happening, we stop our
     // selection scroll.
@@ -1619,7 +1617,7 @@ fn mouseRefreshLinks(
         const left_idx = @intFromEnum(input.MouseButton.left);
         if (self.mouse.click_state[left_idx] == .press) click: {
             const pin = self.mouse.left_click_pin orelse break :click;
-            const click_pt = self.io.terminal.screens.active.pages.pointFromPin(
+            const click_pt = self.activeTerminal().screens.active.pages.pointFromPin(
                 .viewport,
                 pin.*,
             ) orelse break :click;
@@ -1633,7 +1631,7 @@ fn mouseRefreshLinks(
         const link = (try self.linkAtPos(pos)) orelse break :link .{ null, false };
         switch (link.action) {
             .open => {
-                const str = try self.io.terminal.screens.active.selectionString(alloc, .{
+                const str = try self.activeTerminal().screens.active.selectionString(alloc, .{
                     .sel = link.selection,
                     .trim = false,
                 });
@@ -1688,7 +1686,7 @@ fn mouseRefreshLinks(
         _ = try self.rt_app.performAction(
             .{ .surface = self },
             .mouse_shape,
-            self.io.terminal.mouse_shape,
+            self.activeTerminal().mouse_shape,
         );
         _ = try self.rt_app.performAction(
             .{ .surface = self },
@@ -1946,8 +1944,10 @@ pub fn dumpTextLocked(
     alloc: Allocator,
     sel: terminal.Selection,
 ) !Text {
+    const t = self.activeTerminal();
+
     // Read out the text
-    const text = try self.io.terminal.screens.active.selectionString(alloc, .{
+    const text = try t.screens.active.selectionString(alloc, .{
         .sel = sel,
         .trim = false,
     });
@@ -1957,19 +1957,19 @@ pub fn dumpTextLocked(
     const vp: ?Text.Viewport = viewport: {
         // If our bottom right pin is before the viewport, then we can't
         // possibly have this text be within the viewport.
-        const vp_tl_pin = self.io.terminal.screens.active.pages.getTopLeft(.viewport);
-        const br_pin = sel.bottomRight(self.io.terminal.screens.active);
+        const vp_tl_pin = t.screens.active.pages.getTopLeft(.viewport);
+        const br_pin = sel.bottomRight(t.screens.active);
         if (br_pin.before(vp_tl_pin)) break :viewport null;
 
         // If our top-left pin is after the viewport, then we can't possibly
         // have this text be within the viewport.
-        const vp_br_pin = self.io.terminal.screens.active.pages.getBottomRight(.viewport) orelse {
+        const vp_br_pin = t.screens.active.pages.getBottomRight(.viewport) orelse {
             // I don't think this is possible but I don't want to crash on
             // that assertion so let's just break out...
             log.warn("viewport bottom-right pin not found, bug?", .{});
             break :viewport null;
         };
-        const tl_pin = sel.topLeft(self.io.terminal.screens.active);
+        const tl_pin = sel.topLeft(t.screens.active);
         if (vp_br_pin.before(tl_pin)) break :viewport null;
 
         // We established that our top-left somewhere before the viewport
@@ -1979,7 +1979,7 @@ pub fn dumpTextLocked(
 
         // Our top-left point. If it doesn't exist in the viewport it must
         // be before and we can return (0,0).
-        const tl_pt: terminal.Point = self.io.terminal.screens.active.pages.pointFromPin(
+        const tl_pt: terminal.Point = t.screens.active.pages.pointFromPin(
             .viewport,
             tl_pin,
         ) orelse tl: {
@@ -1992,7 +1992,7 @@ pub fn dumpTextLocked(
 
         // Our bottom-right point. If it doesn't exist in the viewport
         // it must be the bottom-right of the viewport.
-        const br_pt = self.io.terminal.screens.active.pages.pointFromPin(
+        const br_pt = t.screens.active.pages.pointFromPin(
             .viewport,
             br_pin,
         ) orelse br: {
@@ -2000,7 +2000,7 @@ pub fn dumpTextLocked(
                 assert(vp_br_pin.before(br_pin));
             }
 
-            break :br self.io.terminal.screens.active.pages.pointFromPin(
+            break :br t.screens.active.pages.pointFromPin(
                 .viewport,
                 vp_br_pin,
             ).?;
@@ -2041,8 +2041,8 @@ pub fn dumpTextLocked(
         };
 
         // Utilize viewport sizing to convert to offsets
-        const start = tl_coord.y * self.io.terminal.screens.active.pages.cols + tl_coord.x;
-        const end = br_coord.y * self.io.terminal.screens.active.pages.cols + br_coord.x;
+        const start = tl_coord.y * t.screens.active.pages.cols + tl_coord.x;
+        const end = br_coord.y * t.screens.active.pages.cols + br_coord.x;
 
         break :viewport .{
             .tl_px_x = x,
@@ -2062,15 +2062,15 @@ pub fn dumpTextLocked(
 pub fn hasSelection(self: *const Surface) bool {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    return self.io.terminal.screens.active.selection != null;
+    return self.activeTerminal().screens.active.selection != null;
 }
 
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    const sel = self.io.terminal.screens.active.selection orelse return null;
-    return try self.io.terminal.screens.active.selectionString(alloc, .{
+    const sel = self.activeTerminal().screens.active.selection orelse return null;
+    return try self.activeTerminal().screens.active.selectionString(alloc, .{
         .sel = sel,
         .trim = false,
     });
@@ -2085,7 +2085,7 @@ pub fn pwd(
 ) Allocator.Error!?[]const u8 {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    const terminal_pwd = self.io.terminal.getPwd() orelse return null;
+    const terminal_pwd = self.activeTerminal().getPwd() orelse return null;
     return try alloc.dupe(u8, terminal_pwd);
 }
 
@@ -2095,7 +2095,7 @@ fn resolvePathForOpening(
     path: []const u8,
 ) Allocator.Error!?[]const u8 {
     if (!std.fs.path.isAbsolute(path)) {
-        const terminal_pwd = self.io.terminal.getPwd() orelse {
+        const terminal_pwd = self.activeTerminal().getPwd() orelse {
             return null;
         };
 
@@ -2245,6 +2245,8 @@ fn copySelectionToClipboards(
     defer arena.deinit();
     const alloc = arena.allocator();
 
+    const t = self.activeTerminal();
+
     // The options we'll use for all formatting. We'll just override the
     // emit format.
     const opts: terminal.formatter.Options = .{
@@ -2252,9 +2254,9 @@ fn copySelectionToClipboards(
         .unwrap = true,
         .trim = self.config.clipboard_trim_trailing_spaces,
         .codepoint_map = self.config.clipboard_codepoint_map.map.list,
-        .background = self.io.terminal.colors.background.get(),
-        .foreground = self.io.terminal.colors.foreground.get(),
-        .palette = &self.io.terminal.colors.palette.current,
+        .background = t.colors.background.get(),
+        .foreground = t.colors.foreground.get(),
+        .palette = &t.colors.palette.current,
     };
 
     const ScreenFormatter = terminal.formatter.ScreenFormatter;
@@ -2262,7 +2264,7 @@ fn copySelectionToClipboards(
     var contents: std.ArrayList(apprt.ClipboardContent) = .empty;
     switch (format) {
         .plain => {
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
+            var formatter: ScreenFormatter = .init(t.screens.active, opts);
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
             try contents.append(alloc, .{
@@ -2272,7 +2274,7 @@ fn copySelectionToClipboards(
         },
 
         .vt => {
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts: {
+            var formatter: ScreenFormatter = .init(t.screens.active, opts: {
                 var copy = opts;
                 copy.emit = .vt;
                 break :opts copy;
@@ -2289,7 +2291,7 @@ fn copySelectionToClipboards(
         },
 
         .html => {
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts: {
+            var formatter: ScreenFormatter = .init(t.screens.active, opts: {
                 var copy = opts;
                 copy.emit = .html;
                 break :opts copy;
@@ -2307,7 +2309,7 @@ fn copySelectionToClipboards(
 
         .mixed => {
             // First, generate plain text with codepoint mappings applied
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
+            var formatter: ScreenFormatter = .init(t.screens.active, opts);
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
             try contents.append(alloc, .{
@@ -2317,7 +2319,7 @@ fn copySelectionToClipboards(
 
             assert(aw.written().len == 0);
             // Second, generate HTML without codepoint mappings
-            formatter = .init(self.io.terminal.screens.active, opts: {
+            formatter = .init(t.screens.active, opts: {
                 var copy = opts;
                 copy.emit = .html;
 
@@ -2357,8 +2359,8 @@ fn copySelectionToClipboards(
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
-    const prev_ = self.io.terminal.screens.active.selection;
-    try self.io.terminal.screens.active.select(sel_);
+    const prev_ = self.activeTerminal().screens.active.selection;
+    try self.activeTerminal().screens.active.select(sel_);
 
     // If copy on select is false then exit early.
     if (self.config.copy_on_select == .false) return;
@@ -2703,7 +2705,7 @@ pub fn keyCallback(
     if (self.config.vt_kam_allowed) {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-        if (self.io.terminal.modes.get(.disable_keyboard)) return .consumed;
+        if (self.activeTerminal().modes.get(.disable_keyboard)) return .consumed;
     }
 
     // If this input event has text, then we hide the mouse if configured.
@@ -2742,12 +2744,12 @@ pub fn keyCallback(
                 log.warn("failed to refresh links err={}", .{err});
                 break :mouse_mods;
             };
-        } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
+        } else if (self.activeTerminal().flags.mouse_event != .none and !self.mouse.mods.shift) {
             // If we have mouse reports on and we don't have shift pressed, we reset state
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
-                self.io.terminal.mouse_shape,
+                self.activeTerminal().mouse_shape,
             );
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -2762,8 +2764,8 @@ pub fn keyCallback(
     // needed, depending on the key state.
     if ((SurfaceMouse{
         .physical_key = event.key,
-        .mouse_event = self.io.terminal.flags.mouse_event,
-        .mouse_shape = self.io.terminal.mouse_shape,
+        .mouse_event = self.activeTerminal().flags.mouse_event,
+        .mouse_shape = self.activeTerminal().mouse_shape,
         .mods = self.mouse.mods,
         .over_link = self.mouse.over_link,
         .hidden = self.mouse.hidden,
@@ -2834,7 +2836,7 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) try self.activeTerminal().scrollViewport(.bottom);
 
         try self.queueRender();
     }
@@ -3534,16 +3536,17 @@ pub fn scrollCallback(
         // we convert to cursor keys. This only happens if we're:
         // (1) alt screen (2) no explicit mouse reporting and (3) alt
         // scroll mode enabled.
-        if (self.io.terminal.screens.active_key == .alternate and
-            self.io.terminal.flags.mouse_event == .none and
-            self.io.terminal.modes.get(.mouse_alternate_scroll))
+        const t = self.activeTerminal();
+        if (t.screens.active_key == .alternate and
+            t.flags.mouse_event == .none and
+            t.modes.get(.mouse_alternate_scroll))
         {
             if (y.delta != 0) {
                 // When we send mouse events as cursor keys we always
                 // clear the selection.
                 try self.setSelection(null);
 
-                const seq = if (self.io.terminal.modes.get(.cursor_keys)) seq: {
+                const seq = if (t.modes.get(.cursor_keys)) seq: {
                     // cursor key: application mode
                     break :seq switch (y.direction()) {
                         .up_right => "\x1bOA",
@@ -3595,7 +3598,7 @@ pub fn scrollCallback(
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
-            self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+            try self.activeTerminal().scrollViewport(.{ .delta = y.delta * -1 });
         }
     }
 
@@ -4004,7 +4007,7 @@ pub fn mouseButtonCallback(
         if (self.config.copy_on_select != .false) {
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
-            const prev_ = self.io.terminal.screens.active.selection;
+            const prev_ = self.activeTerminal().screens.active.selection;
             if (prev_) |prev| {
                 try self.setSelection(terminal.Selection.init(
                     prev.start(),
@@ -4080,17 +4083,9 @@ pub fn mouseButtonCallback(
     if (button == .left and action == .press) click: {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-        const t: *terminal.Terminal = self.renderer_state.terminal;
+        const t: *terminal.Terminal = self.activeTerminal();
 
-        // In tmux control mode, renderer_state.terminal points to a pane
-        // terminal while self.io.terminal is the main terminal. Selection
-        // operations use self.io.terminal but pins come from the pane
-        // terminal — these have different page memory so dereferencing
-        // pins across terminals is a use-after-free. Skip selection until
-        // the architecture supports pane-terminal selection.
-        if (t != &self.io.terminal) break :click;
-
-        const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
+        const screen: *terminal.Screen = t.screens.active;
 
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
@@ -4167,8 +4162,8 @@ pub fn mouseButtonCallback(
             // Single click
             1 => {
                 // If we have a selection, clear it. This always happens.
-                if (self.io.terminal.screens.active.selection != null) {
-                    try self.io.terminal.screens.active.select(null);
+                if (self.activeTerminal().screens.active.selection != null) {
+                    try self.activeTerminal().screens.active.select(null);
                     try self.queueRender();
                 }
             },
@@ -4189,10 +4184,10 @@ pub fn mouseButtonCallback(
                         // Ignore any errors, likely regex errors.
                     }
 
-                    break :sel self.io.terminal.screens.active.selectWord(pin.*, self.config.selection_word_chars);
+                    break :sel self.activeTerminal().screens.active.selectWord(pin.*, self.config.selection_word_chars);
                 };
                 if (sel_) |sel| {
-                    try self.io.terminal.screens.active.select(sel);
+                    try self.activeTerminal().screens.active.select(sel);
                     try self.queueRender();
                 }
             },
@@ -4200,11 +4195,11 @@ pub fn mouseButtonCallback(
             // Triple click, select the line under our mouse
             3 => {
                 const sel_ = if (mods.ctrlOrSuper())
-                    self.io.terminal.screens.active.selectOutput(pin.*)
+                    self.activeTerminal().screens.active.selectOutput(pin.*)
                 else
-                    self.io.terminal.screens.active.selectLine(.{ .pin = pin.* });
+                    self.activeTerminal().screens.active.selectLine(.{ .pin = pin.* });
                 if (sel_) |sel| {
-                    try self.io.terminal.screens.active.select(sel);
+                    try self.activeTerminal().screens.active.select(sel);
                     try self.queueRender();
                 }
             },
@@ -4232,12 +4227,8 @@ pub fn mouseButtonCallback(
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
 
-        // In tmux control mode, skip right-click selection for the same
-        // reason as the left-click guard: pin/terminal mismatch.
-        if (self.renderer_state.terminal != &self.io.terminal) break :sel;
-
         // Get our viewport pin
-        const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
+        const screen: *terminal.Screen = self.activeTerminal().screens.active;
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
             const pt_viewport = self.posToViewport(pos.x, pos.y);
@@ -4259,7 +4250,7 @@ pub fn mouseButtonCallback(
             .@"context-menu" => {
                 // If we already have a selection and the selection contains
                 // where we clicked then we don't want to modify the selection.
-                if (self.io.terminal.screens.active.selection) |prev_sel| {
+                if (self.activeTerminal().screens.active.selection) |prev_sel| {
                     if (prev_sel.contains(screen, pin)) break :sel;
 
                     // The selection doesn't contain our pin, so we create a new
@@ -4283,7 +4274,7 @@ pub fn mouseButtonCallback(
                 return false;
             },
             .copy => {
-                if (self.io.terminal.screens.active.selection) |sel| {
+                if (self.activeTerminal().screens.active.selection) |sel| {
                     try self.copySelectionToClipboards(
                         sel,
                         &.{.standard},
@@ -4294,7 +4285,7 @@ pub fn mouseButtonCallback(
                 try self.setSelection(null);
                 try self.queueRender();
             },
-            .@"copy-or-paste" => if (self.io.terminal.screens.active.selection) |sel| {
+            .@"copy-or-paste" => if (self.activeTerminal().screens.active.selection) |sel| {
                 try self.copySelectionToClipboards(
                     sel,
                     &.{.standard},
@@ -4567,7 +4558,7 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
     const link = try self.linkAtPos(pos) orelse return false;
     switch (link.action) {
         .open => {
-            const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
+            const str = try self.activeTerminal().screens.active.selectionString(self.alloc, .{
                 .sel = link.selection,
                 .trim = false,
             });
@@ -4658,11 +4649,11 @@ pub fn mousePressureCallback(
         // This should always be set in this state but we don't want
         // to handle state inconsistency here.
         const pin = self.mouse.left_click_pin orelse break :select;
-        const sel = self.io.terminal.screens.active.selectWord(
+        const sel = self.activeTerminal().screens.active.selectWord(
             pin.*,
             self.config.selection_word_chars,
         ) orelse break :select;
-        try self.io.terminal.screens.active.select(sel);
+        try self.activeTerminal().screens.active.select(sel);
         try self.queueRender();
     }
 }
@@ -4825,12 +4816,8 @@ pub fn cursorPosCallback(
         // If our terminal screen changed then we don't process this. We don't
         // invalidate our pin or mouse state because if the screen switches
         // back then we can continue our selection.
-        const t: *terminal.Terminal = self.renderer_state.terminal;
+        const t: *terminal.Terminal = self.activeTerminal();
         if (self.mouse.left_click_screen != t.screens.active_key) break :select;
-
-        // In tmux control mode, skip drag selection for the same reason
-        // as the left-click guard: pin/terminal mismatch.
-        if (t != &self.io.terminal) break :select;
 
         // All roads lead to requiring a re-render at this point.
         try self.queueRender();
@@ -4884,7 +4871,7 @@ fn dragLeftClickDouble(
     self: *Surface,
     drag_pin: terminal.Pin,
 ) !void {
-    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const screen: *terminal.Screen = self.activeTerminal().screens.active;
     const click_pin = self.mouse.left_click_pin.?.*;
 
     // Get the word closest to our starting click.
@@ -4910,13 +4897,13 @@ fn dragLeftClickDouble(
     // If our current mouse position is before the starting position,
     // then the selection start is the word nearest our current position.
     if (drag_pin.before(click_pin)) {
-        try self.io.terminal.screens.active.select(.init(
+        try self.activeTerminal().screens.active.select(.init(
             word_current.start(),
             word_start.end(),
             false,
         ));
     } else {
-        try self.io.terminal.screens.active.select(.init(
+        try self.activeTerminal().screens.active.select(.init(
             word_start.start(),
             word_current.end(),
             false,
@@ -4929,7 +4916,7 @@ fn dragLeftClickTriple(
     self: *Surface,
     drag_pin: terminal.Pin,
 ) !void {
-    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const screen: *terminal.Screen = self.activeTerminal().screens.active;
     const click_pin = self.mouse.left_click_pin.?.*;
 
     // Get the line selection under our current drag point. If there isn't a
@@ -4948,7 +4935,7 @@ fn dragLeftClickTriple(
     } else {
         sel.endPtr().* = line.end();
     }
-    try self.io.terminal.screens.active.select(sel);
+    try self.activeTerminal().screens.active.select(sel);
 }
 
 fn dragLeftClickSingle(
@@ -4957,7 +4944,7 @@ fn dragLeftClickSingle(
     drag_x: f64,
 ) !void {
     // This logic is in a separate function so that it can be unit tested.
-    try self.io.terminal.screens.active.select(mouseSelection(
+    try self.activeTerminal().screens.active.select(mouseSelection(
         self.mouse.left_click_pin.?.*,
         drag_pin,
         @intFromFloat(@max(0.0, self.mouse.left_click_xpos)),
@@ -5146,7 +5133,7 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
 ///
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
-    self.io.terminal.scrollViewport(.{ .bottom = {} });
+    try self.activeTerminal().scrollViewport(.{ .bottom = {} });
     try self.queueRender();
 }
 
@@ -5285,7 +5272,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                     log.warn("error scrolling to bottom err={}", .{err});
                 };
 
-                break :normal !self.io.terminal.modes.get(.cursor_keys);
+                break :normal !self.activeTerminal().modes.get(.cursor_keys);
             };
 
             if (normal) {
@@ -5405,7 +5392,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
 
-            if (self.io.terminal.screens.active.selection) |sel| {
+            if (self.activeTerminal().screens.active.selection) |sel| {
                 try self.copySelectionToClipboards(
                     sel,
                     &.{.standard},
@@ -5440,7 +5427,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 const url_text = switch (link_info.action) {
                     .open => url_text: {
                         // For regex links, get the text from selection
-                        break :url_text (self.io.terminal.screens.active.selectionString(self.alloc, .{
+                        break :url_text (self.activeTerminal().screens.active.selectionString(self.alloc, .{
                             .sel = link_info.selection,
                             .trim = self.config.clipboard_trim_trailing_spaces,
                         })) catch |err| {
@@ -5562,7 +5549,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
-                if (self.io.terminal.screens.active_key == .alternate) return false;
+                if (self.activeTerminal().screens.active_key == .alternate) return false;
             }
 
             self.queueIo(.{
@@ -5597,9 +5584,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
-                const sel = self.io.terminal.screens.active.selection orelse return false;
-                const tl = sel.topLeft(self.io.terminal.screens.active);
-                self.io.terminal.screens.active.scroll(.{ .pin = tl });
+                const sel = self.activeTerminal().screens.active.selection orelse return false;
+                const tl = sel.topLeft(self.activeTerminal().screens.active);
+                self.activeTerminal().screens.active.scroll(.{ .pin = tl });
             }
 
             try self.queueRender();
@@ -5837,7 +5824,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
 
-            const sel = self.io.terminal.screens.active.selectAll();
+            const sel = self.activeTerminal().screens.active.selectAll();
             if (sel) |s| {
                 try self.setSelection(s);
                 try self.queueRender();
@@ -5970,7 +5957,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
 
-            const screen: *terminal.Screen = self.io.terminal.screens.active;
+            const screen: *terminal.Screen = self.activeTerminal().screens.active;
             const sel = if (screen.selection) |*sel| sel else {
                 // If we don't have a selection we do not perform this
                 // action, allowing the keybind to fall through to the
@@ -6085,12 +6072,13 @@ fn writeScreenFile(
         // We only dump history if we have history. We still keep
         // the file and write the empty file to the pty so that this
         // command always works on the primary screen.
-        const pages = &self.io.terminal.screens.active.pages;
+        const t = self.activeTerminal();
+        const pages = &t.screens.active.pages;
         const sel_: ?terminal.Selection = switch (loc) {
             .history => history: {
                 // We do not support this for alternate screens
                 // because they don't have scrollback anyways.
-                if (self.io.terminal.screens.active_key == .alternate) {
+                if (t.screens.active_key == .alternate) {
                     break :history null;
                 }
 
@@ -6111,7 +6099,7 @@ fn writeScreenFile(
                 );
             },
 
-            .selection => self.io.terminal.screens.active.selection,
+            .selection => t.screens.active.selection,
         };
 
         const sel = sel_ orelse {
@@ -6121,7 +6109,7 @@ fn writeScreenFile(
         };
 
         const ScreenFormatter = terminal.formatter.ScreenFormatter;
-        var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, .{
+        var formatter: ScreenFormatter = .init(t.screens.active, .{
             .emit = switch (write_screen.emit) {
                 .plain => .plain,
                 .vt => .vt,
@@ -6129,12 +6117,12 @@ fn writeScreenFile(
             },
             .unwrap = true,
             .trim = false,
-            .background = self.io.terminal.colors.background.get(),
-            .foreground = self.io.terminal.colors.foreground.get(),
-            .palette = &self.io.terminal.colors.palette.current,
+            .background = t.colors.background.get(),
+            .foreground = t.colors.foreground.get(),
+            .palette = &t.colors.palette.current,
         });
         formatter.content = .{ .selection = sel.ordered(
-            self.io.terminal.screens.active,
+            t.screens.active,
             .forward,
         ) };
         try formatter.format(buf_writer);
