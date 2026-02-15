@@ -504,6 +504,22 @@ pub const StreamHandler = struct {
                         .ready => {
                             // Viewer startup complete — user input is safe to send
                             self.surfaceMessageWriter(.tmux_ready);
+
+                            // Send the current client size to tmux. All resize
+                            // events during startup fired before the viewer
+                            // existed, so tmux still has the stale 24x80 from
+                            // the previous session. We send a catch-up
+                            // refresh-client now that the viewer is ready.
+                            const grid = self.size.grid();
+                            var buf: [64]u8 = undefined;
+                            const refresh_cmd = std.fmt.bufPrint(&buf, "refresh-client -C {d}x{d}\n", .{
+                                grid.columns,
+                                grid.rows,
+                            }) catch unreachable;
+                            self.messageWriter(try termio.Message.writeReqDirect(
+                                self.alloc,
+                                refresh_cmd,
+                            ));
                         },
                     }
                 }

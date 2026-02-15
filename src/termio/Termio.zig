@@ -516,16 +516,25 @@ pub fn resize(
     td: *ThreadData,
     size: renderer.Size,
 ) !void {
-    self.size = size;
     const grid_size = size.grid();
 
     // Update the size of our pty.
     try self.backend.resize(grid_size, size.terminal());
 
+    // Track whether tmux control mode is active so we can send
+    // refresh-client after releasing the mutex.
+    var tmux_active = false;
+
     // Enter the critical area that we want to keep small
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
+
+        // Update our cached size under the lock. processOutput() on the
+        // main thread reads self.size (via stream_handler.size pointer)
+        // while holding this mutex, so the write must be synchronized to
+        // prevent a torn read of the multi-field struct on ARM64.
+        self.size = size;
 
         // Update the size of our terminal state
         try self.terminal.resize(
@@ -546,6 +555,25 @@ pub fn resize(
         if (self.terminal.modes.get(.in_band_size_reports)) {
             try self.sizeReportLocked(td, .mode_2048);
         }
+
+        // Check if tmux control mode is active. We only read the flag
+        // under the lock; the actual write happens below after unlock.
+        if (comptime StreamHandler.tmux_enabled) {
+            tmux_active = self.terminal_stream.handler.tmux_viewer != null;
+        }
+    }
+
+    // In tmux control mode, the terminal's PTY belongs to tmux, not to
+    // a shell. A PTY resize (TIOCSWINSZ / SSH window-change) won't
+    // affect pane sizes — tmux needs an explicit `refresh-client -C`
+    // command to learn the client's new dimensions.
+    if (tmux_active) {
+        var buf: [64]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&buf, "refresh-client -C {d}x{d}\n", .{
+            grid_size.columns,
+            grid_size.rows,
+        }) catch unreachable; // 64 bytes is always enough
+        try self.backend.queueWrite(self.alloc, td, cmd, false);
     }
 
     // Mail the renderer so that it can update the GPU and re-render
