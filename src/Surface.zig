@@ -2744,12 +2744,12 @@ pub fn keyCallback(
                 log.warn("failed to refresh links err={}", .{err});
                 break :mouse_mods;
             };
-        } else if (self.activeTerminal().flags.mouse_event != .none and !self.mouse.mods.shift) {
+        } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
             // If we have mouse reports on and we don't have shift pressed, we reset state
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
-                self.activeTerminal().mouse_shape,
+                self.io.terminal.mouse_shape,
             );
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -2764,8 +2764,8 @@ pub fn keyCallback(
     // needed, depending on the key state.
     if ((SurfaceMouse{
         .physical_key = event.key,
-        .mouse_event = self.activeTerminal().flags.mouse_event,
-        .mouse_shape = self.activeTerminal().mouse_shape,
+        .mouse_event = self.io.terminal.flags.mouse_event,
+        .mouse_shape = self.io.terminal.mouse_shape,
         .mods = self.mouse.mods,
         .over_link = self.mouse.over_link,
         .hidden = self.mouse.hidden,
@@ -6231,7 +6231,7 @@ fn completeClipboardPaste(
     const encode_opts: input.paste.Options = encode_opts: {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-        const opts: input.paste.Options = .fromTerminal(&self.io.terminal);
+        const opts: input.paste.Options = .fromTerminal(self.activeTerminal());
 
         // If we have paste protection enabled, we detect unsafe pastes and return
         // an error. The error approach allows apprt to attempt to complete the paste
