@@ -480,6 +480,31 @@ pub const StreamHandler = struct {
                         },
 
                         .windows => |windows| {
+                            // syncLayouts() (or sessionChanged()) has
+                            // replaced the viewer's panes map, freeing the
+                            // old backing array. If the renderer was
+                            // pointing at a pane terminal in the old map,
+                            // the pointer is now dangling. Re-point it
+                            // using the active pane from the new map, or
+                            // reset to the main terminal if the pane no
+                            // longer exists. (We already hold
+                            // renderer_state.mutex via processOutput.)
+                            if (viewer.active_pane_id) |pane_id| {
+                                if (viewer.panes.getPtr(pane_id)) |pane| {
+                                    self.renderer_state.terminal = &pane.terminal;
+                                } else {
+                                    // Active pane was removed — reset to
+                                    // the main termio terminal.
+                                    self.renderer_state.terminal = self.terminal;
+                                }
+                            } else if (self.renderer_state.terminal != self.terminal) {
+                                // No active pane but renderer is still
+                                // pointing at a (now-freed) pane terminal.
+                                // This can happen after sessionChanged()
+                                // replaces the entire viewer.
+                                self.renderer_state.terminal = self.terminal;
+                            }
+
                             // Build tmux state snapshot to send to surface
                             var state: apprt.surface.Message.TmuxState = .{
                                 .window_count = windows.len,
