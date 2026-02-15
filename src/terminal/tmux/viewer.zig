@@ -1277,6 +1277,23 @@ pub const Viewer = struct {
                 // so just copy it over.
                 if (panes_old.getEntry(id)) |entry| {
                     gop.value_ptr.* = entry.value_ptr.*;
+
+                    // Resize the pane terminal if tmux assigned it new
+                    // dimensions (e.g. after refresh-client -C). Without
+                    // this, the pane's Terminal grid stays at its old size
+                    // and output is rendered with the wrong dimensions.
+                    const new_cols: size.CellCountInt = @intCast(layout.width);
+                    const new_rows: size.CellCountInt = @intCast(layout.height);
+                    if (gop.value_ptr.terminal.cols != new_cols or
+                        gop.value_ptr.terminal.rows != new_rows)
+                    {
+                        try gop.value_ptr.terminal.resize(
+                            gpa_alloc,
+                            new_cols,
+                            new_rows,
+                        );
+                    }
+
                     break :pane;
                 }
 
