@@ -9,6 +9,7 @@ const CursorStyle = @import("../cursor.zig").Style;
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const Terminal = @import("../Terminal.zig");
+const ReadonlyStream = @import("../stream_readonly.zig").Stream;
 const Layout = @import("layout.zig").Layout;
 const control = @import("control.zig");
 const output = @import("output.zig");
@@ -283,7 +284,27 @@ pub const Viewer = struct {
     pub const Pane = struct {
         terminal: Terminal,
 
+        /// Persistent VT stream for processing %output data. This keeps
+        /// the VT parser and UTF-8 decoder state across multiple %output
+        /// notifications, so that escape sequences and multi-byte UTF-8
+        /// characters that are split across tmux output boundaries are
+        /// handled correctly.
+        ///
+        /// IMPORTANT: After any operation that moves a Pane in memory
+        /// (hash map put, shallow copy in initLayout), callers must call
+        /// fixupStreamPointer() to re-point the handler at the new
+        /// terminal location.
+        vt_stream: ReadonlyStream,
+
+        /// After a move or shallow copy, the stream's handler still
+        /// points at the old pane's terminal. Call this to fix up
+        /// the pointer to the new location.
+        pub fn fixupStreamPointer(self: *Pane) void {
+            self.vt_stream.handler.terminal = &self.terminal;
+        }
+
         pub fn deinit(self: *Pane, alloc: Allocator) void {
+            self.vt_stream.deinit();
             self.terminal.deinit(alloc);
         }
     };
@@ -763,6 +784,18 @@ pub const Viewer = struct {
             window.layout,
         );
 
+        // After all panes are in their final positions in the map, fix up
+        // the stream handler pointers. During initLayout, getOrPut calls
+        // can trigger hash map resizes that move existing entries, which
+        // invalidates the vt_stream.handler.terminal pointers set by
+        // earlier fixupStreamPointer() calls.
+        {
+            var panes_it = panes.iterator();
+            while (panes_it.next()) |kv| {
+                kv.value_ptr.fixupStreamPointer();
+            }
+        }
+
         // Build up the list of removed panes.
         var removed: std.ArrayList(usize) = removed: {
             var removed: std.ArrayList(usize) = .empty;
@@ -1238,11 +1271,12 @@ pub const Viewer = struct {
             return;
         };
         const pane: *Pane = entry.value_ptr;
-        const t: *Terminal = &pane.terminal;
 
-        var stream = t.vtStream();
-        defer stream.deinit();
-        stream.nextSlice(data) catch |err| {
+        // Use the pane's persistent VT stream so that parser and UTF-8
+        // decoder state is preserved across %output boundaries. tmux
+        // can split output at arbitrary byte positions, including in
+        // the middle of escape sequences or multi-byte UTF-8 characters.
+        pane.vt_stream.nextSlice(data) catch |err| {
             log.info("failed to process output for pane id={}: {}", .{ id, err });
             return err;
         };
@@ -1278,6 +1312,10 @@ pub const Viewer = struct {
                 if (panes_old.getEntry(id)) |entry| {
                     gop.value_ptr.* = entry.value_ptr.*;
 
+                    // After shallow copy, the vt_stream's handler still
+                    // points at the old pane's terminal. Fix it up.
+                    gop.value_ptr.fixupStreamPointer();
+
                     // Resize the pane terminal if tmux assigned it new
                     // dimensions (e.g. after refresh-client -C). Without
                     // this, the pane's Terminal grid stays at its old size
@@ -1308,7 +1346,11 @@ pub const Viewer = struct {
 
                 gop.value_ptr.* = .{
                     .terminal = t,
+                    .vt_stream = t.vtStream(),
                 };
+                // The vt_stream was initialized with a pointer to the
+                // stack-local `t`. Now that it's in the map, fix it up.
+                gop.value_ptr.fixupStreamPointer();
             },
         }
     }
@@ -1659,6 +1701,17 @@ fn testViewer(viewer: *Viewer, steps: []const TestStep) !void {
             return err;
         };
     }
+}
+
+/// Test helper: create a Pane with a Terminal and put it in the viewer's
+/// panes map with the stream pointer properly fixed up.
+fn testPutPane(viewer: *Viewer, id: usize, t: Terminal) !void {
+    try viewer.panes.put(testing.allocator, id, .{
+        .terminal = t,
+        .vt_stream = undefined,
+    });
+    const pane = viewer.panes.getPtr(id).?;
+    pane.vt_stream = pane.terminal.vtStream();
 }
 
 test "immediate exit" {
@@ -2461,7 +2514,7 @@ test "setActivePaneId valid pane" {
     // Manually create a pane in the panes map.
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
-    try viewer.panes.put(testing.allocator, 5, .{ .terminal = t });
+    try testPutPane(&viewer, 5, t);
 
     try testing.expectEqual(null, viewer.active_pane_id);
     viewer.setActivePaneId(5);
@@ -2475,7 +2528,7 @@ test "setActivePaneId invalid pane is no-op" {
     // Manually create a pane in the panes map.
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
-    try viewer.panes.put(testing.allocator, 5, .{ .terminal = t });
+    try testPutPane(&viewer, 5, t);
 
     viewer.setActivePaneId(5);
     try testing.expectEqual(5, viewer.active_pane_id);
@@ -2491,7 +2544,7 @@ test "setActivePaneId null clears" {
 
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
-    try viewer.panes.put(testing.allocator, 5, .{ .terminal = t });
+    try testPutPane(&viewer, 5, t);
 
     viewer.setActivePaneId(5);
     try testing.expectEqual(5, viewer.active_pane_id);
@@ -2507,7 +2560,7 @@ test "sendKeys basic formatting" {
     // Create pane 2.
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
-    try viewer.panes.put(testing.allocator, 2, .{ .terminal = t });
+    try testPutPane(&viewer, 2, t);
     viewer.setActivePaneId(2);
 
     // "ls\r" = 0x6C 0x73 0x0D
@@ -2523,7 +2576,7 @@ test "sendKeys single byte" {
 
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
-    try viewer.panes.put(testing.allocator, 0, .{ .terminal = t });
+    try testPutPane(&viewer, 0, t);
     viewer.setActivePaneId(0);
 
     // Single byte: 'a' = 0x61
@@ -2538,7 +2591,7 @@ test "sendKeys escape sequence" {
 
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
-    try viewer.panes.put(testing.allocator, 10, .{ .terminal = t });
+    try testPutPane(&viewer, 10, t);
     viewer.setActivePaneId(10);
 
     // ESC [ A (cursor up) = 0x1B 0x5B 0x41
@@ -2553,7 +2606,7 @@ test "sendKeys empty data returns null" {
 
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
-    try viewer.panes.put(testing.allocator, 0, .{ .terminal = t });
+    try testPutPane(&viewer, 0, t);
     viewer.setActivePaneId(0);
 
     try testing.expectEqual(null, viewer.sendKeys(""));
@@ -2565,7 +2618,7 @@ test "sendKeys no active pane returns null" {
 
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
-    try viewer.panes.put(testing.allocator, 0, .{ .terminal = t });
+    try testPutPane(&viewer, 0, t);
 
     // active_pane_id is null by default.
     try testing.expectEqual(null, viewer.sendKeys("hello"));
@@ -2577,7 +2630,7 @@ test "sendKeys stale pane clears active and returns null" {
 
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
-    try viewer.panes.put(testing.allocator, 3, .{ .terminal = t });
+    try testPutPane(&viewer, 3, t);
     viewer.setActivePaneId(3);
 
     // Remove the pane (simulating tmux pane removal).
@@ -2604,11 +2657,11 @@ test "sendKeys after setActivePaneId round-trip" {
     // Simulate viewer startup populating two panes.
     var t1: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t1.deinit(testing.allocator);
-    try viewer.panes.put(testing.allocator, 2, .{ .terminal = t1 });
+    try testPutPane(&viewer, 2, t1);
 
     var t2: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t2.deinit(testing.allocator);
-    try viewer.panes.put(testing.allocator, 5, .{ .terminal = t2 });
+    try testPutPane(&viewer, 5, t2);
 
     // Before activation, sendKeys returns null.
     try testing.expectEqual(null, viewer.sendKeys("a"));
@@ -2724,4 +2777,87 @@ test "pane terminal pointer invalidated after layout change" {
         const resolved = viewer.panes.getPtr(id).?;
         try testing.expectEqual(new_pane_ptr, resolved);
     }
+}
+
+test "persistent vt stream: split escape sequence across output boundaries" {
+    // Regression test: tmux control mode can split %output at arbitrary byte
+    // boundaries, including in the middle of escape sequences. For example,
+    // the SGR sequence ESC[32m (set foreground green) may arrive as:
+    //   %output %0 \x1b       (first message: just ESC)
+    //   %output %0 [32mA      (second message: CSI params + 'A')
+    //
+    // With a fresh VT parser per %output (the old bug), the second message
+    // starts in GROUND state and prints "[32mA" as literal text.
+    // With a persistent VT stream (the fix), the parser remembers it saw
+    // ESC, transitions through CSI, applies the SGR, and prints 'A' in green.
+    const style = @import("../style.zig");
+
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Create a pane with an 80x24 terminal.
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try testPutPane(&viewer, 0, t);
+
+    // First %output: just the ESC byte (0x1B). The VT parser should
+    // transition to the ESCAPE state and wait for more input.
+    try viewer.receivedOutput(0, "\x1b");
+
+    // Second %output: the rest of the SGR sequence plus a character.
+    // The parser should see '[' → CSI, '3','2' → params, 'm' → SGR dispatch,
+    // then 'A' → print with green foreground.
+    try viewer.receivedOutput(0, "[32mA");
+
+    // Verify: cell at (0,0) should contain 'A' with green foreground (palette index 2).
+    const pane = viewer.panes.getPtr(0).?;
+    const list_cell = pane.terminal.screens.active.pages.getCell(
+        .{ .active = .{ .x = 0, .y = 0 } },
+    ).?;
+
+    // Character should be 'A', not '[' or '3' or any literal text.
+    try testing.expectEqual(@as(u21, 'A'), list_cell.cell.content.codepoint);
+
+    // Style should be non-default (has foreground color).
+    try testing.expect(list_cell.cell.style_id != style.default_id);
+
+    // Foreground should be palette index 2 (SGR 32 = green).
+    const cell_style = list_cell.style();
+    try testing.expectEqual(style.Style.Color{ .palette = 2 }, cell_style.fg_color);
+}
+
+test "persistent vt stream: split UTF-8 multi-byte character across output boundaries" {
+    // Regression test: tmux control mode can split %output in the middle of
+    // a multi-byte UTF-8 character. For example, 'é' (U+00E9) is encoded as
+    // two bytes: 0xC3 0xA9. tmux may split this as:
+    //   %output %0 \xC3       (first message: leading byte only)
+    //   %output %0 \xA9       (second message: continuation byte)
+    //
+    // With a fresh VT parser per %output (the old bug), the UTF-8 decoder
+    // sees an incomplete sequence in the first message and emits U+FFFD
+    // (replacement character, rendered as '?'). The second message starts
+    // fresh and sees a bare continuation byte → another U+FFFD.
+    // With a persistent VT stream (the fix), the decoder buffers the leading
+    // byte and combines it with the continuation byte to produce U+00E9.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Create a pane with an 80x24 terminal.
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try testPutPane(&viewer, 0, t);
+
+    // First %output: leading byte of 'é' (U+00E9).
+    try viewer.receivedOutput(0, "\xC3");
+
+    // Second %output: continuation byte.
+    try viewer.receivedOutput(0, "\xA9");
+
+    // Verify: cell at (0,0) should contain U+00E9 ('é'), not U+FFFD.
+    const pane = viewer.panes.getPtr(0).?;
+    const list_cell = pane.terminal.screens.active.pages.getCell(
+        .{ .active = .{ .x = 0, .y = 0 } },
+    ).?;
+
+    try testing.expectEqual(@as(u21, 0x00E9), list_cell.cell.content.codepoint);
 }
