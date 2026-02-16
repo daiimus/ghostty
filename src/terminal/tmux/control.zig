@@ -966,6 +966,55 @@ test "tmux output with CR LF" {
     try testing.expectEqualStrings("line2", n.output.data[7..]);
 }
 
+test "tmux output with raw UTF-8 box drawing" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // tmux sends UTF-8 bytes >= 0x80 raw (unescaped) in %output.
+    // ┄ = U+2504 = e2 94 84
+    // • = U+2022 = e2 80 a2
+    // ━ = U+2501 = e2 94 81
+    // ═ = U+2550 = e2 95 90
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // Build the %output line with raw UTF-8 bytes
+    const prefix = "%output %3 ";
+    const box_chars = "\xe2\x94\x84\xe2\x80\xa2\xe2\x94\x81\xe2\x95\x90";
+    const line = prefix ++ box_chars;
+
+    for (line) |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .output);
+    try testing.expectEqual(3, n.output.pane_id);
+    // Data should be the raw UTF-8 bytes, unchanged
+    try testing.expectEqual(@as(usize, 12), n.output.data.len);
+    try testing.expectEqualStrings(box_chars, n.output.data);
+}
+
+test "tmux output with mixed UTF-8 and octal escapes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // ESC[31m (octal-escaped ESC) + ┄ (raw UTF-8) + ESC[0m (octal-escaped ESC)
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    const input = "%output %1 \\033[31m\xe2\x94\x84\\033[0m";
+    for (input) |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .output);
+    try testing.expectEqual(1, n.output.pane_id);
+    // Expected: ESC + "[31m" + e2 94 84 + ESC + "[0m"
+    // ESC=1 + [31m=4 + ┄=3 + ESC=1 + [0m=3 = 12 bytes
+    try testing.expectEqual(@as(usize, 12), n.output.data.len);
+    try testing.expectEqual(@as(u8, 0x1B), n.output.data[0]); // ESC
+    try testing.expectEqualStrings("[31m", n.output.data[1..5]);
+    try testing.expectEqualStrings("\xe2\x94\x84", n.output.data[5..8]); // ┄
+    try testing.expectEqual(@as(u8, 0x1B), n.output.data[8]); // ESC
+    try testing.expectEqualStrings("[0m", n.output.data[9..12]);
+}
+
 test "tmux window-close" {
     const testing = std.testing;
     const alloc = testing.allocator;
