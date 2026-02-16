@@ -8,7 +8,9 @@ const CircBuf = @import("../../datastruct/main.zig").CircBuf;
 const CursorStyle = @import("../cursor.zig").Style;
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
+const Parser = @import("../Parser.zig");
 const Terminal = @import("../Terminal.zig");
+const UTF8Decoder = @import("../UTF8Decoder.zig");
 const Layout = @import("layout.zig").Layout;
 const control = @import("control.zig");
 const output = @import("output.zig");
@@ -301,7 +303,14 @@ pub const Viewer = struct {
     pub const Pane = struct {
         terminal: Terminal,
 
+        /// Persistent VT parser state for %output processing.
+        /// Without this, CSI sequences split across %output messages
+        /// lose parser state and render as literal text.
+        vt_parser: Parser = .init(),
+        vt_utf8decoder: UTF8Decoder = .{},
+
         pub fn deinit(self: *Pane, alloc: Allocator) void {
+            self.vt_parser.deinit();
             self.terminal.deinit(alloc);
         }
     };
@@ -1368,8 +1377,58 @@ pub const Viewer = struct {
         const pane: *Pane = entry.value_ptr;
         const t: *Terminal = &pane.terminal;
 
+        // Use pane's persistent parser state to handle CSI sequences
+        // that span multiple %output messages. We start with the
+        // standard vtStream() (which produces a correctly-initialized
+        // ReadonlyStream with a fresh parser in ground state), then
+        // swap in the pane's saved parser/utf8decoder. After processing
+        // we save the parser state back and hand deinit a fresh parser
+        // so it only frees that throw-away instance.
         var stream = t.vtStream();
-        defer stream.deinit();
+        // Swap in persistent parser state from the pane.
+        stream.parser = pane.vt_parser;
+        stream.utf8decoder = pane.vt_utf8decoder;
+        defer {
+            // DCS/OSC/APC sequences within %output data that span to
+            // the end of a message are passthrough sequences meant for
+            // the outer terminal, not for this pane. The ReadonlyStream
+            // handler ignores them anyway, but the parser would remain
+            // trapped in an absorbing state across messages if we
+            // persisted it as-is (dcs_passthrough in particular can
+            // only be exited by the 8-bit C1 ST, which tmux never
+            // sends in 7-bit control mode). Reset to ground so the
+            // next message starts clean.
+            //
+            // CSI/escape states are safe to persist: they are
+            // short-lived and exit on the next final byte, which is
+            // the exact split-sequence case we need to handle.
+            switch (stream.parser.state) {
+                .dcs_passthrough,
+                .dcs_entry,
+                .dcs_param,
+                .dcs_intermediate,
+                .dcs_ignore,
+                .sos_pm_apc_string,
+                => {
+                    stream.parser.state = .ground;
+                    stream.parser.clear();
+                },
+                .osc_string => {
+                    stream.parser.osc_parser.reset();
+                    stream.parser.state = .ground;
+                    stream.parser.clear();
+                },
+                else => {},
+            }
+
+            // Save updated parser state back to the pane.
+            pane.vt_parser = stream.parser;
+            pane.vt_utf8decoder = stream.utf8decoder;
+            // Give deinit a fresh parser to clean up (prevents it
+            // from freeing the parser we just saved to the pane).
+            stream.parser = .init();
+            stream.deinit();
+        }
         stream.nextSlice(data) catch |err| {
             log.info("failed to process output for pane id={}: {}", .{ id, err });
             return err;
@@ -3207,6 +3266,437 @@ test "layout_change stashes raw layout" {
                         "e07b,83x44,0,0[83x22,0,0,0,83x21,0,23,2]",
                         v.windows.items[0].raw_layout,
                     );
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "split OSC across output messages does not corrupt state" {
+    // Verify that an OSC sequence split across two %output messages
+    // doesn't corrupt the parser state or prevent subsequent output
+    // from rendering. The OSC itself may be lost (acceptable), but
+    // the terminal must keep processing after the split.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard initialization
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + list-panes
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = 
+        \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;24;
+        } } },
+        // First output: starts an OSC that doesn't finish
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "A\x1b]0;partial-tit",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    // "A" should be printed before the OSC started
+                    try testing.expect(std.mem.startsWith(u8, str, "A"));
+                }
+            }).check,
+        },
+        // Second output: finishes the OSC and prints more text
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "le\x07HELLO",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    // "HELLO" must appear — the parser must not be stuck
+                    try testing.expect(std.mem.containsAtLeast(u8, str, 1, "HELLO"));
+                }
+            }).check,
+        },
+        // Third output: more text to verify parser is still working
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "\r\nWORLD",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    try testing.expect(std.mem.containsAtLeast(u8, str, 1, "WORLD"));
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "multiple output rounds with OSC sequences keep rendering" {
+    // Regression test for display freeze: after the first command response
+    // the terminal stopped visually updating. This test simulates the
+    // pattern: prompt → command output → new prompt, verifying text
+    // from each phase appears on screen.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard initialization
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + list-panes
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = 
+        \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;24;
+        } } },
+        // First output: initial prompt with OSC title + semantic prompt
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "\x1b]0;user@host:~\x07\x1b]133;A\x07$ ",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    // "$ " should appear (the prompt text)
+                    try testing.expect(std.mem.containsAtLeast(u8, str, 1, "$ "));
+                }
+            }).check,
+        },
+        // Second output: command echo + result
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "ls\r\nfile1  file2  file3\r\n",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    try testing.expect(std.mem.containsAtLeast(u8, str, 1, "file1"));
+                }
+            }).check,
+        },
+        // Third output: new prompt (this is where the freeze happened)
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "\x1b]133;D;0\x07\x1b]0;user@host:~\x07\x1b]133;A\x07$ ",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    // The second "$ " prompt must appear after the command output.
+                    // Count occurrences — we should have at least 2 prompts.
+                    var count: usize = 0;
+                    var pos: usize = 0;
+                    while (std.mem.indexOfPos(u8, str, pos, "$ ")) |idx| {
+                        count += 1;
+                        pos = idx + 2;
+                    }
+                    try testing.expect(count >= 2);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "DCS tmux passthrough does not trap parser across messages" {
+    // Regression test for the display freeze root cause: shells wrap
+    // sequences like OSC 7 (CWD) in DCS tmux passthrough:
+    //   \x1bPtmux;\x1b\x1b]7;file://host/path\x07\x1b\\
+    // The 7-bit ST terminator (\x1b\\) cannot exit dcs_passthrough
+    // because ESC is overridden to `put` in our parse_table (needed
+    // for tmux control mode's UTF-8 support). Without the absorbing-
+    // state reset in receivedOutput(), the parser stays trapped in
+    // dcs_passthrough and ALL subsequent text is silently consumed.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard initialization
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + list-panes
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = 
+        \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;24;
+        } } },
+        // First output: DCS tmux passthrough wrapping OSC 7 (CWD report)
+        // This is the exact pattern zsh emits on every prompt.
+        // \x1bP = DCS entry, tmux; = DCS param, then inner content,
+        // \x1b\\ = 7-bit ST (which CANNOT exit dcs_passthrough).
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "\x1bPtmux;\x1b\x1b]7;file://%2Fhome%2Fuser\x07\x1b\\",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // After this message the parser MUST be back in ground
+                    // state (thanks to the absorbing-state reset). Without
+                    // the fix it would be stuck in dcs_passthrough.
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    try testing.expectEqual(
+                        @as(@TypeOf(pane.vt_parser.state), .ground),
+                        pane.vt_parser.state,
+                    );
+                }
+            }).check,
+        },
+        // Second output: regular text. Without the fix this would be
+        // swallowed by dcs_passthrough's `put` action → invisible.
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "HELLO",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    // "HELLO" MUST be visible on screen
+                    try testing.expect(std.mem.containsAtLeast(u8, str, 1, "HELLO"));
+                }
+            }).check,
+        },
+        // Third output: another DCS passthrough (second prompt cycle).
+        // In real wire captures, the DCS and the subsequent prompt
+        // arrive in separate %output messages (lines 106 vs 107).
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "\x1bPtmux;\x1b\x1b]7;file://%2Fhome%2Fuser\x07\x1b\\",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Parser must be back in ground after the reset
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    try testing.expectEqual(
+                        @as(@TypeOf(pane.vt_parser.state), .ground),
+                        pane.vt_parser.state,
+                    );
+                }
+            }).check,
+        },
+        // Fourth output: the prompt text that follows the DCS.
+        // Without the absorbing-state reset this would be invisible.
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "\r\nuser@host:~ $ ",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    // Prompt text must be visible on screen
+                    try testing.expect(std.mem.containsAtLeast(u8, str, 1, "user@host"));
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "split CSI across output messages persists parser state" {
+    // Regression test: receivedOutput() used to create a fresh VT parser
+    // on every %output message. When tmux splits a CSI sequence across
+    // two messages (e.g., ESC[32 | mX), the second message's leading 'm'
+    // was printed as literal text instead of completing the SGR sequence.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard initialization: block_end, session_changed, version, list-windows
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Single pane layout (83x44, pane 0)
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane commands (primary history, primary visible,
+        // alternate history, alternate visible) + list-panes
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = 
+        \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;24;
+        } } },
+        // First %output: ESC[32  (incomplete CSI — sequence continues in next message)
+        .{
+            .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = "\x1b[32" } } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                }
+            }).check,
+        },
+        // Second %output: mX  (completes ESC[32m = SGR green, then prints 'X')
+        .{
+            .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = "mX" } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    // The cell at (0,0) should contain 'X'
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    try testing.expect(std.mem.startsWith(u8, str, "X"));
+                    // Verify 'X' has green foreground (SGR 32 = palette index 2)
+                    // and NOT that 'm' appears as literal text
+                    const list_cell = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+                    const cell_style = list_cell.style();
+                    try testing.expectEqual(
+                        @as(@TypeOf(cell_style.fg_color), .{ .palette = 2 }),
+                        cell_style.fg_color,
+                    );
+                    // The literal 'm' should NOT be on screen — it was consumed
+                    // by the parser as the CSI terminator, not printed.
+                    try testing.expect(!std.mem.startsWith(u8, str, "m"));
                 }
             }).check,
         },
