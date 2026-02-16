@@ -3706,3 +3706,272 @@ test "split CSI across output messages persists parser state" {
         },
     });
 }
+
+test "UTF-8 box-drawing codepoints in %output reach terminal grid correctly" {
+    // End-to-end test for the U+FFFD investigation: feed raw UTF-8
+    // box-drawing characters through %output and verify the terminal
+    // grid contains the correct Unicode codepoints, not U+FFFD (0xFFFD).
+    //
+    // Characters under test:
+    //   ┄ U+2504 (0xE2 0x94 0x84) - box drawings light triple dash horizontal
+    //   • U+2022 (0xE2 0x80 0xA2) - bullet
+    //   ━ U+2501 (0xE2 0x94 0x81) - box drawings heavy horizontal
+    //   ═ U+2550 (0xE2 0x95 0x90) - box drawings double horizontal
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard initialization
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + list-panes
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = 
+        \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;24;
+        } } },
+        // Send %output with raw UTF-8 box-drawing characters
+        .{
+            .input = .{
+                .tmux = .{
+                    .output = .{
+                        .pane_id = 0,
+                        // Raw UTF-8: ┄•━═
+                        .data = "\xe2\x94\x84\xe2\x80\xa2\xe2\x94\x81\xe2\x95\x90",
+                    },
+                },
+            },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    // Verify via dumpStringAlloc that the UTF-8 chars appear
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    // The dump should contain the raw UTF-8 for our characters
+                    try testing.expect(std.mem.startsWith(
+                        u8,
+                        str,
+                        "\xe2\x94\x84\xe2\x80\xa2\xe2\x94\x81\xe2\x95\x90",
+                    ));
+                    // Also verify at the cell level — each character should be
+                    // at its own grid position with the correct codepoint.
+                    const cell0 = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+                    const cell1 = screen.pages.getCell(.{ .active = .{ .x = 1, .y = 0 } }).?;
+                    const cell2 = screen.pages.getCell(.{ .active = .{ .x = 2, .y = 0 } }).?;
+                    const cell3 = screen.pages.getCell(.{ .active = .{ .x = 3, .y = 0 } }).?;
+                    // ┄ U+2504
+                    try testing.expectEqual(@as(u21, 0x2504), cell0.cell.codepoint());
+                    // • U+2022
+                    try testing.expectEqual(@as(u21, 0x2022), cell1.cell.codepoint());
+                    // ━ U+2501
+                    try testing.expectEqual(@as(u21, 0x2501), cell2.cell.codepoint());
+                    // ═ U+2550
+                    try testing.expectEqual(@as(u21, 0x2550), cell3.cell.codepoint());
+                    // None should be U+FFFD (replacement character)
+                    try testing.expect(cell0.cell.codepoint() != 0xFFFD);
+                    try testing.expect(cell1.cell.codepoint() != 0xFFFD);
+                    try testing.expect(cell2.cell.codepoint() != 0xFFFD);
+                    try testing.expect(cell3.cell.codepoint() != 0xFFFD);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "UTF-8 box-drawing split across %output messages" {
+    // Test that UTF-8 multi-byte sequences split across two %output messages
+    // are correctly reassembled by the persistent UTF8Decoder, producing
+    // the correct codepoint instead of U+FFFD.
+    //
+    // ┄ U+2504 = 0xE2 0x94 0x84 — we split after the first byte.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard initialization
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + list-panes
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = 
+        \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;24;
+        } } },
+        // First %output: "A" + first byte of ┄ (0xE2)
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "A\xe2",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    // "A" should appear; the incomplete byte is buffered
+                    try testing.expect(std.mem.startsWith(u8, str, "A"));
+                }
+            }).check,
+        },
+        // Second %output: remaining bytes of ┄ (0x94 0x84) + "B"
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "\x94\x84B",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    // Cell 0 = 'A' (0x41)
+                    const cell0 = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 'A'), cell0.cell.codepoint());
+                    // Cell 1 = ┄ U+2504 (reassembled from split bytes)
+                    const cell1 = screen.pages.getCell(.{ .active = .{ .x = 1, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x2504), cell1.cell.codepoint());
+                    try testing.expect(cell1.cell.codepoint() != 0xFFFD);
+                    // Cell 2 = 'B' (0x42)
+                    const cell2 = screen.pages.getCell(.{ .active = .{ .x = 2, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 'B'), cell2.cell.codepoint());
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "ACS charset (ESC(0) followed by UTF-8 box-drawing produces spaces not U+FFFD" {
+    // When G0 is configured as DEC Special Graphics via ESC(0, multi-byte
+    // UTF-8 codepoints (> 255) are mapped to space by Terminal.printCell()
+    // (line 622: unmapped_c > maxInt(u8) => ' '). This test confirms that
+    // ACS mode does NOT produce U+FFFD — it produces spaces. This helps
+    // rule out (or confirm) ACS leakage as the cause of U+FFFD rendering.
+    //
+    // Sequence: ESC(0 (G0=dec_special), then ┄ (U+2504 raw UTF-8),
+    // then ESC(B (G0=ascii), then ━ (U+2501 raw UTF-8).
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard initialization
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + list-panes
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = 
+        \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;24;
+        } } },
+        // Send ESC(0 (G0=dec_special) + ┄ U+2504 + ESC(B (G0=ascii) + ━ U+2501
+        .{
+            .input = .{
+                .tmux = .{
+                    .output = .{
+                        .pane_id = 0,
+                        // ESC(0 = 0x1B 0x28 0x30
+                        // ┄ U+2504 = 0xE2 0x94 0x84
+                        // ESC(B = 0x1B 0x28 0x42
+                        // ━ U+2501 = 0xE2 0x94 0x81
+                        .data = "\x1b\x28\x30" ++ "\xe2\x94\x84" ++ "\x1b\x28\x42" ++ "\xe2\x94\x81",
+                    },
+                },
+            },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    // Cell 0: ┄ was printed while G0=dec_special.
+                    // Since U+2504 > 255, Terminal.printCell maps it to space.
+                    const cell0 = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, ' '), cell0.cell.codepoint());
+                    // Crucially: it should NOT be U+FFFD
+                    try testing.expect(cell0.cell.codepoint() != 0xFFFD);
+                    // Cell 1: ━ was printed after ESC(B restored G0=ascii.
+                    // U+2501 should pass through unmapped.
+                    const cell1 = screen.pages.getCell(.{ .active = .{ .x = 1, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x2501), cell1.cell.codepoint());
+                    try testing.expect(cell1.cell.codepoint() != 0xFFFD);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
