@@ -1123,8 +1123,12 @@ pub const Viewer = struct {
         }
 
         // Setup our windows action so the caller can process GUI
-        // window changes.
-        try actions.append(arena_alloc, .{ .windows = windows.items });
+        // window changes. We must dupe into the arena because `windows`
+        // is a local ArrayList whose backing memory is freed by defer
+        // when this function returns. Without the dupe, the action
+        // would hold a dangling pointer (use-after-free).
+        const arena_windows = try arena_alloc.dupe(Window, windows.items);
+        try actions.append(arena_alloc, .{ .windows = arena_windows });
 
         // Sync up our layouts. This will populate unknown panes, prune, etc.
         try self.syncLayouts(windows.items);
