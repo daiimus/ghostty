@@ -286,6 +286,10 @@ pub const Viewer = struct {
         /// the Viewer's allocator. This crosses the C API boundary so Swift
         /// can parse it with its own layout parser. Empty string if unknown.
         raw_layout: []const u8,
+        /// The pane that tmux considers focused in this window.
+        /// Set by `%window-pane-changed` notifications. `null` means
+        /// we haven't received a focus notification for this window yet.
+        focused_pane_id: ?usize = null,
 
         pub fn deinit(self: *Window, alloc: Allocator) void {
             if (self.name.len > 0) alloc.free(self.name);
@@ -624,9 +628,18 @@ pub const Viewer = struct {
                 return self.defunct();
             },
 
-            // The active pane changed. We don't care about this because
-            // we handle our own focus.
-            .window_pane_changed => {},
+            // The active pane changed. Track it so the apprt can query
+            // which pane tmux considers focused in each window (e.g.,
+            // when switching windows, the apprt needs to highlight the
+            // correct pane rather than falling back to the first pane).
+            .window_pane_changed => |info| {
+                for (self.windows.items) |*win| {
+                    if (win.id == info.window_id) {
+                        win.focused_pane_id = info.pane_id;
+                        break;
+                    }
+                }
+            },
 
             // We ignore this one. It means a session was created or
             // destroyed. If it was our own session we will get an exit

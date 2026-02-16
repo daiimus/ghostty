@@ -2137,6 +2137,27 @@ pub const CAPI = struct {
         return @intCast(id);
     }
 
+    /// Get the focused pane ID for a tmux window by index.
+    /// This is the pane that tmux considers focused (from %window-pane-changed),
+    /// as opposed to active_pane_id which is set by the apprt for input routing.
+    /// Returns -1 if not in tmux mode, index out of bounds, or no focus known.
+    ///
+    /// Acquires renderer_state.mutex to synchronize with processOutput.
+    export fn ghostty_surface_tmux_window_focused_pane_id(surface: *Surface, window_index: usize) isize {
+        const handler = &surface.core_surface.io.terminal_stream.handler;
+        if (comptime !@TypeOf(handler.*).tmux_enabled) return -1;
+
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const viewer = handler.tmux_viewer orelse return -1;
+        const windows = viewer.windows.items;
+        if (window_index >= windows.len) return -1;
+
+        const id = windows[window_index].focused_pane_id orelse return -1;
+        return @intCast(id);
+    }
+
     /// Debug: Get terminal state for debugging scrollback issues
     export fn ghostty_surface_debug_terminal_state(surface: *Surface) Darwin.TerminalDebugState {
         surface.core_surface.renderer_state.mutex.lock();
