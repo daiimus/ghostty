@@ -42,6 +42,28 @@ const log = std.log.scoped(.surface);
 // The renderer implementation to use.
 const Renderer = rendererpkg.Renderer;
 
+/// When a surface is acting as a tmux pane observer (rendering a specific
+/// pane from another surface's tmux viewer), this tracks the binding so
+/// we can restore the original state on detach and so the viewer can fix
+/// up our renderer_state.terminal pointer when syncLayouts rebuilds the
+/// pane map.
+pub const TmuxPaneBinding = struct {
+    /// The source surface that owns the tmux viewer with our pane terminal.
+    source: *Surface,
+
+    /// The numeric pane ID we are observing.
+    pane_id: usize,
+
+    /// The original mutex that this surface was created with, saved so
+    /// we can restore it on detach (since we replace it with the source
+    /// surface's mutex for shared synchronization).
+    original_mutex: *std.Thread.Mutex,
+
+    /// The original terminal pointer (this surface's own io.terminal),
+    /// saved so we can restore it on detach.
+    original_terminal: *terminal.Terminal,
+};
+
 /// Minimum window size in cells. This is used to prevent the window from
 /// being resized to a size that is too small to be useful. These defaults
 /// are chosen to match the default size of Mac's Terminal.app, but is
@@ -122,6 +144,11 @@ io_thr: std.Thread,
 
 /// Terminal inspector
 inspector: ?*inspectorpkg.Inspector = null,
+
+/// If this surface is a tmux pane observer (bound to a pane terminal
+/// from another surface's tmux viewer), this holds the binding state.
+/// Null for normal surfaces and for the primary tmux surface.
+tmux_pane_binding: ?TmuxPaneBinding = null,
 
 /// All our sizing information.
 size: rendererpkg.Size,
@@ -832,6 +859,27 @@ pub fn deinit(self: *Surface) void {
     if (self.inspector) |v| {
         v.deinit(self.alloc);
         self.alloc.destroy(v);
+    }
+
+    // If this surface was a tmux pane observer, restore the original
+    // mutex and terminal pointer before cleanup. We must also unregister
+    // from the source viewer so it doesn't try to fix up a dangling
+    // pointer to our renderer_state. The renderer thread is already
+    // stopped at this point so we don't need mutex protection.
+    if (self.tmux_pane_binding) |binding| {
+        // Unregister from the viewer's observer list (best-effort).
+        const handler = &binding.source.io.terminal_stream.handler;
+        if (comptime @TypeOf(handler.*).tmux_enabled) {
+            if (handler.tmux_viewer) |viewer| {
+                viewer.unregisterObserver(binding.pane_id, &self.renderer_state.terminal);
+            }
+        }
+
+        // Restore the original state so deinit below frees the
+        // correct mutex (our own, not the shared source mutex).
+        self.renderer_state.mutex = binding.original_mutex;
+        self.renderer_state.terminal = binding.original_terminal;
+        self.tmux_pane_binding = null;
     }
 
     // Clean up our keyboard state

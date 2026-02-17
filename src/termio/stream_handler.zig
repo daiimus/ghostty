@@ -409,6 +409,12 @@ pub const StreamHandler = struct {
 
                         // Free our viewer state if we have one
                         if (self.tmux_viewer) |viewer| {
+                            // Fix up all observer surfaces to point at the
+                            // main terminal before freeing the viewer.
+                            // Without this, observer renderers would be
+                            // pointing at freed pane terminals.
+                            viewer.fixupObservers(self.terminal);
+
                             viewer.deinit();
                             self.alloc.destroy(viewer);
                             self.tmux_viewer = null;
@@ -504,6 +510,13 @@ pub const StreamHandler = struct {
                                 // replaces the entire viewer.
                                 self.renderer_state.terminal = self.terminal;
                             }
+
+                            // Fix up observer surfaces (multi-pane mode).
+                            // Each observer's renderer_state.terminal must
+                            // be re-pointed to the pane terminal in the
+                            // new map, or to the main terminal if the pane
+                            // was removed.
+                            viewer.fixupObservers(self.terminal);
 
                             // Build tmux state snapshot to send to surface
                             var state: apprt.surface.Message.TmuxState = .{

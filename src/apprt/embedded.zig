@@ -2160,6 +2160,112 @@ pub const CAPI = struct {
         return @intCast(id);
     }
 
+    // =========================================================================
+    // tmux Multi-Pane Binding API
+    // =========================================================================
+
+    /// Bind a target surface's renderer to a tmux pane terminal owned by
+    /// a source surface's tmux viewer. After attachment, the target surface
+    /// renders the pane's terminal content using the source surface's mutex,
+    /// which ensures correct synchronization with the IO thread that writes
+    /// pane data under that same mutex.
+    ///
+    /// The target surface must NOT already be attached (call detach first).
+    /// The source surface must be in tmux control mode with the pane present.
+    ///
+    /// Returns true on success, false on failure (bad pane_id, no viewer,
+    /// already attached, or observer registration failed).
+    ///
+    /// Acquires source's renderer_state.mutex for the entire operation.
+    export fn ghostty_surface_tmux_attach_to_pane(
+        target: *Surface,
+        source: *Surface,
+        pane_id: usize,
+    ) bool {
+        // Target must not already be attached.
+        if (target.core_surface.tmux_pane_binding != null) return false;
+
+        const handler = &source.core_surface.io.terminal_stream.handler;
+        if (comptime !@TypeOf(handler.*).tmux_enabled) return false;
+
+        // Lock the source mutex. This is the mutex we'll share with the
+        // target, so holding it here prevents the IO thread from modifying
+        // pane terminals while we set up the binding.
+        source.core_surface.renderer_state.mutex.lock();
+        defer source.core_surface.renderer_state.mutex.unlock();
+
+        const viewer = handler.tmux_viewer orelse return false;
+        const pane = viewer.panes.getPtr(pane_id) orelse return false;
+
+        // Save target's original state for restoration on detach.
+        const binding: CoreSurface.TmuxPaneBinding = .{
+            .source = &source.core_surface,
+            .pane_id = pane_id,
+            .original_mutex = target.core_surface.renderer_state.mutex,
+            .original_terminal = target.core_surface.renderer_state.terminal,
+        };
+
+        // Replace target's renderer state with shared mutex + pane terminal.
+        target.core_surface.renderer_state.mutex = source.core_surface.renderer_state.mutex;
+        target.core_surface.renderer_state.terminal = &pane.terminal;
+        target.core_surface.tmux_pane_binding = binding;
+
+        // Register as an observer so fixupObservers updates our pointer
+        // when syncLayouts rebuilds the pane map.
+        if (!viewer.registerObserver(pane_id, &target.core_surface.renderer_state.terminal)) {
+            // Registration failed — undo the binding.
+            target.core_surface.renderer_state.mutex = binding.original_mutex;
+            target.core_surface.renderer_state.terminal = binding.original_terminal;
+            target.core_surface.tmux_pane_binding = null;
+            return false;
+        }
+
+        // Wake the target's renderer thread to pick up the new terminal.
+        target.core_surface.renderer_thread.wakeup.notify() catch {};
+        return true;
+    }
+
+    /// Detach a target surface from its tmux pane binding. Restores the
+    /// target's original mutex and terminal pointer, and unregisters the
+    /// observer from the source viewer.
+    ///
+    /// No-op if the target is not currently attached.
+    ///
+    /// Acquires the source's renderer_state.mutex (which is currently
+    /// also the target's mutex) for the entire operation.
+    export fn ghostty_surface_tmux_detach_pane(target: *Surface) void {
+        const binding = target.core_surface.tmux_pane_binding orelse return;
+
+        // The target currently shares the source's mutex. Lock it to
+        // synchronize with the IO thread and the target's own renderer.
+        // (target.core_surface.renderer_state.mutex == source's mutex here)
+        target.core_surface.renderer_state.mutex.lock();
+
+        // Unregister from the source viewer's observer list.
+        const handler = &binding.source.io.terminal_stream.handler;
+        if (comptime @TypeOf(handler.*).tmux_enabled) {
+            if (handler.tmux_viewer) |viewer| {
+                viewer.unregisterObserver(binding.pane_id, &target.core_surface.renderer_state.terminal);
+            }
+        }
+
+        // Restore original terminal before restoring the mutex, while
+        // we still hold the shared lock.
+        target.core_surface.renderer_state.terminal = binding.original_terminal;
+
+        // Now restore the original mutex. We must unlock the shared mutex
+        // (which we currently hold) and then set the field. The brief
+        // moment between unlock and field assignment is safe because the
+        // renderer thread checks the mutex field atomically in its render
+        // loop, and we've already restored the terminal pointer above.
+        target.core_surface.renderer_state.mutex.unlock();
+        target.core_surface.renderer_state.mutex = binding.original_mutex;
+        target.core_surface.tmux_pane_binding = null;
+
+        // Wake the target's renderer to redraw with its own terminal.
+        target.core_surface.renderer_thread.wakeup.notify() catch {};
+    }
+
     /// Debug: Get terminal state for debugging scrollback issues
     export fn ghostty_surface_debug_terminal_state(surface: *Surface) Darwin.TerminalDebugState {
         surface.core_surface.renderer_state.mutex.lock();
