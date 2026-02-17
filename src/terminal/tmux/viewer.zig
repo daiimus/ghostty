@@ -323,6 +323,16 @@ pub const Viewer = struct {
         /// a pointer-to-pointer so we can update the actual field value
         /// when the pane map is rebuilt.
         terminal_ptr: **Terminal,
+
+        /// Optional callback invoked when this pane receives new output
+        /// via `%output`. On iOS (where there is no display link), the
+        /// observer's renderer thread only renders when explicitly woken.
+        /// This callback allows the viewer to wake observer renderers
+        /// without depending on any rendering or event-loop types.
+        notify_cb: ?NotifyCallback = null,
+        notify_ud: ?*anyopaque = null,
+
+        pub const NotifyCallback = *const fn (ud: ?*anyopaque) void;
     };
 
     pub const ObserverList = std.ArrayListUnmanaged(Observer);
@@ -477,6 +487,8 @@ pub const Viewer = struct {
         self: *Viewer,
         pane_id: usize,
         terminal_ptr: **Terminal,
+        notify_cb: ?Observer.NotifyCallback,
+        notify_ud: ?*anyopaque,
     ) bool {
         // Verify the pane exists.
         if (!self.panes.contains(pane_id)) return false;
@@ -491,6 +503,8 @@ pub const Viewer = struct {
         self.observers.append(self.alloc, .{
             .pane_id = pane_id,
             .terminal_ptr = terminal_ptr,
+            .notify_cb = notify_cb,
+            .notify_ud = notify_ud,
         }) catch return false;
 
         return true;
@@ -528,6 +542,18 @@ pub const Viewer = struct {
             } else {
                 // Pane was removed — point at the fallback terminal.
                 obs.terminal_ptr.* = fallback;
+            }
+        }
+    }
+
+    /// Wake all observer renderers bound to the given pane. Called after
+    /// receivedOutput() updates a pane's terminal so that observer surfaces
+    /// re-render the new content. On iOS there is no display link, so
+    /// observers only render when explicitly woken via this callback.
+    pub fn wakeObservers(self: *Viewer, pane_id: usize) void {
+        for (self.observers.items) |obs| {
+            if (obs.pane_id == pane_id) {
+                if (obs.notify_cb) |cb| cb(obs.notify_ud);
             }
         }
     }
@@ -1526,6 +1552,11 @@ pub const Viewer = struct {
             log.info("failed to process output for pane id={}: {}", .{ id, err });
             return err;
         };
+
+        // Wake all observer renderers bound to this pane so they
+        // re-render the new content. On iOS there is no display link,
+        // so observers only render when explicitly woken.
+        self.wakeObservers(id);
     }
 
     fn initLayout(
@@ -4084,7 +4115,7 @@ test "registerObserver succeeds for existing pane" {
     // Simulate a renderer_state.terminal pointer.
     var terminal_ptr: *Terminal = &viewer.panes.getPtr(7).?.terminal;
 
-    const ok = viewer.registerObserver(7, &terminal_ptr);
+    const ok = viewer.registerObserver(7, &terminal_ptr, null, null);
     try testing.expect(ok);
     try testing.expectEqual(@as(usize, 1), viewer.observers.items.len);
 }
@@ -4094,7 +4125,7 @@ test "registerObserver fails for non-existent pane" {
     defer viewer.deinit();
 
     var dummy: *Terminal = undefined;
-    const ok = viewer.registerObserver(99, &dummy);
+    const ok = viewer.registerObserver(99, &dummy, null, null);
     try testing.expect(!ok);
     try testing.expectEqual(@as(usize, 0), viewer.observers.items.len);
 }
@@ -4109,9 +4140,9 @@ test "registerObserver rejects duplicate" {
 
     var terminal_ptr: *Terminal = &viewer.panes.getPtr(3).?.terminal;
 
-    try testing.expect(viewer.registerObserver(3, &terminal_ptr));
+    try testing.expect(viewer.registerObserver(3, &terminal_ptr, null, null));
     // Second registration with same pane_id + terminal_ptr should fail.
-    try testing.expect(!viewer.registerObserver(3, &terminal_ptr));
+    try testing.expect(!viewer.registerObserver(3, &terminal_ptr, null, null));
     try testing.expectEqual(@as(usize, 1), viewer.observers.items.len);
 }
 
@@ -4124,7 +4155,7 @@ test "unregisterObserver removes matching entry" {
     try viewer.panes.put(testing.allocator, 5, .{ .terminal = t });
 
     var terminal_ptr: *Terminal = &viewer.panes.getPtr(5).?.terminal;
-    try testing.expect(viewer.registerObserver(5, &terminal_ptr));
+    try testing.expect(viewer.registerObserver(5, &terminal_ptr, null, null));
     try testing.expectEqual(@as(usize, 1), viewer.observers.items.len);
 
     viewer.unregisterObserver(5, &terminal_ptr);
@@ -4152,7 +4183,7 @@ test "fixupObservers updates pointer for existing pane" {
 
     // Set up a simulated renderer_state.terminal field.
     var terminal_ptr: *Terminal = &viewer.panes.getPtr(1).?.terminal;
-    try testing.expect(viewer.registerObserver(1, &terminal_ptr));
+    try testing.expect(viewer.registerObserver(1, &terminal_ptr, null, null));
 
     // Verify the pointer currently points at the pane.
     try testing.expectEqual(&viewer.panes.getPtr(1).?.terminal, terminal_ptr);
@@ -4194,7 +4225,7 @@ test "fixupObservers falls back when pane removed" {
     try viewer.panes.put(testing.allocator, 10, .{ .terminal = t });
 
     var terminal_ptr: *Terminal = &viewer.panes.getPtr(10).?.terminal;
-    try testing.expect(viewer.registerObserver(10, &terminal_ptr));
+    try testing.expect(viewer.registerObserver(10, &terminal_ptr, null, null));
 
     // Now remove the pane (simulating syncLayouts removing it).
     viewer.panes.getPtr(10).?.deinit(testing.allocator);
@@ -4225,8 +4256,8 @@ test "fixupObservers handles multiple observers" {
     // Register observers for each pane.
     var ptr1: *Terminal = &viewer.panes.getPtr(1).?.terminal;
     var ptr2: *Terminal = &viewer.panes.getPtr(2).?.terminal;
-    try testing.expect(viewer.registerObserver(1, &ptr1));
-    try testing.expect(viewer.registerObserver(2, &ptr2));
+    try testing.expect(viewer.registerObserver(1, &ptr1, null, null));
+    try testing.expect(viewer.registerObserver(2, &ptr2, null, null));
     try testing.expectEqual(@as(usize, 2), viewer.observers.items.len);
 
     // Simulate stale pointers.
@@ -4256,8 +4287,8 @@ test "fixupObservers mixed: one pane exists, one removed" {
 
     var ptr1: *Terminal = &viewer.panes.getPtr(1).?.terminal;
     var ptr2: *Terminal = &viewer.panes.getPtr(2).?.terminal;
-    try testing.expect(viewer.registerObserver(1, &ptr1));
-    try testing.expect(viewer.registerObserver(2, &ptr2));
+    try testing.expect(viewer.registerObserver(1, &ptr1, null, null));
+    try testing.expect(viewer.registerObserver(2, &ptr2, null, null));
 
     // Remove pane 2 only.
     viewer.panes.getPtr(2).?.deinit(testing.allocator);
@@ -4276,4 +4307,52 @@ test "fixupObservers mixed: one pane exists, one removed" {
     try testing.expectEqual(&viewer.panes.getPtr(1).?.terminal, ptr1);
     // Pane 2 removed: should point at fallback.
     try testing.expectEqual(&fallback, ptr2);
+}
+
+test "wakeObservers calls notify for matching pane" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Create two panes.
+    var t1: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t1.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 1, .{ .terminal = t1 });
+
+    var t2: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t2.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 2, .{ .terminal = t2 });
+
+    // Track callback invocations via a simple counter.
+    const Counter = struct {
+        var count: usize = 0;
+        fn callback(_: ?*anyopaque) void {
+            count += 1;
+        }
+    };
+
+    Counter.count = 0;
+
+    var ptr1: *Terminal = &viewer.panes.getPtr(1).?.terminal;
+    var ptr2: *Terminal = &viewer.panes.getPtr(2).?.terminal;
+
+    // Register observer for pane 1 WITH a callback.
+    try testing.expect(viewer.registerObserver(1, &ptr1, Counter.callback, null));
+    // Register observer for pane 2 WITHOUT a callback (null).
+    try testing.expect(viewer.registerObserver(2, &ptr2, null, null));
+
+    // Wake observers for pane 1 — should invoke the callback once.
+    viewer.wakeObservers(1);
+    try testing.expectEqual(@as(usize, 1), Counter.count);
+
+    // Wake observers for pane 2 — callback is null, counter unchanged.
+    viewer.wakeObservers(2);
+    try testing.expectEqual(@as(usize, 1), Counter.count);
+
+    // Wake observers for pane 1 again — counter increments.
+    viewer.wakeObservers(1);
+    try testing.expectEqual(@as(usize, 2), Counter.count);
+
+    // Wake observers for a non-existent pane — no crash, no increment.
+    viewer.wakeObservers(999);
+    try testing.expectEqual(@as(usize, 2), Counter.count);
 }
