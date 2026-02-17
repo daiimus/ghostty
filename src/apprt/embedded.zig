@@ -2162,6 +2162,16 @@ pub const CAPI = struct {
     // tmux Multi-Pane Binding API
     // =========================================================================
 
+    /// Callback passed to the tmux viewer's observer system so it can
+    /// wake an observer surface's renderer thread when new %output
+    /// arrives. The userdata is a pointer to the renderer thread's
+    /// `xev.Async` wakeup handle.
+    fn observerWakeup(ud: ?*anyopaque) void {
+        const xev = @import("../global.zig").xev;
+        const wakeup: *xev.Async = @ptrCast(@alignCast(ud.?));
+        wakeup.notify() catch {};
+    }
+
     /// Bind a target surface's renderer to a tmux pane terminal owned by
     /// a source surface's tmux viewer. After attachment, the target surface
     /// renders the pane's terminal content using the source surface's mutex,
@@ -2209,8 +2219,15 @@ pub const CAPI = struct {
         target.core_surface.tmux_pane_binding = binding;
 
         // Register as an observer so fixupObservers updates our pointer
-        // when syncLayouts rebuilds the pane map.
-        if (!viewer.registerObserver(pane_id, &target.core_surface.renderer_state.terminal)) {
+        // when syncLayouts rebuilds the pane map. Pass a wakeup callback
+        // so the viewer can wake the observer's renderer when new %output
+        // arrives for this pane (critical on iOS where there is no display link).
+        if (!viewer.registerObserver(
+            pane_id,
+            &target.core_surface.renderer_state.terminal,
+            observerWakeup,
+            @ptrCast(&target.core_surface.renderer_thread.wakeup),
+        )) {
             // Registration failed — undo the binding.
             target.core_surface.renderer_state.mutex = binding.original_mutex;
             target.core_surface.renderer_state.terminal = binding.original_terminal;
