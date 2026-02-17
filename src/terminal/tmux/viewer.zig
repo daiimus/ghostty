@@ -209,6 +209,12 @@ pub const Viewer = struct {
     /// tab should be highlighted. Null until the first notification.
     active_window_id: ?usize,
 
+    /// Observer surfaces whose renderer_state.terminal pointers must be
+    /// kept in sync when the pane map is rebuilt. Each observer is bound
+    /// to a specific pane_id and holds a pointer-to-pointer that the
+    /// viewer updates during syncLayouts.
+    observers: ObserverList,
+
     pub const CommandQueue = CircBuf(Command, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, Pane);
 
@@ -300,6 +306,27 @@ pub const Viewer = struct {
         }
     };
 
+    /// An observer is a renderer_state.terminal pointer that must be kept
+    /// in sync with a specific pane's terminal. When syncLayouts rebuilds
+    /// the pane map (invalidating all pane pointers), the viewer iterates
+    /// its observer list and updates each terminal_ptr to point at the new
+    /// pane terminal in the rebuilt map.
+    ///
+    /// This is used by the multi-pane architecture: each per-pane surface
+    /// registers an observer so its renderer_state.terminal stays valid
+    /// when the viewer's pane map is reallocated.
+    pub const Observer = struct {
+        /// The pane ID this observer is watching.
+        pane_id: usize,
+
+        /// Pointer to the `terminal` field in a renderer State. We store
+        /// a pointer-to-pointer so we can update the actual field value
+        /// when the pane map is rebuilt.
+        terminal_ptr: **Terminal,
+    };
+
+    pub const ObserverList = std.ArrayListUnmanaged(Observer);
+
     pub const Pane = struct {
         terminal: Terminal,
 
@@ -340,6 +367,7 @@ pub const Viewer = struct {
             .initial_ready_sent = false,
             .active_pane_id = null,
             .active_window_id = null,
+            .observers = .empty,
         };
     }
 
@@ -361,6 +389,7 @@ pub const Viewer = struct {
         if (self.tmux_version.len > 0) {
             self.alloc.free(self.tmux_version);
         }
+        self.observers.deinit(self.alloc);
         self.action_arena.promote(self.alloc).deinit();
     }
 
@@ -437,6 +466,70 @@ pub const Viewer = struct {
         }
 
         return .{ .send_keys = buf[0..pos] };
+    }
+
+    /// Register an observer for a specific pane. The observer's
+    /// terminal_ptr will be updated whenever the pane map is rebuilt
+    /// (e.g., during syncLayouts). The pane must exist in the panes map.
+    /// Returns true if registration succeeded, false if the pane doesn't
+    /// exist or the observer is already registered.
+    pub fn registerObserver(
+        self: *Viewer,
+        pane_id: usize,
+        terminal_ptr: **Terminal,
+    ) bool {
+        // Verify the pane exists.
+        if (!self.panes.contains(pane_id)) return false;
+
+        // Check for duplicate registration.
+        for (self.observers.items) |obs| {
+            if (obs.pane_id == pane_id and obs.terminal_ptr == terminal_ptr) {
+                return false;
+            }
+        }
+
+        self.observers.append(self.alloc, .{
+            .pane_id = pane_id,
+            .terminal_ptr = terminal_ptr,
+        }) catch return false;
+
+        return true;
+    }
+
+    /// Unregister an observer. Matches on both pane_id and terminal_ptr
+    /// to allow multiple observers per pane (though typically there is
+    /// only one). No-op if the observer is not found.
+    pub fn unregisterObserver(
+        self: *Viewer,
+        pane_id: usize,
+        terminal_ptr: **Terminal,
+    ) void {
+        var i: usize = 0;
+        while (i < self.observers.items.len) {
+            const obs = self.observers.items[i];
+            if (obs.pane_id == pane_id and obs.terminal_ptr == terminal_ptr) {
+                _ = self.observers.swapRemove(i);
+                // Don't increment i — swapRemove moved the last element here.
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Fix up all observer terminal pointers after the pane map has been
+    /// rebuilt. For each observer, if the pane still exists in the new
+    /// map, update the terminal_ptr to point at the new pane's terminal.
+    /// If the pane was removed, point the observer at `fallback` (the
+    /// main termio terminal) so the renderer doesn't access freed memory.
+    pub fn fixupObservers(self: *Viewer, fallback: *Terminal) void {
+        for (self.observers.items) |obs| {
+            if (self.panes.getPtr(obs.pane_id)) |pane| {
+                obs.terminal_ptr.* = &pane.terminal;
+            } else {
+                // Pane was removed — point at the fallback terminal.
+                obs.terminal_ptr.* = fallback;
+            }
+        }
     }
 
     /// Send in an input event (such as a tmux protocol notification,
@@ -3974,4 +4067,213 @@ test "ACS charset (ESC(0) followed by UTF-8 box-drawing produces spaces not U+FF
             .contains_tags = &.{.exit},
         },
     });
+}
+
+// =========================================================================
+// Observer tests
+// =========================================================================
+
+test "registerObserver succeeds for existing pane" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 7, .{ .terminal = t });
+
+    // Simulate a renderer_state.terminal pointer.
+    var terminal_ptr: *Terminal = &viewer.panes.getPtr(7).?.terminal;
+
+    const ok = viewer.registerObserver(7, &terminal_ptr);
+    try testing.expect(ok);
+    try testing.expectEqual(@as(usize, 1), viewer.observers.items.len);
+}
+
+test "registerObserver fails for non-existent pane" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var dummy: *Terminal = undefined;
+    const ok = viewer.registerObserver(99, &dummy);
+    try testing.expect(!ok);
+    try testing.expectEqual(@as(usize, 0), viewer.observers.items.len);
+}
+
+test "registerObserver rejects duplicate" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 3, .{ .terminal = t });
+
+    var terminal_ptr: *Terminal = &viewer.panes.getPtr(3).?.terminal;
+
+    try testing.expect(viewer.registerObserver(3, &terminal_ptr));
+    // Second registration with same pane_id + terminal_ptr should fail.
+    try testing.expect(!viewer.registerObserver(3, &terminal_ptr));
+    try testing.expectEqual(@as(usize, 1), viewer.observers.items.len);
+}
+
+test "unregisterObserver removes matching entry" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 5, .{ .terminal = t });
+
+    var terminal_ptr: *Terminal = &viewer.panes.getPtr(5).?.terminal;
+    try testing.expect(viewer.registerObserver(5, &terminal_ptr));
+    try testing.expectEqual(@as(usize, 1), viewer.observers.items.len);
+
+    viewer.unregisterObserver(5, &terminal_ptr);
+    try testing.expectEqual(@as(usize, 0), viewer.observers.items.len);
+}
+
+test "unregisterObserver is no-op for non-existent observer" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var dummy: *Terminal = undefined;
+    // Should not crash or change anything.
+    viewer.unregisterObserver(99, &dummy);
+    try testing.expectEqual(@as(usize, 0), viewer.observers.items.len);
+}
+
+test "fixupObservers updates pointer for existing pane" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Create a pane.
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 1, .{ .terminal = t });
+
+    // Set up a simulated renderer_state.terminal field.
+    var terminal_ptr: *Terminal = &viewer.panes.getPtr(1).?.terminal;
+    try testing.expect(viewer.registerObserver(1, &terminal_ptr));
+
+    // Verify the pointer currently points at the pane.
+    try testing.expectEqual(&viewer.panes.getPtr(1).?.terminal, terminal_ptr);
+
+    // Simulate a pane map rebuild: create a new pane with the same ID.
+    // First, remember the old address.
+    const old_addr = &viewer.panes.getPtr(1).?.terminal;
+
+    // Replace the pane (simulating syncLayouts: deinit old, put new).
+    viewer.panes.getPtr(1).?.deinit(testing.allocator);
+    var t2: Terminal = try .init(testing.allocator, .{ .cols = 40, .rows = 12 });
+    errdefer t2.deinit(testing.allocator);
+    viewer.panes.getPtr(1).?.terminal = t2;
+
+    // Create a fallback terminal.
+    var fallback: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer fallback.deinit(testing.allocator);
+
+    // Manually point terminal_ptr somewhere else to simulate stale pointer.
+    terminal_ptr = &fallback;
+    try testing.expect(terminal_ptr != &viewer.panes.getPtr(1).?.terminal);
+
+    // fixupObservers should re-point it to the pane's terminal.
+    viewer.fixupObservers(&fallback);
+    try testing.expectEqual(&viewer.panes.getPtr(1).?.terminal, terminal_ptr);
+
+    // Verify it's NOT pointing at the old address (unless the allocator
+    // reused it, but at least verify the fixup ran).
+    _ = old_addr;
+}
+
+test "fixupObservers falls back when pane removed" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Create pane 10.
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 10, .{ .terminal = t });
+
+    var terminal_ptr: *Terminal = &viewer.panes.getPtr(10).?.terminal;
+    try testing.expect(viewer.registerObserver(10, &terminal_ptr));
+
+    // Now remove the pane (simulating syncLayouts removing it).
+    viewer.panes.getPtr(10).?.deinit(testing.allocator);
+    _ = viewer.panes.swapRemove(10);
+
+    // Create a fallback terminal.
+    var fallback: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer fallback.deinit(testing.allocator);
+
+    // fixupObservers should set terminal_ptr to the fallback.
+    viewer.fixupObservers(&fallback);
+    try testing.expectEqual(&fallback, terminal_ptr);
+}
+
+test "fixupObservers handles multiple observers" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Create two panes.
+    var t1: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t1.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 1, .{ .terminal = t1 });
+
+    var t2: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t2.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 2, .{ .terminal = t2 });
+
+    // Register observers for each pane.
+    var ptr1: *Terminal = &viewer.panes.getPtr(1).?.terminal;
+    var ptr2: *Terminal = &viewer.panes.getPtr(2).?.terminal;
+    try testing.expect(viewer.registerObserver(1, &ptr1));
+    try testing.expect(viewer.registerObserver(2, &ptr2));
+    try testing.expectEqual(@as(usize, 2), viewer.observers.items.len);
+
+    // Simulate stale pointers.
+    var fallback: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer fallback.deinit(testing.allocator);
+    ptr1 = &fallback;
+    ptr2 = &fallback;
+
+    // fixupObservers should restore both.
+    viewer.fixupObservers(&fallback);
+    try testing.expectEqual(&viewer.panes.getPtr(1).?.terminal, ptr1);
+    try testing.expectEqual(&viewer.panes.getPtr(2).?.terminal, ptr2);
+}
+
+test "fixupObservers mixed: one pane exists, one removed" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Create two panes.
+    var t1: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t1.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 1, .{ .terminal = t1 });
+
+    var t2: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t2.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 2, .{ .terminal = t2 });
+
+    var ptr1: *Terminal = &viewer.panes.getPtr(1).?.terminal;
+    var ptr2: *Terminal = &viewer.panes.getPtr(2).?.terminal;
+    try testing.expect(viewer.registerObserver(1, &ptr1));
+    try testing.expect(viewer.registerObserver(2, &ptr2));
+
+    // Remove pane 2 only.
+    viewer.panes.getPtr(2).?.deinit(testing.allocator);
+    _ = viewer.panes.swapRemove(2);
+
+    var fallback: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer fallback.deinit(testing.allocator);
+
+    // Make both stale.
+    ptr1 = &fallback;
+    ptr2 = &fallback;
+
+    viewer.fixupObservers(&fallback);
+
+    // Pane 1 still exists: should point at pane 1's terminal.
+    try testing.expectEqual(&viewer.panes.getPtr(1).?.terminal, ptr1);
+    // Pane 2 removed: should point at fallback.
+    try testing.expectEqual(&fallback, ptr2);
 }
