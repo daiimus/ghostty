@@ -2001,6 +2001,34 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Set the active tmux pane for input routing only (send-keys),
+    /// WITHOUT swapping the renderer terminal pointer. This is used in
+    /// multi-surface mode (iOS) where each pane has its own observer
+    /// surface for rendering, but user keystrokes still need to be
+    /// routed to the correct pane via send-keys.
+    ///
+    /// Returns true if successful, false if pane_id not found or not in tmux mode.
+    ///
+    /// Acquires renderer_state.mutex to synchronize with processOutput
+    /// and queueWrite (which reads active_pane_id via sendKeys).
+    export fn ghostty_surface_tmux_set_active_pane_input_only(
+        surface: *Surface,
+        pane_id: usize,
+    ) bool {
+        const handler = &surface.core_surface.io.terminal_stream.handler;
+        if (comptime !@TypeOf(handler.*).tmux_enabled) return false;
+
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const viewer = handler.tmux_viewer orelse return false;
+        if (!viewer.panes.contains(pane_id)) return false;
+
+        // Only set the active pane for input routing — do NOT touch the renderer.
+        viewer.setActivePaneId(pane_id);
+        return true;
+    }
+
     /// Reset to render the main terminal (not a tmux pane).
     ///
     /// Acquires renderer_state.mutex for the entire operation.
