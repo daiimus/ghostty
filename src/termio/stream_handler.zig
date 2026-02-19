@@ -409,11 +409,15 @@ pub const StreamHandler = struct {
 
                         // Free our viewer state if we have one
                         if (self.tmux_viewer) |viewer| {
-                            // Fix up all observer surfaces to point at the
-                            // main terminal before freeing the viewer.
-                            // Without this, observer renderers would be
-                            // pointing at freed pane terminals.
-                            viewer.fixupObservers(self.terminal);
+                            // Unconditionally reset ALL observer surfaces to
+                            // the main terminal before freeing the viewer.
+                            // We must use resetAllObservers (not fixupObservers)
+                            // because the panes are still in the viewer's map
+                            // at this point — fixupObservers would re-point
+                            // observers at the pane terminals (which are about
+                            // to be freed), causing use-after-free on the
+                            // renderer threads.
+                            viewer.resetAllObservers(self.terminal);
 
                             viewer.deinit();
                             self.alloc.destroy(viewer);
