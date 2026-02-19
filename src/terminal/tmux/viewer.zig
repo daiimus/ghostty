@@ -530,6 +530,25 @@ pub const Viewer = struct {
         }
     }
 
+    /// Unregister all observers matching a given terminal_ptr, regardless
+    /// of pane_id. Used when re-registering a surface for a different pane
+    /// (e.g., the primary surface changing its rendering pane via
+    /// setActiveTmuxPane).
+    pub fn unregisterObserverByPtr(
+        self: *Viewer,
+        terminal_ptr: **Terminal,
+    ) void {
+        var i: usize = 0;
+        while (i < self.observers.items.len) {
+            const obs = self.observers.items[i];
+            if (obs.terminal_ptr == terminal_ptr) {
+                _ = self.observers.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
     /// Fix up all observer terminal pointers after the pane map has been
     /// rebuilt. For each observer, if the pane still exists in the new
     /// map, update the terminal_ptr to point at the new pane's terminal.
@@ -4355,4 +4374,90 @@ test "wakeObservers calls notify for matching pane" {
     // Wake observers for a non-existent pane — no crash, no increment.
     viewer.wakeObservers(999);
     try testing.expectEqual(@as(usize, 2), Counter.count);
+}
+
+test "unregisterObserverByPtr removes observer regardless of pane_id" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Create two panes.
+    var t1: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t1.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 1, .{ .terminal = t1 });
+
+    var t2: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t2.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 2, .{ .terminal = t2 });
+
+    var ptr1: *Terminal = &viewer.panes.getPtr(1).?.terminal;
+    var ptr2: *Terminal = &viewer.panes.getPtr(2).?.terminal;
+
+    // Register observers for both panes.
+    try testing.expect(viewer.registerObserver(1, &ptr1, null, null));
+    try testing.expect(viewer.registerObserver(2, &ptr2, null, null));
+    try testing.expectEqual(@as(usize, 2), viewer.observers.items.len);
+
+    // Unregister by ptr1 — should remove only the observer for ptr1.
+    viewer.unregisterObserverByPtr(&ptr1);
+    try testing.expectEqual(@as(usize, 1), viewer.observers.items.len);
+    try testing.expectEqual(&ptr2, viewer.observers.items[0].terminal_ptr);
+
+    // Unregister by ptr2 — should remove the last observer.
+    viewer.unregisterObserverByPtr(&ptr2);
+    try testing.expectEqual(@as(usize, 0), viewer.observers.items.len);
+}
+
+test "unregisterObserverByPtr allows re-registration for different pane" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Create two panes.
+    var t1: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t1.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 1, .{ .terminal = t1 });
+
+    var t2: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t2.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 2, .{ .terminal = t2 });
+
+    // Simulates primary surface renderer_state.terminal.
+    var primary_ptr: *Terminal = &viewer.panes.getPtr(1).?.terminal;
+
+    // Register primary as observer for pane 1.
+    try testing.expect(viewer.registerObserver(1, &primary_ptr, null, null));
+    try testing.expectEqual(@as(usize, 1), viewer.observers.items.len);
+    try testing.expectEqual(@as(usize, 1), viewer.observers.items[0].pane_id);
+
+    // Re-register for pane 2 (simulates setActiveTmuxPane changing pane).
+    viewer.unregisterObserverByPtr(&primary_ptr);
+    primary_ptr = &viewer.panes.getPtr(2).?.terminal;
+    try testing.expect(viewer.registerObserver(2, &primary_ptr, null, null));
+
+    // Should have exactly 1 observer, now for pane 2.
+    try testing.expectEqual(@as(usize, 1), viewer.observers.items.len);
+    try testing.expectEqual(@as(usize, 2), viewer.observers.items[0].pane_id);
+
+    // fixupObservers should point it at pane 2's terminal.
+    var fallback: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer fallback.deinit(testing.allocator);
+    primary_ptr = &fallback; // Stale it.
+    viewer.fixupObservers(&fallback);
+    try testing.expectEqual(&viewer.panes.getPtr(2).?.terminal, primary_ptr);
+}
+
+test "unregisterObserverByPtr is no-op for unknown ptr" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var t1: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t1.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 1, .{ .terminal = t1 });
+
+    var ptr1: *Terminal = &viewer.panes.getPtr(1).?.terminal;
+    try testing.expect(viewer.registerObserver(1, &ptr1, null, null));
+
+    // Unregister with a different ptr — no-op.
+    var other_ptr: *Terminal = &viewer.panes.getPtr(1).?.terminal;
+    viewer.unregisterObserverByPtr(&other_ptr);
+    try testing.expectEqual(@as(usize, 1), viewer.observers.items.len);
 }
