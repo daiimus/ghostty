@@ -159,6 +159,22 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
 }
 
 pub fn deinit(self: *Metal) void {
+    // Defense-in-depth: clear the display callback before releasing the
+    // layer. On iOS the IOSurfaceLayer is added as a sublayer of the
+    // UIView's backing layer and may outlive this Metal instance (the
+    // UIView still retains it). If UIKit's compositor calls `display`
+    // on the orphaned layer after we've been freed, it would dereference
+    // a stale `display_ctx` pointer -> SIGSEGV. Clearing the callback
+    // here ensures the `display` override is a no-op even if the layer
+    // is still alive.
+    self.layer.setDisplayCallback(null, null);
+
+    // On iOS, remove our IOSurfaceLayer from the view's layer hierarchy
+    // so UIKit doesn't try to composite it after we're gone.
+    if (comptime builtin.os.tag == .ios) {
+        self.layer.layer.msgSend(void, objc.sel("removeFromSuperlayer"), .{});
+    }
+
     self.queue.release();
     self.device.release();
     self.layer.release();
@@ -170,6 +186,15 @@ pub fn loopEnter(self: *Metal) void {
         @ptrCast(&displayCallback),
         @ptrCast(renderer),
     );
+}
+
+/// Called when the renderer thread exits its main loop (before thread
+/// join). We must clear the display callback here because the renderer
+/// is about to be freed, but the IOSurfaceLayer may still be retained
+/// by the UIKit layer hierarchy and could receive a `display` call from
+/// the compositor.
+pub fn loopExit(self: *Metal) void {
+    self.layer.setDisplayCallback(null, null);
 }
 
 fn displayCallback(renderer: *Renderer) align(8) void {

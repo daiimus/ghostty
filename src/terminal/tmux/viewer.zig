@@ -565,6 +565,18 @@ pub const Viewer = struct {
         }
     }
 
+    /// Unconditionally reset ALL observer terminal pointers to the given
+    /// fallback terminal. Unlike `fixupObservers` (which re-points observers
+    /// at their pane terminals if the pane still exists), this always uses
+    /// the fallback. Used during tmux exit/teardown where all pane terminals
+    /// are about to be freed — we must not leave any observer pointing at
+    /// a pane terminal regardless of whether it's still in the map.
+    pub fn resetAllObservers(self: *Viewer, fallback: *Terminal) void {
+        for (self.observers.items) |obs| {
+            obs.terminal_ptr.* = fallback;
+        }
+    }
+
     /// Wake all observer renderers bound to the given pane. Called after
     /// receivedOutput() updates a pane's terminal so that observer surfaces
     /// re-render the new content. On iOS there is no display link, so
@@ -4460,4 +4472,48 @@ test "unregisterObserverByPtr is no-op for unknown ptr" {
     var other_ptr: *Terminal = &viewer.panes.getPtr(1).?.terminal;
     viewer.unregisterObserverByPtr(&other_ptr);
     try testing.expectEqual(@as(usize, 1), viewer.observers.items.len);
+}
+
+test "resetAllObservers unconditionally sets all observers to fallback" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Create two panes.
+    var t1: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t1.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 1, .{ .terminal = t1 });
+
+    var t2: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer t2.deinit(testing.allocator);
+    try viewer.panes.put(testing.allocator, 2, .{ .terminal = t2 });
+
+    // Register observers — they start pointing at their pane terminals.
+    var ptr1: *Terminal = &viewer.panes.getPtr(1).?.terminal;
+    var ptr2: *Terminal = &viewer.panes.getPtr(2).?.terminal;
+    try testing.expect(viewer.registerObserver(1, &ptr1, null, null));
+    try testing.expect(viewer.registerObserver(2, &ptr2, null, null));
+
+    // Create fallback terminal.
+    var fallback: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer fallback.deinit(testing.allocator);
+
+    // resetAllObservers should point BOTH at fallback, even though
+    // their panes still exist in the map. (fixupObservers would
+    // re-point them at the pane terminals — that's the bug this
+    // method exists to prevent.)
+    viewer.resetAllObservers(&fallback);
+    try testing.expectEqual(&fallback, ptr1);
+    try testing.expectEqual(&fallback, ptr2);
+}
+
+test "resetAllObservers is safe with no observers" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    var fallback: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer fallback.deinit(testing.allocator);
+
+    // Should be a no-op without panicking.
+    viewer.resetAllObservers(&fallback);
+    try testing.expectEqual(@as(usize, 0), viewer.observers.items.len);
 }
