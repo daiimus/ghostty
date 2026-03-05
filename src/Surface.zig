@@ -687,16 +687,6 @@ pub fn init(
                 .term = config.term,
                 .rt_pre_exec_info = .init(config),
                 .rt_post_fork_info = .init(config),
-
-                // Get the cgroup if we're on linux and have the decl. I'd love
-                // to change this from a decl to a surface options struct because
-                // then we can do memory management better (don't need to retain
-                // the string around).
-                .linux_cgroup = if (comptime builtin.os.tag == .linux and
-                    @hasDecl(apprt.runtime.Surface, "cgroup"))
-                    rt_surface.cgroup()
-                else
-                    Command.linux_cgroup_default,
             });
             break :backend .{ .exec = io_exec };
         };
@@ -2912,7 +2902,7 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) try self.activeTerminal().scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) self.activeTerminal().scrollViewport(.bottom);
 
         try self.queueRender();
     }
@@ -3636,7 +3626,7 @@ pub fn scrollCallback(
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
-            try self.activeTerminal().scrollViewport(.{ .delta = y.delta * -1 });
+            self.activeTerminal().scrollViewport(.{ .delta = y.delta * -1 });
         }
     }
 
@@ -5171,7 +5161,7 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
 ///
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
-    try self.activeTerminal().scrollViewport(.{ .bottom = {} });
+    self.activeTerminal().scrollViewport(.{ .bottom = {} });
     try self.queueRender();
 }
 
