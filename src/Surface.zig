@@ -647,32 +647,50 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env internal_os.getEnvMap(alloc) catch
-                std.process.EnvMap.init(alloc);
+        // Determine which backend to use based on the runtime surface.
+        // Embedded surfaces can specify an external backend for SSH/serial.
+        const uses_external = if (@hasDecl(apprt.runtime.Surface, "usesExternalBackend"))
+            rt_surface.usesExternalBackend()
+        else
+            false;
+
+        // Initialize the appropriate backend
+        var io_backend: termio.Backend = if (uses_external) backend: {
+            // Use external backend (SSH, serial, etc.)
+            if (@hasDecl(apprt.runtime.Surface, "getTermioBackend")) {
+                break :backend try rt_surface.getTermioBackend(alloc);
+            } else {
+                return error.ExternalBackendNotSupported;
+            }
+        } else backend: {
+            // Use exec backend (subprocess with PTY)
+            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                // If an error occurs, we don't want to block surface startup.
+                log.warn("error getting env map for surface err={}", .{err});
+                break :env internal_os.getEnvMap(alloc) catch
+                    std.process.EnvMap.init(alloc);
+            };
+            errdefer env.deinit();
+
+            // don't leak GHOSTTY_LOG to any subprocesses
+            env.remove("GHOSTTY_LOG");
+
+            const io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = config.@"working-directory",
+                .resources_dir = global_state.resources_dir.host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            break :backend .{ .exec = io_exec };
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        env.remove("GHOSTTY_LOG");
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = config.@"working-directory",
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        errdefer io_backend.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -682,7 +700,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = io_backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -2884,7 +2902,7 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) try self.activeTerminal().scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) self.activeTerminal().scrollViewport(.bottom);
 
         try self.queueRender();
     }
@@ -3646,7 +3664,7 @@ pub fn scrollCallback(
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
-            try self.activeTerminal().scrollViewport(.{ .delta = y.delta * -1 });
+            self.activeTerminal().scrollViewport(.{ .delta = y.delta * -1 });
         }
     }
 
@@ -5181,7 +5199,7 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
 ///
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
-    try self.activeTerminal().scrollViewport(.{ .bottom = {} });
+    self.activeTerminal().scrollViewport(.{ .bottom = {} });
     try self.queueRender();
 }
 
