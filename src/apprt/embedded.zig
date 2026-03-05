@@ -1999,8 +1999,12 @@ pub const CAPI = struct {
         surface.core_surface.renderer_state.mutex.lock();
         defer surface.core_surface.renderer_state.mutex.unlock();
 
-        const viewer = handler.tmux_viewer orelse return false;
-        const pane = viewer.panes.getPtr(pane_id) orelse return false;
+        const viewer = handler.tmux_viewer orelse {
+            return false;
+        };
+        const pane = viewer.panes.getPtr(pane_id) orelse {
+            return false;
+        };
 
         // Set the active pane for user input routing (send-keys).
         viewer.setActivePaneId(pane_id);
@@ -2252,7 +2256,9 @@ pub const CAPI = struct {
         pane_id: usize,
     ) bool {
         // Target must not already be attached.
-        if (target.core_surface.tmux_pane_binding != null) return false;
+        if (target.core_surface.tmux_pane_binding != null) {
+            return false;
+        }
 
         const handler = &source.core_surface.io.terminal_stream.handler;
         if (comptime !@TypeOf(handler.*).tmux_enabled) return false;
@@ -2263,8 +2269,12 @@ pub const CAPI = struct {
         source.core_surface.renderer_state.mutex.lock();
         defer source.core_surface.renderer_state.mutex.unlock();
 
-        const viewer = handler.tmux_viewer orelse return false;
-        const pane = viewer.panes.getPtr(pane_id) orelse return false;
+        const viewer = handler.tmux_viewer orelse {
+            return false;
+        };
+        const pane = viewer.panes.getPtr(pane_id) orelse {
+            return false;
+        };
 
         // Save target's original state for restoration on detach.
         const binding: CoreSurface.TmuxPaneBinding = .{
@@ -2310,7 +2320,9 @@ pub const CAPI = struct {
     /// Acquires the source's renderer_state.mutex (which is currently
     /// also the target's mutex) for the entire operation.
     export fn ghostty_surface_tmux_detach_pane(target: *Surface) void {
-        const binding = target.core_surface.tmux_pane_binding orelse return;
+        const binding = target.core_surface.tmux_pane_binding orelse {
+            return;
+        };
 
         // The target currently shares the source's mutex. Lock it to
         // synchronize with the IO thread and the target's own renderer.
