@@ -1179,7 +1179,7 @@ pub const Viewer = struct {
             ),
         } else {
             // If we have no pending commands, this is unexpected.
-            log.info("unexpected block output err={}", .{is_err});
+            log.debug("unexpected block output err={}", .{is_err});
             return;
         };
         self.command_queue.deleteOldest(1);
