@@ -4524,7 +4524,7 @@ fn linkAtPos(
     const mouse_pin: terminal.Pin = mouse_pin: {
         const point = self.posToViewport(pos.x, pos.y);
         const pin = screen.pages.pin(.{ .viewport = point }) orelse {
-            log.warn("failed to get pin for clicked point", .{});
+            log.debug("failed to get pin for clicked point", .{});
             return null;
         };
         break :mouse_pin pin;

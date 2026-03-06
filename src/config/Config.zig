@@ -3988,10 +3988,23 @@ fn writeConfigTemplate(path: []const u8) !void {
 /// The legacy `config` file (without extension) is first loaded,
 /// then `config.ghostty`.
 pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
-    // Load XDG first
-    const legacy_xdg_path = try file_load.legacyDefaultXdgPath(alloc);
+    // Load XDG first. On platforms without a home directory (e.g. iOS),
+    // there are no default config file locations — skip gracefully.
+    const legacy_xdg_path = file_load.legacyDefaultXdgPath(alloc) catch |err| switch (err) {
+        error.NoHomeDir => {
+            log.debug("no home directory found, skipping default config files", .{});
+            return;
+        },
+        else => return err,
+    };
     defer alloc.free(legacy_xdg_path);
-    const xdg_path = try file_load.defaultXdgPath(alloc);
+    const xdg_path = file_load.defaultXdgPath(alloc) catch |err| switch (err) {
+        error.NoHomeDir => {
+            log.debug("no home directory found, skipping default config files", .{});
+            return;
+        },
+        else => return err,
+    };
     defer alloc.free(xdg_path);
     const xdg_loaded: bool = xdg_loaded: {
         const legacy_xdg_action = self.loadOptionalFile(alloc, legacy_xdg_path);
