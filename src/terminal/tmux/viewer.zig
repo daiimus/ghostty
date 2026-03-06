@@ -1624,8 +1624,22 @@ pub const Viewer = struct {
                     // dimensions (e.g. after refresh-client -C). Without
                     // this, the pane's Terminal grid stays at its old size
                     // and output is rendered with the wrong dimensions.
-                    const new_cols: size.CellCountInt = @intCast(layout.width);
-                    const new_rows: size.CellCountInt = @intCast(layout.height);
+                    const new_cols: size.CellCountInt = std.math.cast(
+                        size.CellCountInt,
+                        layout.width,
+                    ) orelse {
+                        log.warn("pane {} layout width {} overflows CellCountInt, skipping", .{ id, layout.width });
+                        _ = panes_new.swapRemove(gop.key_ptr.*);
+                        break :pane;
+                    };
+                    const new_rows: size.CellCountInt = std.math.cast(
+                        size.CellCountInt,
+                        layout.height,
+                    ) orelse {
+                        log.warn("pane {} layout height {} overflows CellCountInt, skipping", .{ id, layout.height });
+                        _ = panes_new.swapRemove(gop.key_ptr.*);
+                        break :pane;
+                    };
                     if (gop.value_ptr.terminal.cols != new_cols or
                         gop.value_ptr.terminal.rows != new_rows)
                     {
@@ -1639,12 +1653,28 @@ pub const Viewer = struct {
                     break :pane;
                 }
 
-                // TODO: We need to gracefully handle overflow of our
-                // max cols/width here. In practice we shouldn't hit this
-                // so we cast but its not safe.
+                // Validate layout dimensions fit in CellCountInt before
+                // creating the terminal. Oversized dimensions from a
+                // corrupted or adversarial layout would panic on @intCast.
+                const cols: size.CellCountInt = std.math.cast(
+                    size.CellCountInt,
+                    layout.width,
+                ) orelse {
+                    log.warn("pane {} layout width {} overflows CellCountInt, skipping", .{ id, layout.width });
+                    _ = panes_new.swapRemove(gop.key_ptr.*);
+                    break :pane;
+                };
+                const rows: size.CellCountInt = std.math.cast(
+                    size.CellCountInt,
+                    layout.height,
+                ) orelse {
+                    log.warn("pane {} layout height {} overflows CellCountInt, skipping", .{ id, layout.height });
+                    _ = panes_new.swapRemove(gop.key_ptr.*);
+                    break :pane;
+                };
                 var t: Terminal = try .init(gpa_alloc, .{
-                    .cols = @intCast(layout.width),
-                    .rows = @intCast(layout.height),
+                    .cols = cols,
+                    .rows = rows,
                 });
                 errdefer t.deinit(gpa_alloc);
 
