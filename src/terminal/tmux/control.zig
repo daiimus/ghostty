@@ -68,10 +68,19 @@ pub const Parser = struct {
                 isOctalDigit(data[read + 2]) and
                 isOctalDigit(data[read + 3]))
             {
-                data[write] = (@as(u8, data[read + 1] - '0') << 6) |
-                    (@as(u8, data[read + 2] - '0') << 3) |
+                // Compute the octal value using u16 to avoid overflow.
+                // Values above 255 (\400+) cannot represent a byte, so
+                // treat them as literal characters.
+                const val: u16 = (@as(u16, data[read + 1] - '0') << 6) |
+                    (@as(u16, data[read + 2] - '0') << 3) |
                     (data[read + 3] - '0');
-                read += 4;
+                if (val <= std.math.maxInt(u8)) {
+                    data[write] = @intCast(val);
+                    read += 4;
+                } else {
+                    data[write] = data[read];
+                    read += 1;
+                }
             } else {
                 data[write] = data[read];
                 read += 1;

@@ -975,7 +975,10 @@ pub const Viewer = struct {
 
         // Replace the old name with the new one.
         if (window.name.len > 0) self.alloc.free(window.name);
-        window.name = try self.alloc.dupe(u8, new_name);
+        window.name = if (new_name.len > 0)
+            try self.alloc.dupe(u8, new_name)
+        else
+            "";
 
         // Notify the apprt that windows changed so it can refresh.
         var arena = self.action_arena.promote(self.alloc);
@@ -1289,7 +1292,10 @@ pub const Viewer = struct {
                 .height = data.window_height,
                 .layout_arena = arena.state,
                 .layout = layout,
-                .name = try self.alloc.dupe(u8, data.window_name),
+                .name = if (data.window_name.len > 0)
+                    try self.alloc.dupe(u8, data.window_name)
+                else
+                    "",
                 .raw_layout = try self.alloc.dupe(u8, data.window_layout),
             });
         }
@@ -1538,6 +1544,12 @@ pub const Viewer = struct {
         // Swap in persistent parser state from the pane.
         stream.parser = pane.vt_parser;
         stream.utf8decoder = pane.vt_utf8decoder;
+        // Restore the OSC parser allocator lost during the swap.
+        // VTParser.init() sets osc_parser.alloc = null; vtStream()
+        // sets it via initAlloc(), but our parser swap overwrites it.
+        // Without this, multi-field OSC sequences (OSC 4, 10, 11)
+        // are silently dropped.
+        stream.parser.osc_parser.alloc = self.alloc;
         defer {
             // DCS/OSC/APC sequences within %output data that span to
             // the end of a message are passthrough sequences meant for
