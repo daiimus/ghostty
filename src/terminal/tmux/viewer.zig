@@ -348,6 +348,11 @@ pub const Viewer = struct {
         /// writes this directly to the backend. Includes trailing newline.
         send_keys: []const u8,
 
+        /// A tmux `display-message` was received. The payload is the
+        /// message text. Surfaced to the apprt so the UI can show it
+        /// as a toast/banner.
+        message: []const u8,
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -1075,6 +1080,16 @@ pub const Viewer = struct {
             // No-op for now — the apprt can observe these via C API later
             // when format subscriptions are actively used.
             .subscription_changed => {},
+
+            // display-message: surface the message text to the apprt.
+            .message => |text| {
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(arena.allocator(), .{ .message = text }) catch {
+                    log.warn("failed to append message action", .{});
+                    return self.defunct();
+                };
+            },
         }
 
         // After processing commands, we add our next command to
