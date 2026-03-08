@@ -130,6 +130,10 @@ pub const Message = union(enum) {
     /// text, copied via WriteReq.
     tmux_message: WriteReq,
 
+    /// tmux control mode: the active window changed.
+    /// Sent when the user switches windows via tmux (e.g., prefix+n).
+    tmux_active_window_changed: usize,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 

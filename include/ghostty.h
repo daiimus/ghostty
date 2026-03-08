@@ -888,6 +888,11 @@ typedef struct {
   size_t len;
 } ghostty_action_tmux_message_s;
 
+// apprt.action.TmuxActiveWindowChanged
+typedef struct {
+  uint32_t window_id;
+} ghostty_action_tmux_active_window_changed_s;
+
 // terminal.Scrollbar
 typedef struct {
   uint64_t total;
@@ -966,6 +971,7 @@ typedef enum {
   GHOSTTY_ACTION_TMUX_READY,
   GHOSTTY_ACTION_TMUX_COMMAND_RESPONSE,
   GHOSTTY_ACTION_TMUX_MESSAGE,
+  GHOSTTY_ACTION_TMUX_ACTIVE_WINDOW_CHANGED,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1010,6 +1016,7 @@ typedef union {
   ghostty_action_tmux_command_response_s tmux_command_response;
   ghostty_action_tmux_exit_s tmux_exit;
   ghostty_action_tmux_message_s tmux_message;
+  ghostty_action_tmux_active_window_changed_s tmux_active_window_changed;
 } ghostty_action_u;
 
 typedef struct {

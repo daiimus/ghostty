@@ -611,6 +611,12 @@ pub const StreamHandler = struct {
                                 .tmux_message = data,
                             });
                         },
+
+                        .active_window_changed => |window_id| {
+                            self.surfaceMessageWriter(.{
+                                .tmux_active_window_changed = window_id,
+                            });
+                        },
                     }
                 }
             },
