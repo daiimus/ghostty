@@ -2384,7 +2384,11 @@ const Command = union(enum) {
             ),
 
             .register_subscriptions => try writer.writeAll(
-                "refresh-client -B 'pane_title:%*:#{pane_title}'\n",
+                "refresh-client" ++
+                    " -B 'pane_title:%*:#{pane_title}'" ++
+                    " -B 'status_left::#{T:status-left}'" ++
+                    " -B 'status_right::#{T:status-right}'" ++
+                    "\n",
             ),
 
             .user => |v| try writer.writeAll(v),
