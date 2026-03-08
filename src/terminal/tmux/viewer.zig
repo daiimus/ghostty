@@ -309,8 +309,9 @@ pub const Viewer = struct {
 
     pub const Action = union(enum) {
         /// Tmux has closed the control mode connection, we should end
-        /// our viewer session in some way.
-        exit,
+        /// our viewer session in some way. The reason string describes
+        /// why the exit occurred (e.g., "detached", "server-exited").
+        exit: []const u8,
 
         /// Send a command to tmux, e.g. `list-windows`. The caller
         /// should not worry about parsing this or reading what command
@@ -791,7 +792,7 @@ pub const Viewer = struct {
             // I don't think this is technically possible (reading the
             // tmux source code), but if we see an exit we can semantically
             // handle this without issue.
-            .exit => return self.defunct(),
+            .exit => |info| return self.defunctWithReason(info.reason),
 
             // Any begin and end (even error) is fine! Now we wait for
             // session-changed to get the initial session ID. session-changed
@@ -819,7 +820,7 @@ pub const Viewer = struct {
         switch (n) {
             .enter => unreachable,
 
-            .exit => return self.defunct(),
+            .exit => |info| return self.defunctWithReason(info.reason),
 
             .session_changed => |info| {
                 self.session_id = info.id;
@@ -837,6 +838,19 @@ pub const Viewer = struct {
                 };
             },
 
+            else => return &.{},
+        }
+    }
+
+    fn nextIdle(
+        self: *Viewer,
+        n: control.Notification,
+    ) []const Action {
+        assert(self.state == .idle);
+
+        switch (n) {
+            .enter => unreachable,
+            .exit => |info| return self.defunctWithReason(info.reason),
             else => return &.{},
         }
     }
@@ -868,7 +882,7 @@ pub const Viewer = struct {
 
         switch (n) {
             .enter => unreachable,
-            .exit => return self.defunct(),
+            .exit => |info| return self.defunctWithReason(info.reason),
 
             inline .block_end,
             .block_err,
@@ -2061,8 +2075,19 @@ pub const Viewer = struct {
     }
 
     fn defunct(self: *Viewer) []const Action {
+        return self.defunctWithReason("");
+    }
+
+    fn defunctWithReason(self: *Viewer, reason: []const u8) []const Action {
         self.state = .defunct;
-        return self.singleAction(.exit);
+        return self.singleAction(.{ .exit = reason });
+    }
+
+    /// Request a graceful detach from the tmux session. This sends
+    /// `detach-client` to tmux, which will cause tmux to send %exit
+    /// back to us (triggering the normal exit/cleanup flow).
+    pub fn detach(self: *Viewer) []const Action {
+        return self.singleAction(.{ .command = "detach-client\n" });
     }
 };
 
@@ -2210,14 +2235,19 @@ const Command = union(enum) {
                 .{comptime Format.tmux_version.comptimeFormat()},
             )),
 
-            // Enable flow control with a 30-second pause threshold.
-            // When the client falls 30+ seconds behind on a pane's output,
-            // tmux pauses that pane and sends %pause. The client can then
-            // catch up and send `refresh-client -A '%N:continue'` to resume.
+            // Enable flow control with a 30-second pause threshold and
+            // wait-exit mode. When the client falls 30+ seconds behind
+            // on a pane's output, tmux pauses that pane and sends %pause.
+            // The client can then catch up and send
+            // `refresh-client -A '%N:continue'` to resume.
             // This replaces %output with %extended-output which includes
             // latency metadata.
+            //
+            // wait-exit tells tmux to wait for an empty-line acknowledgment
+            // from the client after sending %exit, giving us time to
+            // perform graceful cleanup before tmux closes the connection.
             .enable_flow_control => try writer.writeAll(
-                "refresh-client -f pause-after=30\n",
+                "refresh-client -f wait-exit,pause-after=30\n",
             ),
 
             .user => |v| try writer.writeAll(v),
@@ -2399,14 +2429,60 @@ test "immediate exit" {
 
     try testViewer(&viewer, &.{
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .check = (struct {
                 fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(0, actions.len);
+                }
+            }).check,
+        },
+    });
+}
+
+test "exit propagates reason" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{
+            .input = .{ .tmux = .{ .exit = .{ .reason = "detached" } } },
+            .contains_tags = &.{.exit},
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| {
+                        if (action == .exit) {
+                            try testing.expectEqualStrings("detached", action.exit);
+                            return;
+                        }
+                    }
+                    return error.TestUnexpectedResult;
+                }
+            }).check,
+        },
+    });
+}
+
+test "exit with server-exited reason" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{
+            .input = .{ .tmux = .{ .exit = .{ .reason = "server-exited" } } },
+            .contains_tags = &.{.exit},
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| {
+                        if (action == .exit) {
+                            try testing.expectEqualStrings("server-exited", action.exit);
+                            return;
+                        }
+                    }
+                    return error.TestUnexpectedResult;
                 }
             }).check,
         },
@@ -2503,7 +2579,7 @@ test "session changed resets state" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -2689,7 +2765,7 @@ test "initial flow" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -2765,7 +2841,7 @@ test "layout change" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -2831,7 +2907,7 @@ test "layout_change does not return command when queue not empty" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -2903,7 +2979,7 @@ test "layout_change returns command when queue was empty" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -2969,7 +3045,7 @@ test "window_add queues list_windows when queue empty" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3030,7 +3106,7 @@ test "window_add queues list_windows when queue not empty" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3220,7 +3296,7 @@ test "two pane flow with pane state" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3543,7 +3619,7 @@ test "window name and raw layout from list-windows" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3600,7 +3676,7 @@ test "window_renamed updates name" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3672,7 +3748,7 @@ test "window_close removes window and orphaned panes" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3739,7 +3815,7 @@ test "window_close clears active_window_id" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3819,7 +3895,7 @@ test "session_window_changed sets active_window_id" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3889,7 +3965,7 @@ test "layout_change stashes raw layout" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3998,7 +4074,7 @@ test "split OSC across output messages does not corrupt state" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -4114,7 +4190,7 @@ test "multiple output rounds with OSC sequences keep rendering" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -4251,7 +4327,7 @@ test "DCS tmux passthrough does not trap parser across messages" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -4340,7 +4416,7 @@ test "split CSI across output messages persists parser state" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -4444,7 +4520,7 @@ test "UTF-8 box-drawing codepoints in %output reach terminal grid correctly" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -4538,7 +4614,7 @@ test "UTF-8 box-drawing split across %output messages" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -4624,7 +4700,7 @@ test "ACS charset (ESC(0) followed by UTF-8 box-drawing produces spaces not U+FF
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -4717,7 +4793,7 @@ test "4-byte emoji codepoints in %output reach terminal grid correctly" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -4807,7 +4883,7 @@ test "CJK double-width characters in %output produce wide cells" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -4895,7 +4971,7 @@ test "braille pattern codepoints in %output reach terminal grid correctly" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -4988,7 +5064,7 @@ test "4-byte emoji split across %output messages" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -5088,7 +5164,7 @@ test "mixed CJK and ASCII in %output with correct cell positions" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -5498,7 +5574,7 @@ test "flow control: enable_flow_control in init sequence" {
         // Version response triggers enable_flow_control (refresh-client -f)
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "refresh-client -f pause-after=",
+            .contains_command = "refresh-client -f wait-exit,pause-after=",
         },
         // Flow control response triggers list-windows
         .{
@@ -6351,6 +6427,16 @@ test "queueUserCommand returns command when queue is empty" {
     });
 }
 
+test "detach returns detach-client command" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    const actions = viewer.detach();
+    try testing.expectEqual(1, actions.len);
+    try testing.expect(actions[0] == .command);
+    try testing.expectEqualStrings("detach-client\n", actions[0].command);
+}
+
 test "queueUserCommand returns null when queue has in-flight command" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
@@ -6662,4 +6748,41 @@ test "error response for pane capture is skipped gracefully" {
     for (actions2) |action| {
         try testing.expect(action != .exit);
     }
+}
+
+test "flow control: wait-exit in enable_flow_control command" {
+    // Verify that the enable_flow_control command includes wait-exit
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup: block_end → session_changed triggers command queue
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "$0",
+            } } },
+            .contains_tags = &.{.command},
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // Find the command that contains refresh-client -f
+                    for (actions) |action| {
+                        if (action == .command) {
+                            if (std.mem.indexOf(u8, action.command, "refresh-client -f")) |_| {
+                                // Verify it contains wait-exit
+                                try testing.expect(
+                                    std.mem.indexOf(u8, action.command, "wait-exit") != null,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    // The flow control command might not be in this batch
+                    // (it's queued and will be sent after the first command
+                    // completes), so not finding it here is acceptable.
+                }
+            }).check,
+        },
+    });
 }

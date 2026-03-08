@@ -2442,6 +2442,22 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Request a graceful detach from the tmux session. Sends
+    /// `detach-client` to tmux, which will cause tmux to send
+    /// %exit back to the client (triggering normal cleanup).
+    /// Safe to call from any thread.
+    export fn ghostty_surface_tmux_detach(surface: *Surface) void {
+        const io = &surface.core_surface.io;
+        const msg = termio.Message.writeReqDirect(
+            io.alloc,
+            @as([]const u8, "detach-client\n"),
+        ) catch |err| {
+            log.warn("failed to create tmux detach message err={}", .{err});
+            return;
+        };
+        io.queueMessage(msg, .unlocked);
+    }
+
     /// Debug: Get terminal state for debugging scrollback issues
     export fn ghostty_surface_debug_terminal_state(surface: *Surface) Darwin.TerminalDebugState {
         surface.core_surface.renderer_state.mutex.lock();

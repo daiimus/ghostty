@@ -394,7 +394,23 @@ pub const StreamHandler = struct {
                         break :tmux;
                     },
 
-                    .exit => {
+                    .exit => |exit_info| {
+                        // Extract the exit reason before any cleanup.
+                        // The reason string references the control parser's
+                        // buffer which will be invalidated during cleanup.
+                        const reason = exit_info.reason;
+                        log.info("tmux control mode %exit received, reason=\"{s}\"", .{reason});
+
+                        // Acknowledge the %exit to tmux. With wait-exit
+                        // enabled, tmux holds the connection open until it
+                        // receives an empty line from the client. We send
+                        // this BEFORE teardown so tmux knows we received
+                        // the %exit and can proceed with its own cleanup.
+                        self.messageWriter(try termio.Message.writeReqDirect(
+                            self.alloc,
+                            @as([]const u8, "\n"),
+                        ));
+
                         // Reset the renderer terminal pointer back to the main
                         // terminal BEFORE freeing the viewer. The renderer may
                         // currently be pointing at a pane terminal inside the
@@ -425,11 +441,14 @@ pub const StreamHandler = struct {
                         }
 
                         // Notify the surface that tmux control mode
-                        // has exited. The viewer's action-based exit
-                        // path (from viewer.next()) also sends this,
-                        // but we bypass viewer.next() entirely here
-                        // since we're handling the raw DCS %exit event.
-                        self.surfaceMessageWriter(.tmux_exit);
+                        // has exited, including the exit reason. The
+                        // viewer's action-based exit path (from
+                        // viewer.next()) also sends this, but we bypass
+                        // viewer.next() entirely here since we're
+                        // handling the raw DCS %exit event.
+                        self.surfaceMessageWriter(.{
+                            .tmux_exit = apprt.surface.Message.TmuxExitReason.init(reason),
+                        });
 
                         // And always break since we assert below
                         // that we're not handling an exit command.
@@ -456,9 +475,13 @@ pub const StreamHandler = struct {
                 for (viewer.next(.{ .tmux = tmux })) |action| {
                     log.info("tmux viewer action={f}", .{action});
                     switch (action) {
-                        .exit => {
-                            // Notify the surface that tmux control mode has exited
-                            self.surfaceMessageWriter(.tmux_exit);
+                        .exit => |reason| {
+                            // Notify the surface that tmux control mode has exited.
+                            // This path is for viewer-internal exits (e.g., OOM
+                            // causing defunct()), not for %exit from tmux.
+                            self.surfaceMessageWriter(.{
+                                .tmux_exit = apprt.surface.Message.TmuxExitReason.init(reason),
+                            });
                         },
 
                         .command => |command| {

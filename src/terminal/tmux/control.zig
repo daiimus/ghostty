@@ -137,7 +137,7 @@ pub const Parser = struct {
             // Return an exit notification.
             .idle => if (byte != '%') {
                 self.broken();
-                return .{ .exit = {} };
+                return .{ .exit = .{ .reason = "" } };
             } else {
                 self.buffer.clearRetainingCapacity();
                 self.state = .notification;
@@ -881,11 +881,16 @@ pub const Parser = struct {
             return .{ .unlinked_window_renamed = .{ .id = id, .name = name } };
         } else if (std.mem.eql(u8, cmd, "%exit")) {
             // tmux sends %exit when the control mode client is exiting.
-            // Return the exit notification so the viewer and stream handler
-            // can perform proper cleanup.
-            self.buffer.clearRetainingCapacity();
+            // The optional reason string follows the command (e.g.,
+            // "%exit detached", "%exit server-exited").
+            const reason = if (cmd.len < line.len)
+                std.mem.trimLeft(u8, line[cmd.len..], " ")
+            else
+                "";
+
+            // Important: do not clear buffer here since reason points to it
             self.state = .idle;
-            return .{ .exit = {} };
+            return .{ .exit = .{ .reason = reason } };
         } else {
             // Unknown notification, log it and return to idle state.
             log.warn("unknown tmux control mode notification={s}", .{cmd});
@@ -916,12 +921,12 @@ pub const Notification = union(enum) {
 
     /// Exit.
     ///
-    /// NOTE: The tmux protocol contains a "reason" string (human friendly)
-    /// associated with this. We currently drop it because we don't need it
-    /// but this may be something we want to add later. If we do add it,
-    /// we have to consider buffer limits and how we handle those (dropping
-    /// vs truncating, etc.).
-    exit,
+    /// The reason field contains the human-readable reason string from
+    /// tmux (e.g., "detached", "server-exited"), or an empty string if
+    /// no reason was provided.
+    exit: struct {
+        reason: []const u8,
+    },
 
     /// Dispatched at the end of a begin/end block with the raw data.
     /// The control mode parser can't parse the data because it is unaware
@@ -1767,4 +1772,40 @@ test "tmux block_id mismatch on error still returns notification" {
     try testing.expect(n == .block_err);
     try testing.expectEqualStrings("bad command", n.block_err);
     try testing.expect(c.blockId() == null);
+}
+
+test "tmux exit without reason" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%exit") |byte| try testing.expect(try c.put(byte) == null);
+    const n2 = (try c.put('\n')).?;
+    try testing.expect(n2 == .exit);
+    try testing.expectEqualStrings("", n2.exit.reason);
+}
+
+test "tmux exit with reason" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%exit detached") |byte| try testing.expect(try c.put(byte) == null);
+    const n2 = (try c.put('\n')).?;
+    try testing.expect(n2 == .exit);
+    try testing.expectEqualStrings("detached", n2.exit.reason);
+}
+
+test "tmux exit with server-exited reason" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%exit server-exited") |byte| try testing.expect(try c.put(byte) == null);
+    const n2 = (try c.put('\n')).?;
+    try testing.expect(n2 == .exit);
+    try testing.expectEqualStrings("server-exited", n2.exit.reason);
 }
