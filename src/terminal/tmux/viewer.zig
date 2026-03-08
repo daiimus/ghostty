@@ -214,6 +214,13 @@ pub const Viewer = struct {
     /// tab should be highlighted. Null until the first notification.
     active_window_id: ?usize,
 
+    /// Count of fire-and-forget commands (e.g., send-keys, flow control
+    /// continue) whose %begin/%end responses have not yet arrived. When
+    /// a block response arrives with an empty command queue, this counter
+    /// is decremented to absorb the expected response instead of logging
+    /// "unexpected block output."
+    pending_fire_and_forget: usize,
+
     /// Observer surfaces whose renderer_state.terminal pointers must be
     /// kept in sync when the pane map is rebuilt. Each observer is bound
     /// to a specific pane_id and holds a pointer-to-pointer that the
@@ -481,6 +488,7 @@ pub const Viewer = struct {
             .initial_ready_sent = false,
             .active_pane_id = null,
             .active_window_id = null,
+            .pending_fire_and_forget = 0,
             .observers = .empty,
         };
     }
@@ -620,6 +628,13 @@ pub const Viewer = struct {
             return .{ .command = builder.writer.buffered() };
         }
         return null;
+    }
+
+    /// Increment the fire-and-forget counter. Call this after dispatching
+    /// a fire-and-forget action (send_keys, flow control continue) that
+    /// will produce a %begin/%end response outside the command queue.
+    pub fn trackFireAndForget(self: *Viewer) void {
+        self.pending_fire_and_forget +|= 1;
     }
 
     /// Register an observer for a specific pane. The observer's
@@ -826,19 +841,6 @@ pub const Viewer = struct {
         }
     }
 
-    fn nextIdle(
-        self: *Viewer,
-        n: control.Notification,
-    ) []const Action {
-        assert(self.state == .idle);
-
-        switch (n) {
-            .enter => unreachable,
-            .exit => return self.defunct(),
-            else => return &.{},
-        }
-    }
-
     fn nextCommand(
         self: *Viewer,
         n: control.Notification,
@@ -1030,6 +1032,7 @@ pub const Viewer = struct {
                     };
                     actions.append(arena_alloc, .{ .send_keys = continue_cmd }) catch
                         return self.defunct();
+                    self.trackFireAndForget();
                 } else {
                     log.warn("received %pause for unknown pane {}", .{info.pane_id});
                 }
@@ -1422,8 +1425,17 @@ pub const Viewer = struct {
                 v,
             ),
         } else {
-            // If we have no pending commands, this is unexpected.
-            log.debug("unexpected block output err={}", .{is_err});
+            // No pending commands in the queue. Check if this response
+            // belongs to a fire-and-forget action (send-keys, flow control
+            // continue) that was dispatched outside the command queue.
+            if (self.pending_fire_and_forget > 0) {
+                self.pending_fire_and_forget -= 1;
+                log.debug("consumed fire-and-forget response (remaining={})", .{self.pending_fire_and_forget});
+                return;
+            }
+            // Truly unexpected output — nothing in queue and no pending
+            // fire-and-forget actions.
+            log.warn("unexpected block output err={} with empty queue and no pending fire-and-forget", .{is_err});
             return;
         };
         self.command_queue.deleteOldest(1);
@@ -1435,7 +1447,25 @@ pub const Viewer = struct {
         defer self.action_arena = arena.state;
         const arena_alloc = arena.allocator();
 
-        // Process our command
+        // Process our command. If the response is an error, log it and
+        // skip processing for commands where error content is meaningless
+        // (pane captures). For other commands, let the handler deal with
+        // potentially empty/malformed content — they already have error
+        // paths that handle parse failures gracefully.
+        if (is_err) {
+            log.warn("tmux command error for {s}: {s}", .{
+                @tagName(command),
+                if (content.len > 0) content[0..@min(content.len, 200)] else "(empty)",
+            });
+            switch (command) {
+                // Pane capture errors are expected when a pane is destroyed
+                // between queueing the command and receiving the response.
+                // Silently skip — the pane will be cleaned up by layout sync.
+                .pane_history, .pane_visible => return,
+                else => {},
+            }
+        }
+
         switch (command) {
             .user => {
                 try actions.append(
@@ -6518,4 +6548,118 @@ test "command_response with is_error on block_err" {
             .contains_tags = &.{.exit},
         },
     });
+}
+
+test "fire-and-forget counter tracks send-keys responses" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Boot through startup to command_queue state.
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7e2,83x44,0,0,5
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Consume pane capture responses (4 captures + 1 pane_state)
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;43;8,16,24,32,40,48,56,64,72,80
+                ,
+            } },
+            .contains_tags = &.{.ready},
+        },
+    });
+
+    // Counter should start at 0.
+    try testing.expectEqual(0, viewer.pending_fire_and_forget);
+
+    // Simulate two fire-and-forget actions being dispatched.
+    viewer.trackFireAndForget();
+    viewer.trackFireAndForget();
+    try testing.expectEqual(2, viewer.pending_fire_and_forget);
+
+    // Now feed two block_end responses with empty queue. These should
+    // be consumed by the fire-and-forget counter instead of being
+    // treated as unexpected output.
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+    try testing.expectEqual(1, viewer.pending_fire_and_forget);
+
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+    try testing.expectEqual(0, viewer.pending_fire_and_forget);
+}
+
+test "error response for pane capture is skipped gracefully" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Boot to command_queue state with one pane.
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7e2,83x44,0,0,5
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+    });
+
+    // The command queue now has pane capture commands. Feed error
+    // responses — they should be handled gracefully without going defunct.
+    // (pane_history error)
+    const actions1 = viewer.next(.{ .tmux = .{ .block_err = "pane not found" } });
+    // Should not go defunct.
+    try testing.expect(viewer.state != .defunct);
+    // No exit action should be emitted.
+    for (actions1) |action| {
+        try testing.expect(action != .exit);
+    }
+
+    // (pane_visible error)
+    const actions2 = viewer.next(.{ .tmux = .{ .block_err = "pane not found" } });
+    try testing.expect(viewer.state != .defunct);
+    for (actions2) |action| {
+        try testing.expect(action != .exit);
+    }
 }
