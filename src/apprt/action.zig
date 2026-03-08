@@ -355,6 +355,9 @@ pub const Action = union(Key) {
     /// tmux control mode: display-message notification
     tmux_message: TmuxMessage,
 
+    /// tmux control mode: active window changed
+    tmux_active_window_changed: TmuxActiveWindowChanged,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -426,6 +429,7 @@ pub const Action = union(Key) {
         tmux_ready,
         tmux_command_response,
         tmux_message,
+        tmux_active_window_changed,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -750,6 +754,22 @@ pub const TmuxExit = struct {
         var c: C = .{ .reason = .{0} ** 15, .reason_len = len };
         @memcpy(c.reason[0..len], self.reason[0..len]);
         return c;
+    }
+};
+
+/// tmux control mode active window changed notification
+pub const TmuxActiveWindowChanged = struct {
+    window_id: usize,
+
+    // Sync with: ghostty_action_tmux_active_window_changed_s
+    pub const C = extern struct {
+        window_id: u32,
+    };
+
+    pub fn cval(self: TmuxActiveWindowChanged) C {
+        return .{
+            .window_id = @intCast(self.window_id),
+        };
     }
 };
 

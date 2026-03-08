@@ -1300,6 +1300,17 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
             tmux_msg.deinit();
         },
+
+        .tmux_active_window_changed => |window_id| {
+            log.info("tmux active window changed to @{}", .{window_id});
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_active_window_changed,
+                .{ .window_id = window_id },
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux active window change err={}", .{err});
+            };
+        },
     }
 }
 

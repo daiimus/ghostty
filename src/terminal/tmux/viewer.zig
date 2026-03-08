@@ -341,6 +341,11 @@ pub const Viewer = struct {
         /// is valid until the next call to `next()`.
         command_response: CommandResponse,
 
+        /// The active window in our session changed. The apprt should
+        /// update its tab/window highlight to reflect the new active
+        /// window. The payload is the new window ID.
+        active_window_changed: usize,
+
         /// Send a `send-keys` command directly to tmux stdin for user
         /// input routing. Unlike `command`, this is fire-and-forget and
         /// must NOT go through the command queue (which would serialize
@@ -987,6 +992,13 @@ pub const Viewer = struct {
             .session_window_changed => |info| {
                 if (info.session_id == self.session_id) {
                     self.active_window_id = info.window_id;
+
+                    var arena = self.action_arena.promote(self.alloc);
+                    defer self.action_arena = arena.state;
+                    actions.append(arena.allocator(), .{ .active_window_changed = info.window_id }) catch {
+                        log.warn("failed to emit active window changed action, becoming defunct", .{});
+                        return self.defunct();
+                    };
                 }
             },
 
