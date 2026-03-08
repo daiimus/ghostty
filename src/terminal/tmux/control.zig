@@ -478,6 +478,110 @@ pub const Parser = struct {
             // Important: do not clear buffer here since client/name point to it
             self.state = .idle;
             return .{ .client_session_changed = .{ .client = client, .session_id = session_id, .name = name } };
+        } else if (std.mem.eql(u8, cmd, "%pause")) cmd: {
+            // Flow control: %pause %{pane_id}
+            var re = oni.Regex.init(
+                "^%pause %([0-9]+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .pause = .{ .pane_id = id } };
+        } else if (std.mem.eql(u8, cmd, "%continue")) cmd: {
+            // Flow control: %continue %{pane_id}
+            var re = oni.Regex.init(
+                "^%continue %([0-9]+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .continue_pane = .{ .pane_id = id } };
+        } else if (std.mem.eql(u8, cmd, "%extended-output")) cmd: {
+            // Flow control: %extended-output %{pane_id} {age_ms} : {data}
+            // The ` : ` separator separates metadata from the actual output data.
+            var re = oni.Regex.init(
+                "^%extended-output %([0-9]+) ([0-9]+) : (.+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+
+            const age_ms = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[2])..@intCast(ends[2])],
+                10,
+            ) catch unreachable;
+
+            // Unescape octal sequences in the data, same as %output.
+            const raw = @constCast(line[@intCast(starts[3])..@intCast(ends[3])]);
+            const data = unescapeOctal(raw);
+
+            // Important: do not clear buffer here since data points to it
+            self.state = .idle;
+            return .{ .extended_output = .{ .pane_id = id, .age_ms = age_ms, .data = data } };
         } else if (std.mem.eql(u8, cmd, "%window-close")) cmd: {
             var re = oni.Regex.init(
                 "^%window-close @([0-9]+)$",
@@ -657,6 +761,26 @@ pub const Notification = union(enum) {
         client: []const u8,
         session_id: usize,
         name: []const u8,
+    },
+
+    /// Flow control: a pane has been paused because the client fell behind.
+    /// Sent when flow control is enabled via `refresh-client -f pause-after=N`.
+    pause: struct {
+        pane_id: usize,
+    },
+
+    /// Flow control: a previously paused pane has been continued.
+    continue_pane: struct {
+        pane_id: usize,
+    },
+
+    /// Flow control: extended output from a pane. Replaces `%output` when
+    /// flow control is enabled. Includes the number of milliseconds by which
+    /// the pane output is behind.
+    extended_output: struct {
+        pane_id: usize,
+        age_ms: usize,
+        data: []const u8,
     },
 
     pub fn format(self: Notification, writer: *std.Io.Writer) !void {
@@ -1145,4 +1269,71 @@ test "tmux session-window-changed" {
     try testing.expect(n == .session_window_changed);
     try testing.expectEqual(3, n.session_window_changed.session_id);
     try testing.expectEqual(5, n.session_window_changed.window_id);
+}
+
+test "tmux pause" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%pause %7") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .pause);
+    try testing.expectEqual(7, n.pause.pane_id);
+}
+
+test "tmux continue" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%continue %12") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .continue_pane);
+    try testing.expectEqual(12, n.continue_pane.pane_id);
+}
+
+test "tmux extended-output" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%extended-output %3 500 : hello world") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .extended_output);
+    try testing.expectEqual(3, n.extended_output.pane_id);
+    try testing.expectEqual(500, n.extended_output.age_ms);
+    try testing.expectEqualStrings("hello world", n.extended_output.data);
+}
+
+test "tmux extended-output with octal escapes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    // \033[31m = ESC [ 3 1 m (red SGR)
+    for ("%extended-output %5 1200 : \\033[31mred") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .extended_output);
+    try testing.expectEqual(5, n.extended_output.pane_id);
+    try testing.expectEqual(1200, n.extended_output.age_ms);
+    try testing.expectEqualStrings("\x1b[31mred", n.extended_output.data);
+}
+
+test "tmux extended-output zero age" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%extended-output %0 0 : $") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .extended_output);
+    try testing.expectEqual(0, n.extended_output.pane_id);
+    try testing.expectEqual(0, n.extended_output.age_ms);
+    try testing.expectEqualStrings("$", n.extended_output.data);
 }
