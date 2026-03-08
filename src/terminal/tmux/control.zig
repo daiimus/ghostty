@@ -661,7 +661,10 @@ pub const Parser = struct {
                 null,
             ) catch |err| {
                 log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
+                // Fall through to the unknown-notification cleanup path
+                // rather than returning an error, which would leave the
+                // parser stuck in .notification state.
+                break :cmd;
             };
             defer re.deinit();
 
