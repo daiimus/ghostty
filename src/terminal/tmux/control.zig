@@ -180,7 +180,7 @@ pub const Parser = struct {
                     // Format: "%end <id>" or "%error <id>" where <id> should match
                     // the <id> from the "%begin <id>" that opened this block.
                     const tag = if (err) "%error" else "%end";
-                    const end_id = std.mem.trimLeft(u8, line[tag.len..], " ");
+                    const end_id = std.mem.trim(u8, line[tag.len..], " \r\n\t");
                     if (self.blockId()) |begin_id| {
                         if (!std.mem.eql(u8, begin_id, end_id)) {
                             log.warn(
@@ -234,7 +234,7 @@ pub const Parser = struct {
             // The format is: %begin <timestamp> <command_number> <flags>
             const id_start = "%begin".len;
             const id = if (id_start < line.len)
-                std.mem.trimLeft(u8, line[id_start..], " ")
+                std.mem.trim(u8, line[id_start..], " \r\n\t")
             else
                 "";
             if (id.len > 0 and id.len <= self.block_id_buf.len) {

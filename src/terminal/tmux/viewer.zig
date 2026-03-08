@@ -280,7 +280,7 @@ pub const Viewer = struct {
             // Check for an optional suffix letter.
             var suffix: u8 = 0;
             if (digit_end < after_dot.len) {
-                if (std.ascii.isAlphabetic(after_dot[digit_end])) {
+                if (std.ascii.isLower(after_dot[digit_end])) {
                     suffix = after_dot[digit_end];
                     // Must be the last character (reject "3.5ab").
                     if (digit_end + 1 != after_dot.len) return null;
@@ -842,19 +842,6 @@ pub const Viewer = struct {
         }
     }
 
-    fn nextIdle(
-        self: *Viewer,
-        n: control.Notification,
-    ) []const Action {
-        assert(self.state == .idle);
-
-        switch (n) {
-            .enter => unreachable,
-            .exit => |info| return self.defunctWithReason(info.reason),
-            else => return &.{},
-        }
-    }
-
     fn nextCommand(
         self: *Viewer,
         n: control.Notification,
@@ -1101,6 +1088,7 @@ pub const Viewer = struct {
             while (self.command_queue.first()) |queued| {
                 if (!queued.meetsVersionRequirement(self.parsed_version)) {
                     log.info("skipping command {s}: requires newer tmux", .{@tagName(queued.*)});
+                    queued.deinit(self.alloc);
                     self.command_queue.deleteOldest(1);
                     continue;
                 }
@@ -5607,7 +5595,7 @@ test "TmuxVersion: parse next- prefix" {
     try testing.expectEqual(@as(u8, 0), v.suffix);
 }
 
-test "TmuxVersion: parse single digit version" {
+test "TmuxVersion: parse older version without suffix" {
     const v = Viewer.TmuxVersion.parse("2.9").?;
     try testing.expectEqual(@as(u16, 2), v.major);
     try testing.expectEqual(@as(u16, 9), v.minor);
