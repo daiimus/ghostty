@@ -668,6 +668,33 @@ pub const StreamHandler = struct {
                                 },
                             });
                         },
+
+                        .subscription_changed => |info| {
+                            var msg = apprt.surface.Message{
+                                .tmux_subscription_changed = undefined,
+                            };
+                            const name_len = @min(
+                                info.name.len,
+                                msg.tmux_subscription_changed.name.len,
+                            );
+                            @memcpy(
+                                msg.tmux_subscription_changed.name[0..name_len],
+                                info.name[0..name_len],
+                            );
+                            msg.tmux_subscription_changed.name[name_len] = 0;
+
+                            const value_len = @min(
+                                info.value.len,
+                                msg.tmux_subscription_changed.value.len,
+                            );
+                            @memcpy(
+                                msg.tmux_subscription_changed.value[0..value_len],
+                                info.value[0..value_len],
+                            );
+                            msg.tmux_subscription_changed.value[value_len] = 0;
+
+                            self.surfaceMessageWriter(msg);
+                        },
                     }
                 }
             },
