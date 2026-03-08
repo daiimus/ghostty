@@ -647,6 +647,163 @@ pub const Parser = struct {
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .session_window_changed = .{ .session_id = session_id, .window_id = window_id } };
+        } else if (std.mem.eql(u8, cmd, "%pane-mode-changed")) cmd: {
+            // %pane-mode-changed %<pane_id>
+            var re = oni.Regex.init(
+                "^%pane-mode-changed %([0-9]+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const pane_id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .pane_mode_changed = .{ .pane_id = pane_id } };
+        } else if (std.mem.eql(u8, cmd, "%session-renamed")) cmd: {
+            // %session-renamed $<session_id> <name>
+            var re = oni.Regex.init(
+                "^%session-renamed \\$([0-9]+) (.+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+            const name = line[@intCast(starts[2])..@intCast(ends[2])];
+
+            // Do not clear buffer — name points into it.
+            self.state = .idle;
+            return .{ .session_renamed = .{ .id = id, .name = name } };
+        } else if (std.mem.eql(u8, cmd, "%unlinked-window-add")) cmd: {
+            // %unlinked-window-add @<window_id>
+            var re = oni.Regex.init(
+                "^%unlinked-window-add @([0-9]+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .unlinked_window_add = .{ .id = id } };
+        } else if (std.mem.eql(u8, cmd, "%unlinked-window-close")) cmd: {
+            // %unlinked-window-close @<window_id>
+            var re = oni.Regex.init(
+                "^%unlinked-window-close @([0-9]+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .unlinked_window_close = .{ .id = id } };
+        } else if (std.mem.eql(u8, cmd, "%unlinked-window-renamed")) cmd: {
+            // %unlinked-window-renamed @<window_id> <name>
+            var re = oni.Regex.init(
+                "^%unlinked-window-renamed @([0-9]+) (.+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+            const name = line[@intCast(starts[2])..@intCast(ends[2])];
+
+            // Do not clear buffer — name points into it.
+            self.state = .idle;
+            return .{ .unlinked_window_renamed = .{ .id = id, .name = name } };
         } else if (std.mem.eql(u8, cmd, "%exit")) {
             // tmux sends %exit when the control mode client is exiting.
             // Return the exit notification so the viewer and stream handler
@@ -781,6 +938,33 @@ pub const Notification = union(enum) {
         pane_id: usize,
         age_ms: usize,
         data: []const u8,
+    },
+
+    /// A pane entered or exited a special mode (copy mode, choose mode, etc.).
+    pane_mode_changed: struct {
+        pane_id: usize,
+    },
+
+    /// A session was renamed (by any client).
+    session_renamed: struct {
+        id: usize,
+        name: []const u8,
+    },
+
+    /// A window was added in a session other than the attached one.
+    unlinked_window_add: struct {
+        id: usize,
+    },
+
+    /// A window was closed in a session other than the attached one.
+    unlinked_window_close: struct {
+        id: usize,
+    },
+
+    /// A window was renamed in a session other than the attached one.
+    unlinked_window_renamed: struct {
+        id: usize,
+        name: []const u8,
     },
 
     pub fn format(self: Notification, writer: *std.Io.Writer) !void {
@@ -1336,4 +1520,66 @@ test "tmux extended-output zero age" {
     try testing.expectEqual(0, n.extended_output.pane_id);
     try testing.expectEqual(0, n.extended_output.age_ms);
     try testing.expectEqualStrings("$", n.extended_output.data);
+}
+
+test "tmux pane-mode-changed" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%pane-mode-changed %7") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .pane_mode_changed);
+    try testing.expectEqual(7, n.pane_mode_changed.pane_id);
+}
+
+test "tmux session-renamed" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%session-renamed $3 my new name") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .session_renamed);
+    try testing.expectEqual(3, n.session_renamed.id);
+    try testing.expectEqualStrings("my new name", n.session_renamed.name);
+}
+
+test "tmux unlinked-window-add" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%unlinked-window-add @5") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .unlinked_window_add);
+    try testing.expectEqual(5, n.unlinked_window_add.id);
+}
+
+test "tmux unlinked-window-close" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%unlinked-window-close @12") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .unlinked_window_close);
+    try testing.expectEqual(12, n.unlinked_window_close.id);
+}
+
+test "tmux unlinked-window-renamed" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%unlinked-window-renamed @8 vim main.zig") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .unlinked_window_renamed);
+    try testing.expectEqual(8, n.unlinked_window_renamed.id);
+    try testing.expectEqualStrings("vim main.zig", n.unlinked_window_renamed.name);
 }
