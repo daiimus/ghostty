@@ -346,6 +346,11 @@ pub const Viewer = struct {
         vt_parser: Parser = .init(),
         vt_utf8decoder: UTF8Decoder = .{},
 
+        /// Flow control: true when tmux has paused output for this pane
+        /// because the client fell behind. Output resumes when the client
+        /// sends `refresh-client -A '%N:continue'`.
+        paused: bool = false,
+
         pub fn deinit(self: *Pane, alloc: Allocator) void {
             self.vt_parser.deinit();
             self.terminal.deinit(alloc);
@@ -671,7 +676,7 @@ pub const Viewer = struct {
 
                 return self.enterCommandQueue(
                     arena.allocator(),
-                    &.{ .tmux_version, .list_windows },
+                    &.{ .tmux_version, .enable_flow_control, .list_windows },
                 ) catch {
                     log.warn("failed to queue command, becoming defunct", .{});
                     return self.defunct();
@@ -843,6 +848,67 @@ pub const Viewer = struct {
             .client_detached,
             .client_session_changed,
             => {},
+
+            // Flow control: tmux paused output for a pane. Record the
+            // pause state. Since the viewer processes all queued output
+            // synchronously before reaching %pause, we have already
+            // consumed everything — immediately send continue to resume.
+            .pause => |info| {
+                if (self.panes.getEntry(info.pane_id)) |entry| {
+                    entry.value_ptr.paused = true;
+                    log.info("pane {} paused by tmux flow control, sending continue", .{info.pane_id});
+
+                    // Format: refresh-client -A '%N:continue'\n
+                    var arena = self.action_arena.promote(self.alloc);
+                    defer self.action_arena = arena.state;
+                    const arena_alloc = arena.allocator();
+
+                    const continue_cmd = std.fmt.allocPrint(
+                        arena_alloc,
+                        "refresh-client -A '%{d}:continue'\n",
+                        .{info.pane_id},
+                    ) catch {
+                        log.warn("failed to format continue command for pane {}", .{info.pane_id});
+                        return self.defunct();
+                    };
+                    actions.append(arena_alloc, .{ .send_keys = continue_cmd }) catch
+                        return self.defunct();
+                } else {
+                    log.warn("received %pause for unknown pane {}", .{info.pane_id});
+                }
+            },
+
+            // Flow control: tmux continued a previously paused pane.
+            .continue_pane => |info| {
+                if (self.panes.getEntry(info.pane_id)) |entry| {
+                    entry.value_ptr.paused = false;
+                    log.info("pane {} continued by tmux flow control", .{info.pane_id});
+                } else {
+                    log.warn("received %continue for unknown pane {}", .{info.pane_id});
+                }
+            },
+
+            // Flow control: extended output replaces %output when flow
+            // control is enabled. Process the data identically to %output;
+            // the age_ms metadata is logged but not yet used for adaptive
+            // throttling.
+            .extended_output => |out| {
+                if (out.age_ms > 5000) {
+                    log.warn(
+                        "pane {} output is {}ms behind",
+                        .{ out.pane_id, out.age_ms },
+                    );
+                }
+                self.receivedOutput(
+                    out.pane_id,
+                    out.data,
+                ) catch |err| {
+                    log.warn(
+                        "failed to process extended output for pane id={}: {}",
+                        .{ out.pane_id, err },
+                    );
+                };
+            },
         }
 
         // After processing commands, we add our next command to
@@ -1219,6 +1285,10 @@ pub const Viewer = struct {
             ),
 
             .tmux_version => try self.receivedTmuxVersion(content),
+
+            // Flow control enable response: nothing to parse. The server
+            // acknowledges the flag silently.
+            .enable_flow_control => {},
         }
     }
 
@@ -1799,6 +1869,11 @@ const Command = union(enum) {
     /// Get the tmux server version.
     tmux_version,
 
+    /// Enable flow control by setting the pause-after flag. When enabled,
+    /// tmux sends %extended-output instead of %output and will pause panes
+    /// that fall more than the specified number of seconds behind.
+    enable_flow_control,
+
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
@@ -1815,6 +1890,7 @@ const Command = union(enum) {
             .pane_visible,
             .pane_state,
             .tmux_version,
+            .enable_flow_control,
             => {},
             .user => |v| alloc.free(v),
         };
@@ -1872,6 +1948,16 @@ const Command = union(enum) {
                 "display-message -p '{s}'\n",
                 .{comptime Format.tmux_version.comptimeFormat()},
             )),
+
+            // Enable flow control with a 30-second pause threshold.
+            // When the client falls 30+ seconds behind on a pane's output,
+            // tmux pauses that pane and sends %pause. The client can then
+            // catch up and send `refresh-client -A '%N:continue'` to resume.
+            // This replaces %output with %extended-output which includes
+            // latency metadata.
+            .enable_flow_control => try writer.writeAll(
+                "refresh-client -f pause-after=30\n",
+            ),
 
             .user => |v| try writer.writeAll(v),
         }
@@ -2083,6 +2169,11 @@ test "session changed resets state" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         // Receive window layout with two panes (same format as "initial flow" test)
@@ -2175,15 +2266,20 @@ test "initial flow" {
                 }
             }).check,
         },
-        // Receive version response, which triggers list-windows
+        // Receive version response, which triggers enable_flow_control
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "list-windows",
+            .contains_command = "refresh-client",
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqualStrings("3.5a", v.tmux_version);
                 }
             }).check,
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
         },
         .{
             .input = .{ .tmux = .{
@@ -2355,6 +2451,11 @@ test "layout change" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
@@ -2426,6 +2527,11 @@ test "layout_change does not return command when queue not empty" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
@@ -2487,6 +2593,11 @@ test "layout_change returns command when queue was empty" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
@@ -2554,6 +2665,11 @@ test "window_add queues list_windows when queue empty" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
@@ -2615,6 +2731,11 @@ test "window_add queues list_windows when queue not empty" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         // Receive initial window layout with one pane
@@ -2677,6 +2798,11 @@ test "two pane flow with pane state" {
         // Receive version response, which triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         // list-windows output with 2 panes in a vertical split
@@ -3041,6 +3167,11 @@ test "pane terminal pointer invalidated after layout change" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         // One-pane layout
@@ -3126,6 +3257,11 @@ test "window name and raw layout from list-windows" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         // list-windows output with window name "vim"
@@ -3167,6 +3303,11 @@ test "window_renamed updates name" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -3219,6 +3360,11 @@ test "window_close removes window and orphaned panes" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         // Two windows: @0 with pane 0, @1 with pane 2
@@ -3286,6 +3432,11 @@ test "window_close clears active_window_id" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -3348,6 +3499,11 @@ test "session_window_changed sets active_window_id" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -3423,6 +3579,11 @@ test "layout_change stashes raw layout" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         // Initial layout
@@ -3493,6 +3654,11 @@ test "split OSC across output messages does not corrupt state" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -3597,6 +3763,11 @@ test "multiple output rounds with OSC sequences keep rendering" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -3712,6 +3883,11 @@ test "DCS tmux passthrough does not trap parser across messages" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -3840,6 +4016,11 @@ test "split CSI across output messages persists parser state" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         // Single pane layout (83x44, pane 0)
@@ -3929,6 +4110,11 @@ test "UTF-8 box-drawing codepoints in %output reach terminal grid correctly" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -4024,6 +4210,11 @@ test "UTF-8 box-drawing split across %output messages" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -4116,6 +4307,11 @@ test "ACS charset (ESC(0) followed by UTF-8 box-drawing produces spaces not U+FF
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -4198,6 +4394,11 @@ test "4-byte emoji codepoints in %output reach terminal grid correctly" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -4284,6 +4485,11 @@ test "CJK double-width characters in %output produce wide cells" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -4369,6 +4575,11 @@ test "braille pattern codepoints in %output reach terminal grid correctly" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -4449,6 +4660,11 @@ test "4-byte emoji split across %output messages" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -4543,6 +4759,11 @@ test "mixed CJK and ASCII in %output with correct cell positions" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        // Flow control response, triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
         },
         .{
@@ -4997,4 +5218,266 @@ test "resetAllObservers is safe with no observers" {
     // Should be a no-op without panicking.
     viewer.resetAllObservers(&fallback);
     try testing.expectEqual(@as(usize, 0), viewer.observers.items.len);
+}
+
+test "flow control: enable_flow_control in init sequence" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            // First command: tmux_version (display-message)
+            .contains_command = "display-message",
+        },
+        // Version response triggers enable_flow_control (refresh-client -f)
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client -f pause-after=",
+        },
+        // Flow control response triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+    });
+}
+
+test "flow control: pause sets pane paused and sends continue" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        // Single pane layout (pane 5, checksum b7e2 for "83x44,0,0,5")
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7e2,83x44,0,0,5
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture-pane + pane_state
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_tags = &.{.ready},
+        },
+        // Now send %pause for pane 5
+        .{
+            .input = .{ .tmux = .{ .pause = .{ .pane_id = 5 } } },
+            // Should emit a send_keys action with the continue command
+            .contains_send_keys = "refresh-client -A '%5:continue'",
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane = v.panes.getEntry(5).?.value_ptr;
+                    try testing.expect(pane.paused);
+                }
+            }).check,
+        },
+    });
+}
+
+test "flow control: continue clears pane paused state" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        // Single pane layout (pane 5, checksum b7e2 for "83x44,0,0,5")
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7e2,83x44,0,0,5
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture-pane + pane_state
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_tags = &.{.ready},
+        },
+        // Pause pane 5
+        .{
+            .input = .{ .tmux = .{ .pause = .{ .pane_id = 5 } } },
+            .contains_send_keys = "refresh-client -A '%5:continue'",
+        },
+        // Continue pane 5
+        .{
+            .input = .{ .tmux = .{ .continue_pane = .{ .pane_id = 5 } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane = v.panes.getEntry(5).?.value_ptr;
+                    try testing.expect(!pane.paused);
+                }
+            }).check,
+        },
+    });
+}
+
+test "flow control: extended output feeds terminal" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        // Single pane layout (pane 5, checksum b7e2 for "83x44,0,0,5")
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7e2,83x44,0,0,5
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture-pane + pane_state
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_tags = &.{.ready},
+        },
+        // Send extended output to pane 5
+        .{
+            .input = .{ .tmux = .{ .extended_output = .{
+                .pane_id = 5,
+                .age_ms = 100,
+                .data = "extended data",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // No actions should be emitted (output goes directly to terminal)
+                    try testing.expectEqual(0, actions.len);
+                    // Verify data reached the terminal
+                    const pane = v.panes.getEntry(5).?.value_ptr;
+                    const screen: *@import("../Screen.zig") = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    try testing.expect(std.mem.containsAtLeast(u8, str, 1, "extended data"));
+                }
+            }).check,
+        },
+    });
+}
+
+test "flow control: pause unknown pane is no-op" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        // Single pane layout (pane 0 only)
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_tags = &.{.ready},
+        },
+        // Pause for non-existent pane 999 — should not crash
+        .{
+            .input = .{ .tmux = .{ .pause = .{ .pane_id = 999 } } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // No send_keys should be emitted for unknown pane
+                    for (actions) |action| {
+                        if (action == .send_keys) {
+                            return error.UnexpectedSendKeys;
+                        }
+                    }
+                }
+            }).check,
+        },
+    });
 }
