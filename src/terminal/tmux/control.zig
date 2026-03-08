@@ -879,6 +879,40 @@ pub const Parser = struct {
             // Do not clear buffer — name points into it.
             self.state = .idle;
             return .{ .unlinked_window_renamed = .{ .id = id, .name = name } };
+        } else if (std.mem.eql(u8, cmd, "%paste-buffer-changed")) {
+            // %paste-buffer-changed <name>
+            // Sent when a paste buffer is created or changed.
+            const name = if (cmd.len < line.len)
+                std.mem.trimLeft(u8, line[cmd.len..], " ")
+            else
+                "";
+
+            // Do not clear buffer — name points into it.
+            self.state = .idle;
+            return .{ .paste_buffer_changed = name };
+        } else if (std.mem.eql(u8, cmd, "%paste-buffer-deleted")) {
+            // %paste-buffer-deleted <name>
+            // Sent when a paste buffer is deleted.
+            const name = if (cmd.len < line.len)
+                std.mem.trimLeft(u8, line[cmd.len..], " ")
+            else
+                "";
+
+            // Do not clear buffer — name points into it.
+            self.state = .idle;
+            return .{ .paste_buffer_deleted = name };
+        } else if (std.mem.eql(u8, cmd, "%config-error")) {
+            // %config-error <error>
+            // Sent when an error occurs in a configuration file.
+            // Added in tmux 3.4.
+            const text = if (cmd.len < line.len)
+                std.mem.trimLeft(u8, line[cmd.len..], " ")
+            else
+                "";
+
+            // Do not clear buffer — text points into it.
+            self.state = .idle;
+            return .{ .config_error = text };
         } else if (std.mem.eql(u8, cmd, "%message")) {
             // %message <text>
             // Sent when tmux generates a display-message. The payload is
@@ -1075,6 +1109,19 @@ pub const Notification = union(enum) {
     /// tmux internally (e.g., "no previous window"). The format is:
     ///   %message <text>
     message: []const u8,
+
+    /// A paste buffer was created or modified. The format is:
+    ///   %paste-buffer-changed <name>
+    paste_buffer_changed: []const u8,
+
+    /// A paste buffer was deleted. The format is:
+    ///   %paste-buffer-deleted <name>
+    paste_buffer_deleted: []const u8,
+
+    /// A configuration file error occurred. Added in tmux 3.4.
+    /// The format is:
+    ///   %config-error <error>
+    config_error: []const u8,
 
     pub fn format(self: Notification, writer: *std.Io.Writer) !void {
         const T = Notification;
