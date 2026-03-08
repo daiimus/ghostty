@@ -507,6 +507,7 @@ pub const Action = union(Key) {
 
     /// Returns the value type for the given key.
     pub fn Value(comptime key: Key) type {
+        @setEvalBranchQuota(2000);
         inline for (@typeInfo(Action).@"union".fields) |field| {
             const field_key = @field(Key, field.name);
             if (field_key == key) return field.type;
