@@ -849,6 +849,24 @@ pub const Viewer = struct {
             .client_session_changed,
             => {},
 
+            // Pane mode changes (copy mode, choose mode, etc.). The viewer
+            // doesn't track mode state — the apprt can observe this via the
+            // C API if it wants to show a UI indicator.
+            .pane_mode_changed => {},
+
+            // Session renamed. We track sessions by ID, not name, so this
+            // is informational. The apprt can pick up the new name via
+            // session queries if needed.
+            .session_renamed => {},
+
+            // Unlinked window notifications are for windows in sessions other
+            // than the one we're attached to. The viewer only manages the
+            // attached session, so these are no-ops.
+            .unlinked_window_add,
+            .unlinked_window_close,
+            .unlinked_window_renamed,
+            => {},
+
             // Flow control: tmux paused output for a pane. Record the
             // pause state. Since the viewer processes all queued output
             // synchronously before reaching %pause, we have already
