@@ -2795,7 +2795,14 @@ pub fn keyCallback(
         // 1. mouse reporting is off
         // OR
         // 2. mouse reporting is on and we are not reporting shift to the terminal
-        if (self.io.terminal.flags.mouse_event == .none or
+        //
+        // We use the active terminal (renderer_state.terminal) so that
+        // in tmux mode we read mouse state from the pane's terminal.
+        self.renderer_state.mutex.lock();
+        const mouse_ev = self.renderer_state.terminal.flags.mouse_event;
+        self.renderer_state.mutex.unlock();
+
+        if (mouse_ev == .none or
             (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
         {
             // Refresh our link state
@@ -2810,7 +2817,7 @@ pub fn keyCallback(
                 log.warn("failed to refresh links err={}", .{err});
                 break :mouse_mods;
             };
-        } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
+        } else if (mouse_ev != .none and !self.mouse.mods.shift) {
             // If we have mouse reports on and we don't have shift pressed, we reset state
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -2827,10 +2834,16 @@ pub fn keyCallback(
     }
 
     // Process the cursor state logic. This will update the cursor shape if
-    // needed, depending on the key state.
+    // needed, depending on the key state. We read mouse_event from the
+    // active terminal so tmux pane state is respected.
+    const key_mouse_ev = key_mouse_ev: {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        break :key_mouse_ev self.renderer_state.terminal.flags.mouse_event;
+    };
     if ((SurfaceMouse{
         .physical_key = event.key,
-        .mouse_event = self.io.terminal.flags.mouse_event,
+        .mouse_event = key_mouse_ev,
         .mouse_shape = self.io.terminal.mouse_shape,
         .mods = self.mouse.mods,
         .over_link = self.mouse.over_link,
@@ -3674,10 +3687,14 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
 const MouseReportAction = enum { press, release, motion };
 
 /// Returns true if mouse reporting is enabled both in the config and
-/// the terminal state.
+/// the terminal state. Uses the active terminal so that when a tmux
+/// pane is active, we read the mouse mode from the pane's terminal,
+/// not the host terminal running `tmux -CC`.
 fn isMouseReporting(self: *const Surface) bool {
+    // Callers must hold renderer_state.mutex.
+    const t = self.renderer_state.terminal;
     return self.config.mouse_reporting and
-        self.io.terminal.flags.mouse_event != .none;
+        t.flags.mouse_event != .none;
 }
 
 fn mouseReport(
@@ -3687,12 +3704,19 @@ fn mouseReport(
     mods: input.Mods,
     pos: apprt.CursorPos,
 ) !void {
+    // Use the active terminal so that when a tmux pane is active,
+    // we read mouse modes from the pane's terminal, not the host
+    // terminal running `tmux -CC`. Callers must hold renderer_state.mutex.
+    const t = self.renderer_state.terminal;
+    const mouse_event = t.flags.mouse_event;
+    const mouse_format = t.flags.mouse_format;
+
     // Mouse reporting must be enabled by both config and terminal state
     assert(self.config.mouse_reporting);
-    assert(self.io.terminal.flags.mouse_event != .none);
+    assert(mouse_event != .none);
 
     // Depending on the event, we may do nothing at all.
-    switch (self.io.terminal.flags.mouse_event) {
+    switch (mouse_event) {
         .none => unreachable, // checked by assert above
 
         // X10 only reports clicks with mouse button 1, 2, 3. We verify
@@ -3724,7 +3748,7 @@ fn mouseReport(
         };
         if (pos_out_viewport) outside_viewport: {
             // If we don't have a motion-tracking event mode, do nothing.
-            if (!self.io.terminal.flags.mouse_event.motion()) return;
+            if (!mouse_event.motion()) return;
 
             // If any button is pressed, we still do the report. Otherwise,
             // we do not do the report.
@@ -3741,7 +3765,7 @@ fn mouseReport(
 
     // Record our new point. We only want to send a mouse event if the
     // cell changed, unless we're tracking raw pixels.
-    if (action == .motion and self.io.terminal.flags.mouse_format != .sgr_pixels) {
+    if (action == .motion and mouse_format != .sgr_pixels) {
         if (self.mouse.event_point) |last_point| {
             if (last_point.eql(viewport_point)) return;
         }
@@ -3757,8 +3781,8 @@ fn mouseReport(
             // Null button means motion without a button pressed
             acc = 3;
         } else if (action == .release and
-            self.io.terminal.flags.mouse_format != .sgr and
-            self.io.terminal.flags.mouse_format != .sgr_pixels)
+            mouse_format != .sgr and
+            mouse_format != .sgr_pixels)
         {
             // Release is 3. It is NOT 3 in SGR mode because SGR can tell
             // the application what button was released.
@@ -3779,7 +3803,7 @@ fn mouseReport(
         }
 
         // X10 doesn't have modifiers
-        if (self.io.terminal.flags.mouse_event != .x10) {
+        if (mouse_event != .x10) {
             if (mods.shift) acc += 4;
             if (mods.alt) acc += 8;
             if (mods.ctrl) acc += 16;
@@ -3791,7 +3815,7 @@ fn mouseReport(
         break :code acc;
     };
 
-    switch (self.io.terminal.flags.mouse_format) {
+    switch (mouse_format) {
         .x10 => {
             if (viewport_point.x > 222 or viewport_point.y > 222) {
                 log.info("X10 mouse format can only encode X/Y up to 223", .{});
@@ -3922,8 +3946,9 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
     defer if (lock) self.renderer_state.mutex.unlock();
 
     // If the terminal explicitly requests it then we always allow it
-    // since we processed never/always at this point.
-    switch (self.io.terminal.flags.mouse_shift_capture) {
+    // since we processed never/always at this point. Use the active
+    // terminal so tmux pane state is respected.
+    switch (self.renderer_state.terminal.flags.mouse_shift_capture) {
         .false => return false,
         .true => return true,
         .null => {},
@@ -3938,11 +3963,12 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
 }
 
 /// Returns true if the mouse is currently captured by the terminal
-/// (i.e. reporting events).
+/// (i.e. reporting events). Uses the active terminal so that when a
+/// tmux pane is active, we read the mouse mode from the pane's terminal.
 pub fn mouseCaptured(self: *Surface) bool {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    return self.io.terminal.flags.mouse_event != .none;
+    return self.renderer_state.terminal.flags.mouse_event != .none;
 }
 
 /// Called for mouse button press/release events. This will return true
@@ -4567,7 +4593,7 @@ fn linkAtPin(
 fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
     // In any of these scenarios, whatever mods are set (even shift)
     // are preserved.
-    if (self.io.terminal.flags.mouse_event == .none) return mods;
+    if (self.renderer_state.terminal.flags.mouse_event == .none) return mods;
     if (!mods.shift) return mods;
     if (self.mouseShiftCapture(false)) return mods;
 
@@ -4800,7 +4826,7 @@ pub fn cursorPosCallback(
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
+        (self.renderer_state.terminal.flags.mouse_event == .none or
             (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
     {
         // If we were previously over a link, we always update. We do this so that if the text

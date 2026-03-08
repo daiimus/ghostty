@@ -1480,13 +1480,38 @@ pub const Viewer = struct {
             t.modes.set(.cursor_keys, data.keypad_cursor_flag);
             t.modes.set(.origin, data.origin_flag);
 
-            // Mouse modes
+            // Mouse modes — set both modes (for DECRPM queries) and flags
+            // (for Surface mouse reporting). The flags must reflect the
+            // highest-numbered enabled mode, matching stream_handler behavior
+            // where the last DECSET wins.
             t.modes.set(.mouse_event_any, data.mouse_all_flag);
             t.modes.set(.mouse_event_button, data.mouse_any_flag);
             t.modes.set(.mouse_event_normal, data.mouse_button_flag);
             t.modes.set(.mouse_event_x10, data.mouse_standard_flag);
             t.modes.set(.mouse_format_utf8, data.mouse_utf8_flag);
             t.modes.set(.mouse_format_sgr, data.mouse_sgr_flag);
+
+            // Sync flags.mouse_event from modes. Higher-numbered modes
+            // take priority (any > button > normal > x10), matching the
+            // precedence order that stream_readonly applies.
+            t.flags.mouse_event = if (data.mouse_all_flag)
+                .any
+            else if (data.mouse_any_flag)
+                .button
+            else if (data.mouse_button_flag)
+                .normal
+            else if (data.mouse_standard_flag)
+                .x10
+            else
+                .none;
+
+            // Sync flags.mouse_format from modes.
+            t.flags.mouse_format = if (data.mouse_sgr_flag)
+                .sgr
+            else if (data.mouse_utf8_flag)
+                .utf8
+            else
+                .x10;
 
             // Focus and bracketed paste
             t.modes.set(.focus_event, data.focus_flag);
@@ -5476,6 +5501,295 @@ test "flow control: pause unknown pane is no-op" {
                             return error.UnexpectedSendKeys;
                         }
                     }
+                }
+            }).check,
+        },
+    });
+}
+
+test "pane state: mouse_all_flag sets flags.mouse_event to any" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        // Single pane layout (pane 5)
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7e2,83x44,0,0,5
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // 4 capture-pane responses (all empty)
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // list-panes pane_state: mouse_all_flag=1, mouse_sgr_flag=1
+        //   fields: pane_id;cursor_x;cursor_y;cursor_flag;cursor_shape;
+        //           cursor_colour;cursor_blinking;alternate_on;
+        //           alternate_saved_x;alternate_saved_y;insert_flag;
+        //           wrap_flag;keypad_flag;keypad_cursor_flag;origin_flag;
+        //           mouse_all_flag;mouse_any_flag;mouse_button_flag;
+        //           mouse_standard_flag;mouse_utf8_flag;mouse_sgr_flag;
+        //           focus_flag;bracketed_paste;scroll_region_upper;
+        //           scroll_region_lower;pane_tabs
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;1;0;0;0;0;1;0;0;0;43;8,16,24,32,40,48,56,64,72,80
+                ,
+            } },
+            .contains_tags = &.{.ready},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
+                    const t: *Terminal = &pane.terminal;
+                    // modes should be set
+                    try testing.expect(t.modes.get(.mouse_event_any));
+                    try testing.expect(!t.modes.get(.mouse_event_button));
+                    try testing.expect(!t.modes.get(.mouse_event_normal));
+                    try testing.expect(!t.modes.get(.mouse_event_x10));
+                    try testing.expect(t.modes.get(.mouse_format_sgr));
+                    try testing.expect(!t.modes.get(.mouse_format_utf8));
+                    // flags should be synced from modes
+                    try testing.expectEqual(.any, t.flags.mouse_event);
+                    try testing.expectEqual(.sgr, t.flags.mouse_format);
+                }
+            }).check,
+        },
+    });
+}
+
+test "pane state: mouse_button_flag sets flags.mouse_event to button" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7e2,83x44,0,0,5
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // mouse_any_flag=1 (which maps to mouse_event_button), mouse_utf8_flag=1
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;1;0;0;1;0;0;0;0;43;8,16,24,32,40,48,56,64,72,80
+                ,
+            } },
+            .contains_tags = &.{.ready},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
+                    const t: *Terminal = &pane.terminal;
+                    try testing.expect(t.modes.get(.mouse_event_button));
+                    try testing.expect(t.modes.get(.mouse_format_utf8));
+                    try testing.expectEqual(.button, t.flags.mouse_event);
+                    try testing.expectEqual(.utf8, t.flags.mouse_format);
+                }
+            }).check,
+        },
+    });
+}
+
+test "pane state: mouse_standard_flag sets flags.mouse_event to x10" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7e2,83x44,0,0,5
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // mouse_standard_flag=1 (x10 mode), no format flags
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;1;0;0;0;0;0;43;8,16,24,32,40,48,56,64,72,80
+                ,
+            } },
+            .contains_tags = &.{.ready},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
+                    const t: *Terminal = &pane.terminal;
+                    try testing.expect(t.modes.get(.mouse_event_x10));
+                    try testing.expectEqual(.x10, t.flags.mouse_event);
+                    try testing.expectEqual(.x10, t.flags.mouse_format);
+                }
+            }).check,
+        },
+    });
+}
+
+test "pane state: no mouse flags leaves flags.mouse_event as none" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7e2,83x44,0,0,5
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // All mouse flags = 0
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;43;8,16,24,32,40,48,56,64,72,80
+                ,
+            } },
+            .contains_tags = &.{.ready},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
+                    const t: *Terminal = &pane.terminal;
+                    try testing.expectEqual(.none, t.flags.mouse_event);
+                    try testing.expectEqual(.x10, t.flags.mouse_format);
+                }
+            }).check,
+        },
+    });
+}
+
+test "pane state: mouse_all_flag takes precedence over lower mouse modes" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7e2,83x44,0,0,5
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // All mouse event flags set — mouse_all_flag should win
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;1;1;1;1;1;1;0;0;0;43;8,16,24,32,40,48,56,64,72,80
+                ,
+            } },
+            .contains_tags = &.{.ready},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
+                    const t: *Terminal = &pane.terminal;
+                    // All modes are set, but flags.mouse_event should
+                    // reflect the highest-priority one (any > button > normal > x10)
+                    try testing.expectEqual(.any, t.flags.mouse_event);
+                    // Both sgr and utf8 format modes set — sgr should take priority
+                    try testing.expectEqual(.sgr, t.flags.mouse_format);
                 }
             }).check,
         },
