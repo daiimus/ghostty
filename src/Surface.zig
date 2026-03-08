@@ -1261,6 +1261,24 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 log.warn("apprt failed to notify tmux ready err={}", .{err});
             };
         },
+
+        .tmux_command_response => |resp| {
+            const content = resp.data.slice();
+            log.info("tmux command response: {} bytes, is_error={}", .{ content.len, resp.is_error });
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_command_response,
+                .{
+                    .data = content.ptr,
+                    .len = content.len,
+                    .is_error = resp.is_error,
+                },
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux command response err={}", .{err});
+            };
+            // Free the mailbox-owned copy after the action is consumed.
+            resp.deinit();
+        },
     }
 }
 
