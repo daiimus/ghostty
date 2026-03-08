@@ -386,6 +386,15 @@ pub const Viewer = struct {
             pane_id: usize,
         },
 
+        /// A format subscription value changed. Emitted when tmux sends
+        /// `%subscription-changed` after a `refresh-client -B` registration.
+        /// The name identifies the subscription and the value is the new
+        /// format expansion.
+        subscription_changed: struct {
+            name: []const u8,
+            value: []const u8,
+        },
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -869,7 +878,7 @@ pub const Viewer = struct {
 
                 return self.enterCommandQueue(
                     arena.allocator(),
-                    &.{ .tmux_version, .enable_flow_control, .list_windows },
+                    &.{ .tmux_version, .enable_flow_control, .register_subscriptions, .list_windows },
                 ) catch {
                     log.warn("failed to queue command, becoming defunct", .{});
                     return self.defunct();
@@ -1151,9 +1160,17 @@ pub const Viewer = struct {
             },
 
             // Format subscription: a subscribed format value changed.
-            // No-op for now — the apprt can observe these via C API later
-            // when format subscriptions are actively used.
-            .subscription_changed => {},
+            .subscription_changed => |sc| {
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(arena.allocator(), .{ .subscription_changed = .{
+                    .name = sc.name,
+                    .value = sc.value,
+                } }) catch {
+                    log.warn("failed to emit subscription changed action", .{});
+                    return self.defunct();
+                };
+            },
 
             // display-message: surface the message text to the apprt.
             .message => |text| {
@@ -1621,6 +1638,10 @@ pub const Viewer = struct {
             // Flow control enable response: nothing to parse. The server
             // acknowledges the flag silently.
             .enable_flow_control => {},
+
+            // Subscription registration response: nothing to parse.
+            // The server acknowledges the subscription silently.
+            .register_subscriptions => {},
         }
     }
 
@@ -2247,6 +2268,11 @@ const Command = union(enum) {
     /// that fall more than the specified number of seconds behind.
     enable_flow_control,
 
+    /// Register format subscriptions via refresh-client -B. This allows
+    /// tmux to notify us when certain format values change (e.g., pane
+    /// titles) without polling.
+    register_subscriptions,
+
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
@@ -2264,6 +2290,7 @@ const Command = union(enum) {
             .pane_state,
             .tmux_version,
             .enable_flow_control,
+            .register_subscriptions,
             => {},
             .user => |v| alloc.free(v),
         };
@@ -2276,6 +2303,7 @@ const Command = union(enum) {
     pub fn meetsVersionRequirement(self: Command, version: ?Viewer.TmuxVersion) bool {
         return switch (self) {
             .enable_flow_control => if (version) |v| v.atLeast(Viewer.TmuxVersion.flow_control) else false,
+            .register_subscriptions => if (version) |v| v.atLeast(Viewer.TmuxVersion.format_subscriptions) else false,
             // All other commands work on any version.
             .list_windows,
             .pane_history,
@@ -2353,6 +2381,10 @@ const Command = union(enum) {
             // perform graceful cleanup before tmux closes the connection.
             .enable_flow_control => try writer.writeAll(
                 "refresh-client -f wait-exit,pause-after=30\n",
+            ),
+
+            .register_subscriptions => try writer.writeAll(
+                "refresh-client -B 'pane_title:%*:#{pane_title}'\n",
             ),
 
             .user => |v| try writer.writeAll(v),
@@ -2613,7 +2645,12 @@ test "session changed resets state" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -2718,7 +2755,12 @@ test "initial flow" {
                 }
             }).check,
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -2895,7 +2937,12 @@ test "layout change" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -2971,7 +3018,12 @@ test "layout_change does not return command when queue not empty" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -3037,7 +3089,12 @@ test "layout_change returns command when queue was empty" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -3109,7 +3166,12 @@ test "window_add queues list_windows when queue empty" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -3175,7 +3237,12 @@ test "window_add queues list_windows when queue not empty" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -3242,7 +3309,12 @@ test "two pane flow with pane state" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -3611,7 +3683,12 @@ test "pane terminal pointer invalidated after layout change" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -3701,7 +3778,12 @@ test "window name and raw layout from list-windows" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -3747,7 +3829,12 @@ test "window_renamed updates name" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -3804,7 +3891,12 @@ test "window_close removes window and orphaned panes" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -3876,7 +3968,12 @@ test "window_close clears active_window_id" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -3943,7 +4040,12 @@ test "session_window_changed sets active_window_id" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -4023,7 +4125,12 @@ test "layout_change stashes raw layout" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -4098,7 +4205,12 @@ test "split OSC across output messages does not corrupt state" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -4207,7 +4319,12 @@ test "multiple output rounds with OSC sequences keep rendering" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -4327,7 +4444,12 @@ test "DCS tmux passthrough does not trap parser across messages" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -4460,7 +4582,12 @@ test "split CSI across output messages persists parser state" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -4554,7 +4681,12 @@ test "UTF-8 box-drawing codepoints in %output reach terminal grid correctly" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -4654,7 +4786,12 @@ test "UTF-8 box-drawing split across %output messages" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -4751,7 +4888,12 @@ test "ACS charset (ESC(0) followed by UTF-8 box-drawing produces spaces not U+FF
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -4838,7 +4980,12 @@ test "4-byte emoji codepoints in %output reach terminal grid correctly" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -4929,7 +5076,12 @@ test "CJK double-width characters in %output produce wide cells" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -5019,7 +5171,12 @@ test "braille pattern codepoints in %output reach terminal grid correctly" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -5104,7 +5261,12 @@ test "4-byte emoji split across %output messages" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -5203,7 +5365,12 @@ test "mixed CJK and ASCII in %output with correct cell positions" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
-        // Flow control response, triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -5681,7 +5848,12 @@ test "flow control: enable_flow_control in init sequence" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client -f wait-exit,pause-after=",
         },
-        // Flow control response triggers list-windows
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -5840,7 +6012,12 @@ test "version gating: new tmux sends enable_flow_control" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client -f wait-exit,pause-after=",
         },
-        // Flow control response triggers list-windows.
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -5871,6 +6048,12 @@ test "version gating: exactly 3.2 enables flow control" {
             .input = .{ .tmux = .{ .block_end = "3.2" } },
             .contains_command = "refresh-client -f wait-exit,pause-after=",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -5917,6 +6100,12 @@ test "version gating: next- prefix parsed correctly" {
             .input = .{ .tmux = .{ .block_end = "next-3.5" } },
             .contains_command = "refresh-client -f wait-exit,pause-after=",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -5965,6 +6154,12 @@ test "flow control: pause sets pane paused and sends continue" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6020,6 +6215,12 @@ test "flow control: continue clears pane paused state" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6078,6 +6279,12 @@ test "flow control: extended output feeds terminal" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6144,6 +6351,12 @@ test "flow control: pause unknown pane is no-op" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6199,6 +6412,12 @@ test "pane state: mouse_all_flag sets flags.mouse_event to any" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6270,6 +6489,12 @@ test "pane state: mouse_button_flag sets flags.mouse_event to button" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6325,6 +6550,12 @@ test "pane state: mouse_standard_flag sets flags.mouse_event to x10" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6379,6 +6610,12 @@ test "pane state: no mouse flags leaves flags.mouse_event as none" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6432,6 +6669,12 @@ test "pane state: mouse_all_flag takes precedence over lower mouse modes" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6489,6 +6732,12 @@ test "queueUserCommand returns command when queue is empty" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6560,6 +6809,12 @@ test "queueUserCommand returns null when queue has in-flight command" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6609,6 +6864,12 @@ test "command_response emitted on user command block_end" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6684,6 +6945,12 @@ test "command_response with is_error on block_err" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6759,6 +7026,12 @@ test "fire-and-forget counter tracks send-keys responses" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
@@ -6822,6 +7095,12 @@ test "error response for pane capture is skipped gracefully" {
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "refresh-client",
         },
+        // Flow control response, triggers register_subscriptions
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "refresh-client",
+        },
+        // Subscription registration response, triggers list-windows
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "list-windows",
