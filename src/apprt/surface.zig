@@ -160,6 +160,16 @@ pub const Message = union(enum) {
         pane_id: usize,
     },
 
+    /// tmux format subscription value changed. Payload carries
+    /// the subscription name and the new expanded value as
+    /// inline fixed-size sentinel-terminated buffers.
+    tmux_subscription_changed: struct {
+        /// Subscription name (e.g., "pane_title"). Max 63 bytes.
+        name: [63:0]u8,
+        /// Expanded format value. Max 255 bytes.
+        value: [255:0]u8,
+    },
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 

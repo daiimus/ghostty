@@ -376,6 +376,9 @@ pub const Action = union(Key) {
     /// tmux control mode: focused pane changed within a window
     tmux_focused_pane_changed: TmuxFocusedPaneChanged,
 
+    /// tmux control mode: format subscription value changed
+    tmux_subscription_changed: TmuxSubscriptionChanged,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -454,6 +457,7 @@ pub const Action = union(Key) {
         tmux_pane_mode_changed,
         tmux_session_renamed,
         tmux_focused_pane_changed,
+        tmux_subscription_changed,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -900,6 +904,29 @@ pub const TmuxFocusedPaneChanged = struct {
         return .{
             .window_id = @intCast(self.window_id),
             .pane_id = @intCast(self.pane_id),
+        };
+    }
+};
+
+/// tmux control mode `%subscription-changed` notification.
+/// Fired when a format subscription registered via `refresh-client -B`
+/// detects that the expanded format value has changed.
+pub const TmuxSubscriptionChanged = struct {
+    /// The subscription name (as registered).
+    name: [:0]const u8,
+    /// The expanded format value.
+    value: [:0]const u8,
+
+    // Sync with: ghostty_action_tmux_subscription_changed_s
+    pub const C = extern struct {
+        name: [*:0]const u8,
+        value: [*:0]const u8,
+    };
+
+    pub fn cval(self: TmuxSubscriptionChanged) C {
+        return .{
+            .name = self.name.ptr,
+            .value = self.value.ptr,
         };
     }
 };
