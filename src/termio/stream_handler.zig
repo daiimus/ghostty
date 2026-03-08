@@ -563,6 +563,22 @@ pub const StreamHandler = struct {
                                 refresh_cmd,
                             ));
                         },
+
+                        .command_response => |resp| {
+                            // User command response — copy content through
+                            // the surface mailbox using WriteReq (handles
+                            // small inline or heap allocation).
+                            const data = try apprt.surface.Message.WriteReq.init(
+                                self.alloc,
+                                resp.content,
+                            );
+                            self.surfaceMessageWriter(.{
+                                .tmux_command_response = .{
+                                    .data = data,
+                                    .is_error = resp.is_error,
+                                },
+                            });
+                        },
                     }
                 }
             },

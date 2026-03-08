@@ -349,6 +349,9 @@ pub const Action = union(Key) {
     /// tmux control mode: viewer startup complete, user input safe to send
     tmux_ready: void,
 
+    /// tmux control mode: response to a user command
+    tmux_command_response: TmuxCommandResponse,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -418,6 +421,7 @@ pub const Action = union(Key) {
         tmux_state_changed,
         tmux_exit,
         tmux_ready,
+        tmux_command_response,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -655,6 +659,31 @@ pub const TmuxStateChanged = struct {
         return .{
             .window_count = @intCast(self.window_count),
             .pane_count = @intCast(self.pane_count),
+        };
+    }
+};
+
+/// Response to a user-initiated tmux command.
+pub const TmuxCommandResponse = struct {
+    /// Pointer to the response content.
+    data: [*]const u8,
+    /// Length of the response content.
+    len: usize,
+    /// Whether the response was a `%error` block.
+    is_error: bool,
+
+    // Sync with: ghostty_action_tmux_command_response_s
+    pub const C = extern struct {
+        data: [*]const u8,
+        len: usize,
+        is_error: bool,
+    };
+
+    pub fn cval(self: TmuxCommandResponse) C {
+        return .{
+            .data = self.data,
+            .len = self.len,
+            .is_error = self.is_error,
         };
     }
 };
