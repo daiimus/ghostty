@@ -1066,6 +1066,11 @@ pub const Viewer = struct {
                     );
                 };
             },
+
+            // Format subscription: a subscribed format value changed.
+            // No-op for now — the apprt can observe these via C API later
+            // when format subscriptions are actively used.
+            .subscription_changed => {},
         }
 
         // After processing commands, we add our next command to
