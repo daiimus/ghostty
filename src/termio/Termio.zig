@@ -455,6 +455,9 @@ pub inline fn queueWrite(
                     action.send_keys,
                     false,
                 );
+                // Increment after successful write so the counter
+                // stays consistent if queueWrite errors.
+                v.trackFireAndForget();
             } else {
                 log.warn("tmux send-keys returned null for {} byte(s), input dropped", .{data.len});
             }
@@ -467,6 +470,7 @@ pub inline fn queueWrite(
                         action.send_keys,
                         false,
                     );
+                    v.trackFireAndForget();
                 }
             }
             return;
