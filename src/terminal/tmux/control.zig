@@ -647,6 +647,38 @@ pub const Parser = struct {
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .session_window_changed = .{ .session_id = session_id, .window_id = window_id } };
+        } else if (std.mem.eql(u8, cmd, "%subscription-changed")) cmd: {
+            // Format from tmux source (control.c):
+            //   %subscription-changed name $session @window idx %pane : value
+            // or for session-scope subscriptions:
+            //   %subscription-changed name $session - - - : value
+            // We extract the subscription name and the value after " : ".
+            var re = oni.Regex.init(
+                "^%subscription-changed ([^ ]+) \\$[0-9]+ [^ ]+ [^ ]+ [^ ]+ : (.*)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const name = line[@intCast(starts[1])..@intCast(ends[1])];
+            const value = line[@intCast(starts[2])..@intCast(ends[2])];
+
+            // Important: do not clear buffer here since name and value point to it
+            self.state = .idle;
+            return .{ .subscription_changed = .{ .name = name, .value = value } };
         } else if (std.mem.eql(u8, cmd, "%pane-mode-changed")) cmd: {
             // %pane-mode-changed %<pane_id>
             var re = oni.Regex.init(
@@ -965,6 +997,17 @@ pub const Notification = union(enum) {
     unlinked_window_renamed: struct {
         id: usize,
         name: []const u8,
+    },
+
+    /// A format subscription value has changed. Sent when a subscription
+    /// registered via `refresh-client -B` detects that the expanded format
+    /// value has changed. The format is:
+    ///   %subscription-changed name $session @window idx %pane : value
+    /// where @window, idx, and %pane may be "-" if the subscription scope
+    /// is session-level. See tmux(1) Control Mode — Format subscriptions.
+    subscription_changed: struct {
+        name: []const u8,
+        value: []const u8,
     },
 
     pub fn format(self: Notification, writer: *std.Io.Writer) !void {
@@ -1520,6 +1563,45 @@ test "tmux extended-output zero age" {
     try testing.expectEqual(0, n.extended_output.pane_id);
     try testing.expectEqual(0, n.extended_output.age_ms);
     try testing.expectEqualStrings("$", n.extended_output.data);
+}
+
+test "tmux subscription-changed session scope" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%subscription-changed pane_title $0 - - - : my title") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .subscription_changed);
+    try testing.expectEqualStrings("pane_title", n.subscription_changed.name);
+    try testing.expectEqualStrings("my title", n.subscription_changed.value);
+}
+
+test "tmux subscription-changed pane scope" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%subscription-changed mytitle $1 @0 0 %3 : hello world") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .subscription_changed);
+    try testing.expectEqualStrings("mytitle", n.subscription_changed.name);
+    try testing.expectEqualStrings("hello world", n.subscription_changed.value);
+}
+
+test "tmux subscription-changed empty value" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%subscription-changed watch $2 - - - : ") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .subscription_changed);
+    try testing.expectEqualStrings("watch", n.subscription_changed.name);
+    try testing.expectEqualStrings("", n.subscription_changed.value);
 }
 
 test "tmux pane-mode-changed" {
