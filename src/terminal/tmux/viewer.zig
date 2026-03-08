@@ -5733,7 +5733,7 @@ test "version gating: new tmux sends enable_flow_control" {
         // Report version 3.5a — flow control supported.
         .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "refresh-client -f pause-after=",
+            .contains_command = "refresh-client -f wait-exit,pause-after=",
         },
         // Flow control response triggers list-windows.
         .{
@@ -5764,7 +5764,7 @@ test "version gating: exactly 3.2 enables flow control" {
         // Exactly 3.2 — should enable flow control.
         .{
             .input = .{ .tmux = .{ .block_end = "3.2" } },
-            .contains_command = "refresh-client -f pause-after=",
+            .contains_command = "refresh-client -f wait-exit,pause-after=",
         },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
@@ -5810,7 +5810,7 @@ test "version gating: next- prefix parsed correctly" {
         // Dev build: next-3.5 should enable flow control.
         .{
             .input = .{ .tmux = .{ .block_end = "next-3.5" } },
-            .contains_command = "refresh-client -f pause-after=",
+            .contains_command = "refresh-client -f wait-exit,pause-after=",
         },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
@@ -6421,7 +6421,7 @@ test "queueUserCommand returns command when queue is empty" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -6480,7 +6480,7 @@ test "queueUserCommand returns null when queue has in-flight command" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -6555,7 +6555,7 @@ test "command_response emitted on user command block_end" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
@@ -6630,7 +6630,7 @@ test "command_response with is_error on block_err" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
             .contains_tags = &.{.exit},
         },
     });
