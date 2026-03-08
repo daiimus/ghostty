@@ -4173,6 +4173,445 @@ test "ACS charset (ESC(0) followed by UTF-8 box-drawing produces spaces not U+FF
     });
 }
 
+test "4-byte emoji codepoints in %output reach terminal grid correctly" {
+    // UTF-8 integrity fence: 4-byte emoji sequences must produce the correct
+    // Unicode codepoints in the terminal grid, not U+FFFD.
+    //
+    // Characters under test:
+    //   😀 U+1F600 (0xF0 0x9F 0x98 0x80) - grinning face
+    //   🎉 U+1F389 (0xF0 0x9F 0x8E 0x89) - party popper
+    //   🚀 U+1F680 (0xF0 0x9F 0x9A 0x80) - rocket
+    //
+    // Note: These emoji are typically rendered as wide (2-cell) characters.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard initialization
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + list-panes
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = 
+        \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;24;
+        } } },
+        // Send %output with 4-byte emoji
+        .{
+            .input = .{
+                .tmux = .{
+                    .output = .{
+                        .pane_id = 0,
+                        // Raw UTF-8: 😀🎉🚀
+                        .data = "\xf0\x9f\x98\x80\xf0\x9f\x8e\x89\xf0\x9f\x9a\x80",
+                    },
+                },
+            },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    // Each emoji is wide (2 cells): emoji at x=0, spacer_tail at x=1, etc.
+                    // 😀 U+1F600 at x=0
+                    const cell0 = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x1F600), cell0.cell.codepoint());
+                    try testing.expect(cell0.cell.wide == .wide);
+                    // Spacer tail at x=1
+                    const cell1 = screen.pages.getCell(.{ .active = .{ .x = 1, .y = 0 } }).?;
+                    try testing.expect(cell1.cell.wide == .spacer_tail);
+                    // 🎉 U+1F389 at x=2
+                    const cell2 = screen.pages.getCell(.{ .active = .{ .x = 2, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x1F389), cell2.cell.codepoint());
+                    try testing.expect(cell2.cell.wide == .wide);
+                    // 🚀 U+1F680 at x=4
+                    const cell4 = screen.pages.getCell(.{ .active = .{ .x = 4, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x1F680), cell4.cell.codepoint());
+                    try testing.expect(cell4.cell.wide == .wide);
+                    // None should be U+FFFD
+                    try testing.expect(cell0.cell.codepoint() != 0xFFFD);
+                    try testing.expect(cell2.cell.codepoint() != 0xFFFD);
+                    try testing.expect(cell4.cell.codepoint() != 0xFFFD);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "CJK double-width characters in %output produce wide cells" {
+    // UTF-8 integrity fence: CJK ideographs are 3-byte UTF-8 sequences that
+    // render as double-width (2-cell) characters in terminal grids.
+    //
+    // Characters under test:
+    //   中 U+4E2D (0xE4 0xB8 0xAD) - CJK ideograph "middle"
+    //   文 U+6587 (0xE6 0x96 0x87) - CJK ideograph "writing"
+    //   字 U+5B57 (0xE5 0xAD 0x97) - CJK ideograph "character"
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard initialization
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + list-panes
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = 
+        \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;24;
+        } } },
+        // Send %output with CJK characters
+        .{
+            .input = .{
+                .tmux = .{
+                    .output = .{
+                        .pane_id = 0,
+                        // Raw UTF-8: 中文字
+                        .data = "\xe4\xb8\xad\xe6\x96\x87\xe5\xad\x97",
+                    },
+                },
+            },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    // 中 U+4E2D at x=0, wide
+                    const cell0 = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x4E2D), cell0.cell.codepoint());
+                    try testing.expect(cell0.cell.wide == .wide);
+                    // Spacer tail at x=1
+                    const cell1 = screen.pages.getCell(.{ .active = .{ .x = 1, .y = 0 } }).?;
+                    try testing.expect(cell1.cell.wide == .spacer_tail);
+                    // 文 U+6587 at x=2, wide
+                    const cell2 = screen.pages.getCell(.{ .active = .{ .x = 2, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x6587), cell2.cell.codepoint());
+                    try testing.expect(cell2.cell.wide == .wide);
+                    // 字 U+5B57 at x=4, wide
+                    const cell4 = screen.pages.getCell(.{ .active = .{ .x = 4, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x5B57), cell4.cell.codepoint());
+                    try testing.expect(cell4.cell.wide == .wide);
+                    // None should be U+FFFD
+                    try testing.expect(cell0.cell.codepoint() != 0xFFFD);
+                    try testing.expect(cell2.cell.codepoint() != 0xFFFD);
+                    try testing.expect(cell4.cell.codepoint() != 0xFFFD);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "braille pattern codepoints in %output reach terminal grid correctly" {
+    // UTF-8 integrity fence: Braille patterns are 3-byte UTF-8 sequences in
+    // the U+2800-U+28FF range, rendered as narrow (1-cell) characters.
+    //
+    // Characters under test:
+    //   ⠿ U+283F (0xE2 0xA0 0xBF) - braille pattern dots-123456
+    //   ⣿ U+28FF (0xE2 0xA3 0xBF) - braille pattern dots-12345678
+    //   ⠁ U+2801 (0xE2 0xA0 0x81) - braille pattern dots-1
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard initialization
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + list-panes
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = 
+        \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;24;
+        } } },
+        // Send %output with braille patterns
+        .{
+            .input = .{
+                .tmux = .{
+                    .output = .{
+                        .pane_id = 0,
+                        // Raw UTF-8: ⠿⣿⠁
+                        .data = "\xe2\xa0\xbf\xe2\xa3\xbf\xe2\xa0\x81",
+                    },
+                },
+            },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    // Braille characters are narrow (1-cell wide)
+                    // ⠿ U+283F at x=0
+                    const cell0 = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x283F), cell0.cell.codepoint());
+                    try testing.expect(cell0.cell.wide == .narrow);
+                    // ⣿ U+28FF at x=1
+                    const cell1 = screen.pages.getCell(.{ .active = .{ .x = 1, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x28FF), cell1.cell.codepoint());
+                    try testing.expect(cell1.cell.wide == .narrow);
+                    // ⠁ U+2801 at x=2
+                    const cell2 = screen.pages.getCell(.{ .active = .{ .x = 2, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x2801), cell2.cell.codepoint());
+                    try testing.expect(cell2.cell.wide == .narrow);
+                    // None should be U+FFFD
+                    try testing.expect(cell0.cell.codepoint() != 0xFFFD);
+                    try testing.expect(cell1.cell.codepoint() != 0xFFFD);
+                    try testing.expect(cell2.cell.codepoint() != 0xFFFD);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "4-byte emoji split across %output messages" {
+    // UTF-8 integrity fence: A 4-byte emoji split across two %output messages
+    // must be correctly reassembled by the persistent UTF8Decoder.
+    //
+    // 🚀 U+1F680 = 0xF0 0x9F 0x9A 0x80 — we split after the first two bytes.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard initialization
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + list-panes
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = 
+        \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;24;
+        } } },
+        // First %output: "A" + first two bytes of 🚀 (0xF0 0x9F)
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "A\xf0\x9f",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    // "A" should appear; the incomplete bytes are buffered
+                    const cell0 = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 'A'), cell0.cell.codepoint());
+                }
+            }).check,
+        },
+        // Second %output: remaining bytes of 🚀 (0x9A 0x80) + "B"
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "\x9a\x80B",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    // Cell 0 = 'A' (0x41)
+                    const cell0 = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 'A'), cell0.cell.codepoint());
+                    // Cell 1 = 🚀 U+1F680 (reassembled from split bytes), wide
+                    const cell1 = screen.pages.getCell(.{ .active = .{ .x = 1, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x1F680), cell1.cell.codepoint());
+                    try testing.expect(cell1.cell.wide == .wide);
+                    try testing.expect(cell1.cell.codepoint() != 0xFFFD);
+                    // Spacer tail at x=2
+                    const cell2 = screen.pages.getCell(.{ .active = .{ .x = 2, .y = 0 } }).?;
+                    try testing.expect(cell2.cell.wide == .spacer_tail);
+                    // Cell 3 = 'B' (0x42)
+                    const cell3 = screen.pages.getCell(.{ .active = .{ .x = 3, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 'B'), cell3.cell.codepoint());
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "mixed CJK and ASCII in %output with correct cell positions" {
+    // UTF-8 integrity fence: Mixed narrow ASCII and wide CJK characters must
+    // produce correct codepoints at correct grid positions, accounting for
+    // the fact that wide chars occupy 2 cells each.
+    //
+    // Input: "A中B文C" — expected layout:
+    //   x=0: 'A' (narrow)
+    //   x=1: 中 (wide), x=2: spacer_tail
+    //   x=3: 'B' (narrow)
+    //   x=4: 文 (wide), x=5: spacer_tail
+    //   x=6: 'C' (narrow)
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard initialization
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + list-panes
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = 
+        \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;24;
+        } } },
+        // Send %output with mixed ASCII and CJK
+        .{
+            .input = .{
+                .tmux = .{
+                    .output = .{
+                        .pane_id = 0,
+                        // "A" + 中 + "B" + 文 + "C"
+                        .data = "A\xe4\xb8\xadB\xe6\x96\x87C",
+                    },
+                },
+            },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    // x=0: 'A' narrow
+                    const cell0 = screen.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 'A'), cell0.cell.codepoint());
+                    try testing.expect(cell0.cell.wide == .narrow);
+                    // x=1: 中 U+4E2D wide
+                    const cell1 = screen.pages.getCell(.{ .active = .{ .x = 1, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x4E2D), cell1.cell.codepoint());
+                    try testing.expect(cell1.cell.wide == .wide);
+                    // x=2: spacer_tail
+                    const cell2 = screen.pages.getCell(.{ .active = .{ .x = 2, .y = 0 } }).?;
+                    try testing.expect(cell2.cell.wide == .spacer_tail);
+                    // x=3: 'B' narrow
+                    const cell3 = screen.pages.getCell(.{ .active = .{ .x = 3, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 'B'), cell3.cell.codepoint());
+                    try testing.expect(cell3.cell.wide == .narrow);
+                    // x=4: 文 U+6587 wide
+                    const cell4 = screen.pages.getCell(.{ .active = .{ .x = 4, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 0x6587), cell4.cell.codepoint());
+                    try testing.expect(cell4.cell.wide == .wide);
+                    // x=5: spacer_tail
+                    const cell5 = screen.pages.getCell(.{ .active = .{ .x = 5, .y = 0 } }).?;
+                    try testing.expect(cell5.cell.wide == .spacer_tail);
+                    // x=6: 'C' narrow
+                    const cell6 = screen.pages.getCell(.{ .active = .{ .x = 6, .y = 0 } }).?;
+                    try testing.expectEqual(@as(u21, 'C'), cell6.cell.codepoint());
+                    try testing.expect(cell6.cell.wide == .narrow);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
 // =========================================================================
 // Observer tests
 // =========================================================================

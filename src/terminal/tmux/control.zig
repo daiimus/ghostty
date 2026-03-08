@@ -1024,6 +1024,104 @@ test "tmux output with mixed UTF-8 and octal escapes" {
     try testing.expectEqualStrings("[0m", n.output.data[9..12]);
 }
 
+test "tmux output with 4-byte emoji pass-through" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // tmux sends UTF-8 bytes >= 0x80 raw (unescaped) in %output.
+    // 4-byte emoji must pass through unchanged.
+    // 😀 = U+1F600 = f0 9f 98 80
+    // 🎉 = U+1F389 = f0 9f 8e 89
+    // 🚀 = U+1F680 = f0 9f 9a 80
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    const prefix = "%output %5 ";
+    const emoji = "\xf0\x9f\x98\x80\xf0\x9f\x8e\x89\xf0\x9f\x9a\x80";
+    const line = prefix ++ emoji;
+
+    for (line) |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .output);
+    try testing.expectEqual(5, n.output.pane_id);
+    // Data should be the raw UTF-8 bytes, unchanged (12 bytes: 3 x 4-byte)
+    try testing.expectEqual(@as(usize, 12), n.output.data.len);
+    try testing.expectEqualStrings(emoji, n.output.data);
+}
+
+test "tmux output with CJK characters pass-through" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // CJK ideographs are 3-byte UTF-8, sent raw by tmux.
+    // 中 = U+4E2D = e4 b8 ad
+    // 文 = U+6587 = e6 96 87
+    // 字 = U+5B57 = e5 ad 97
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    const prefix = "%output %2 ";
+    const cjk = "\xe4\xb8\xad\xe6\x96\x87\xe5\xad\x97";
+    const line = prefix ++ cjk;
+
+    for (line) |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .output);
+    try testing.expectEqual(2, n.output.pane_id);
+    // 9 bytes: 3 x 3-byte CJK characters
+    try testing.expectEqual(@as(usize, 9), n.output.data.len);
+    try testing.expectEqualStrings(cjk, n.output.data);
+}
+
+test "tmux output with mixed 3-byte and 4-byte UTF-8" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Mixed: box-drawing (3-byte) + emoji (4-byte) + CJK (3-byte)
+    // ┄ = U+2504 = e2 94 84  (3 bytes)
+    // 🚀 = U+1F680 = f0 9f 9a 80  (4 bytes)
+    // 中 = U+4E2D = e4 b8 ad  (3 bytes)
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    const prefix = "%output %0 ";
+    const mixed = "\xe2\x94\x84\xf0\x9f\x9a\x80\xe4\xb8\xad";
+    const line = prefix ++ mixed;
+
+    for (line) |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .output);
+    try testing.expectEqual(0, n.output.pane_id);
+    // 10 bytes: 3 + 4 + 3
+    try testing.expectEqual(@as(usize, 10), n.output.data.len);
+    try testing.expectEqualStrings("\xe2\x94\x84", n.output.data[0..3]); // ┄
+    try testing.expectEqualStrings("\xf0\x9f\x9a\x80", n.output.data[3..7]); // 🚀
+    try testing.expectEqualStrings("\xe4\xb8\xad", n.output.data[7..10]); // 中
+}
+
+test "tmux output with 4-byte emoji and octal-escaped SGR" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Octal-escaped ESC[31m + raw 4-byte emoji + octal-escaped ESC[0m
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    const input = "%output %4 \\033[31m\xf0\x9f\x98\x80\\033[0m";
+    for (input) |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .output);
+    try testing.expectEqual(4, n.output.pane_id);
+    // Expected: ESC + "[31m" + f0 9f 98 80 + ESC + "[0m"
+    // ESC=1 + [31m=4 + 😀=4 + ESC=1 + [0m=3 = 13 bytes
+    try testing.expectEqual(@as(usize, 13), n.output.data.len);
+    try testing.expectEqual(@as(u8, 0x1B), n.output.data[0]); // ESC
+    try testing.expectEqualStrings("[31m", n.output.data[1..5]);
+    try testing.expectEqualStrings("\xf0\x9f\x98\x80", n.output.data[5..9]); // 😀
+    try testing.expectEqual(@as(u8, 0x1B), n.output.data[9]); // ESC
+    try testing.expectEqualStrings("[0m", n.output.data[10..13]);
+}
+
 test "tmux window-close" {
     const testing = std.testing;
     const alloc = testing.allocator;
