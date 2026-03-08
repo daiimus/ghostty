@@ -172,6 +172,11 @@ pub const Viewer = struct {
     /// versions as necessary.
     tmux_version: []const u8,
 
+    /// The parsed version for comparison. Null if the version string
+    /// could not be parsed (should not happen with well-behaved tmux
+    /// servers, but we handle it gracefully).
+    parsed_version: ?TmuxVersion,
+
     /// The list of commands we've sent that we want to send and wait
     /// for a response for. We only send one command at a time just
     /// to avoid any possible confusion around ordering.
@@ -217,6 +222,83 @@ pub const Viewer = struct {
 
     pub const CommandQueue = CircBuf(Command, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, Pane);
+
+    /// A parsed tmux version for comparison purposes. Tmux versions
+    /// follow the format "major.minor[suffix]" where suffix is an
+    /// optional lowercase letter (e.g., "3.5a", "2.9", "3.2a").
+    /// Development builds may have a "next-" prefix (e.g., "next-3.5")
+    /// which is stripped during parsing and treated as that version.
+    pub const TmuxVersion = struct {
+        major: u16,
+        minor: u16,
+        /// Optional suffix letter (e.g., 'a' in "3.5a"). Zero means
+        /// no suffix. A version with a suffix is newer than the same
+        /// version without one (3.5a > 3.5).
+        suffix: u8,
+
+        /// Well-known version thresholds for feature gating.
+        pub const flow_control = TmuxVersion{ .major = 3, .minor = 2, .suffix = 0 };
+        pub const format_subscriptions = TmuxVersion{ .major = 3, .minor = 2, .suffix = 0 };
+        pub const unlinked_window = TmuxVersion{ .major = 3, .minor = 1, .suffix = 0 };
+        pub const send_keys_hex = TmuxVersion{ .major = 2, .minor = 9, .suffix = 0 };
+
+        /// Parse a version string like "3.5a", "2.9", or "next-3.5".
+        /// Returns null if the string cannot be parsed.
+        pub fn parse(input: []const u8) ?TmuxVersion {
+            // Strip "next-" prefix from development builds.
+            const version_str = if (std.mem.startsWith(u8, input, "next-"))
+                input[5..]
+            else
+                input;
+
+            // Find the dot separator.
+            const dot_pos = std.mem.indexOfScalar(u8, version_str, '.') orelse return null;
+            if (dot_pos == 0) return null;
+
+            const major = std.fmt.parseInt(u16, version_str[0..dot_pos], 10) catch return null;
+
+            // After the dot: digits optionally followed by a single letter.
+            const after_dot = version_str[dot_pos + 1 ..];
+            if (after_dot.len == 0) return null;
+
+            // Find where the digits end.
+            var digit_end: usize = 0;
+            while (digit_end < after_dot.len and std.ascii.isDigit(after_dot[digit_end])) {
+                digit_end += 1;
+            }
+            if (digit_end == 0) return null;
+
+            const minor = std.fmt.parseInt(u16, after_dot[0..digit_end], 10) catch return null;
+
+            // Check for an optional suffix letter.
+            var suffix: u8 = 0;
+            if (digit_end < after_dot.len) {
+                if (std.ascii.isAlphabetic(after_dot[digit_end])) {
+                    suffix = after_dot[digit_end];
+                    // Must be the last character (reject "3.5ab").
+                    if (digit_end + 1 != after_dot.len) return null;
+                } else {
+                    // Unexpected trailing character.
+                    return null;
+                }
+            }
+
+            return .{ .major = major, .minor = minor, .suffix = suffix };
+        }
+
+        /// Compare two versions. Returns .lt, .eq, or .gt.
+        pub fn order(self: TmuxVersion, other: TmuxVersion) std.math.Order {
+            if (self.major != other.major) return std.math.order(self.major, other.major);
+            if (self.minor != other.minor) return std.math.order(self.minor, other.minor);
+            // suffix=0 means no suffix, which sorts before any letter.
+            return std.math.order(self.suffix, other.suffix);
+        }
+
+        /// Returns true if this version is at least the given version.
+        pub fn atLeast(self: TmuxVersion, minimum: TmuxVersion) bool {
+            return self.order(minimum) != .lt;
+        }
+    };
 
     pub const Action = union(enum) {
         /// Tmux has closed the control mode connection, we should end
@@ -390,6 +472,7 @@ pub const Viewer = struct {
             // set this to a real value.
             .session_id = 0,
             .tmux_version = "",
+            .parsed_version = null,
             .command_queue = command_queue,
             .windows = .empty,
             .panes = .empty,
@@ -990,6 +1073,18 @@ pub const Viewer = struct {
         // processing may itself queue more commands. We only emit a
         // command if a prior command was consumed (or never existed).
         if (self.state == .command_queue and command_consumed) {
+            // Skip any commands that are gated on a tmux version we
+            // don't meet. This handles the case where enable_flow_control
+            // was queued but the tmux server is older than 3.2.
+            while (self.command_queue.first()) |queued| {
+                if (!queued.meetsVersionRequirement(self.parsed_version)) {
+                    log.info("skipping command {s}: requires newer tmux", .{@tagName(queued.*)});
+                    self.command_queue.deleteOldest(1);
+                    continue;
+                }
+                break;
+            }
+
             if (self.command_queue.first()) |next_command| {
                 // We should not have any commands, because our nextCommand
                 // always queues them.
@@ -1284,6 +1379,7 @@ pub const Viewer = struct {
 
         // Transfer preserved version to replacement
         replacement.tmux_version = try replacement.alloc.dupe(u8, self.tmux_version);
+        replacement.parsed_version = self.parsed_version;
 
         // Save arena state back before swap
         replacement.action_arena = arena.state;
@@ -1394,6 +1490,11 @@ pub const Viewer = struct {
             self.alloc.free(self.tmux_version);
         }
         self.tmux_version = try self.alloc.dupe(u8, data.version);
+        self.parsed_version = TmuxVersion.parse(data.version);
+
+        if (self.parsed_version == null) {
+            log.warn("could not parse tmux version: {s}", .{data.version});
+        }
     }
 
     fn receivedListWindows(
@@ -2000,6 +2101,24 @@ const Command = union(enum) {
             .enable_flow_control,
             => {},
             .user => |v| alloc.free(v),
+        };
+    }
+
+    /// Returns true if the command is allowed to run given the current
+    /// parsed tmux version. Commands that require a specific minimum
+    /// version return false when the version is unknown (null) or too
+    /// old. Most commands have no version requirement.
+    pub fn meetsVersionRequirement(self: Command, version: ?Viewer.TmuxVersion) bool {
+        return switch (self) {
+            .enable_flow_control => if (version) |v| v.atLeast(Viewer.TmuxVersion.flow_control) else false,
+            // All other commands work on any version.
+            .list_windows,
+            .pane_history,
+            .pane_visible,
+            .pane_state,
+            .tmux_version,
+            .user,
+            => true,
         };
     }
 
@@ -5352,6 +5471,264 @@ test "flow control: enable_flow_control in init sequence" {
             .contains_command = "list-windows",
         },
     });
+}
+
+// --- TmuxVersion parsing tests ---
+
+test "TmuxVersion: parse standard version" {
+    const v = Viewer.TmuxVersion.parse("3.5a").?;
+    try testing.expectEqual(@as(u16, 3), v.major);
+    try testing.expectEqual(@as(u16, 5), v.minor);
+    try testing.expectEqual(@as(u8, 'a'), v.suffix);
+}
+
+test "TmuxVersion: parse version without suffix" {
+    const v = Viewer.TmuxVersion.parse("3.2").?;
+    try testing.expectEqual(@as(u16, 3), v.major);
+    try testing.expectEqual(@as(u16, 2), v.minor);
+    try testing.expectEqual(@as(u8, 0), v.suffix);
+}
+
+test "TmuxVersion: parse next- prefix" {
+    const v = Viewer.TmuxVersion.parse("next-3.5").?;
+    try testing.expectEqual(@as(u16, 3), v.major);
+    try testing.expectEqual(@as(u16, 5), v.minor);
+    try testing.expectEqual(@as(u8, 0), v.suffix);
+}
+
+test "TmuxVersion: parse single digit version" {
+    const v = Viewer.TmuxVersion.parse("2.9").?;
+    try testing.expectEqual(@as(u16, 2), v.major);
+    try testing.expectEqual(@as(u16, 9), v.minor);
+    try testing.expectEqual(@as(u8, 0), v.suffix);
+}
+
+test "TmuxVersion: parse rejects empty string" {
+    try testing.expect(Viewer.TmuxVersion.parse("") == null);
+}
+
+test "TmuxVersion: parse rejects no dot" {
+    try testing.expect(Viewer.TmuxVersion.parse("35a") == null);
+}
+
+test "TmuxVersion: parse rejects trailing garbage" {
+    try testing.expect(Viewer.TmuxVersion.parse("3.5ab") == null);
+}
+
+test "TmuxVersion: parse rejects dot only" {
+    try testing.expect(Viewer.TmuxVersion.parse(".") == null);
+}
+
+test "TmuxVersion: parse rejects leading dot" {
+    try testing.expect(Viewer.TmuxVersion.parse(".5") == null);
+}
+
+test "TmuxVersion: parse rejects trailing dot" {
+    try testing.expect(Viewer.TmuxVersion.parse("3.") == null);
+}
+
+test "TmuxVersion: order equal versions" {
+    const a = Viewer.TmuxVersion{ .major = 3, .minor = 2, .suffix = 0 };
+    const b = Viewer.TmuxVersion{ .major = 3, .minor = 2, .suffix = 0 };
+    try testing.expectEqual(std.math.Order.eq, a.order(b));
+}
+
+test "TmuxVersion: order major difference" {
+    const a = Viewer.TmuxVersion{ .major = 2, .minor = 9, .suffix = 0 };
+    const b = Viewer.TmuxVersion{ .major = 3, .minor = 0, .suffix = 0 };
+    try testing.expectEqual(std.math.Order.lt, a.order(b));
+    try testing.expectEqual(std.math.Order.gt, b.order(a));
+}
+
+test "TmuxVersion: order minor difference" {
+    const a = Viewer.TmuxVersion{ .major = 3, .minor = 1, .suffix = 0 };
+    const b = Viewer.TmuxVersion{ .major = 3, .minor = 2, .suffix = 0 };
+    try testing.expectEqual(std.math.Order.lt, a.order(b));
+}
+
+test "TmuxVersion: order suffix difference" {
+    const a = Viewer.TmuxVersion{ .major = 3, .minor = 5, .suffix = 0 };
+    const b = Viewer.TmuxVersion{ .major = 3, .minor = 5, .suffix = 'a' };
+    try testing.expectEqual(std.math.Order.lt, a.order(b));
+    try testing.expectEqual(std.math.Order.gt, b.order(a));
+}
+
+test "TmuxVersion: atLeast true for equal version" {
+    const v = Viewer.TmuxVersion{ .major = 3, .minor = 2, .suffix = 0 };
+    try testing.expect(v.atLeast(Viewer.TmuxVersion.flow_control));
+}
+
+test "TmuxVersion: atLeast true for newer version" {
+    const v = Viewer.TmuxVersion{ .major = 3, .minor = 5, .suffix = 'a' };
+    try testing.expect(v.atLeast(Viewer.TmuxVersion.flow_control));
+}
+
+test "TmuxVersion: atLeast false for older version" {
+    const v = Viewer.TmuxVersion{ .major = 3, .minor = 1, .suffix = 0 };
+    try testing.expect(!v.atLeast(Viewer.TmuxVersion.flow_control));
+}
+
+test "TmuxVersion: atLeast false for much older version" {
+    const v = Viewer.TmuxVersion{ .major = 2, .minor = 9, .suffix = 0 };
+    try testing.expect(!v.atLeast(Viewer.TmuxVersion.flow_control));
+}
+
+// --- Version gating behavior tests ---
+
+test "version gating: old tmux skips enable_flow_control" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            // First command: tmux_version (display-message)
+            .contains_command = "display-message",
+        },
+        // Report version 2.9 — too old for flow control.
+        // enable_flow_control should be skipped, list-windows sent directly.
+        .{
+            .input = .{ .tmux = .{ .block_end = "2.9" } },
+            .contains_command = "list-windows",
+        },
+    });
+
+    // Verify the parsed version was stored.
+    const pv = viewer.parsed_version.?;
+    try testing.expectEqual(@as(u16, 2), pv.major);
+    try testing.expectEqual(@as(u16, 9), pv.minor);
+}
+
+test "version gating: new tmux sends enable_flow_control" {
+    // This is essentially the same as the existing
+    // "flow control: enable_flow_control in init sequence" test,
+    // but explicitly verifies version gating allows it through.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        // Report version 3.5a — flow control supported.
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client -f pause-after=",
+        },
+        // Flow control response triggers list-windows.
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+    });
+
+    const pv = viewer.parsed_version.?;
+    try testing.expectEqual(@as(u16, 3), pv.major);
+    try testing.expectEqual(@as(u16, 5), pv.minor);
+    try testing.expectEqual(@as(u8, 'a'), pv.suffix);
+}
+
+test "version gating: exactly 3.2 enables flow control" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        // Exactly 3.2 — should enable flow control.
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.2" } },
+            .contains_command = "refresh-client -f pause-after=",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+    });
+}
+
+test "version gating: 3.1 skips flow control" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        // Version 3.1 — just below flow control threshold.
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.1" } },
+            .contains_command = "list-windows",
+        },
+    });
+}
+
+test "version gating: next- prefix parsed correctly" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        // Dev build: next-3.5 should enable flow control.
+        .{
+            .input = .{ .tmux = .{ .block_end = "next-3.5" } },
+            .contains_command = "refresh-client -f pause-after=",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+    });
+}
+
+test "version gating: unparseable version skips flow control" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        // Garbage version string — parsed_version is null, skip flow control.
+        .{
+            .input = .{ .tmux = .{ .block_end = "banana" } },
+            .contains_command = "list-windows",
+        },
+    });
+
+    try testing.expect(viewer.parsed_version == null);
 }
 
 test "flow control: pause sets pane paused and sends continue" {
