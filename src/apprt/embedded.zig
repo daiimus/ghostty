@@ -1711,6 +1711,30 @@ pub const CAPI = struct {
         return surface.core_surface.hasSelection();
     }
 
+    /// Returns the pixel bounds of the current selection in viewport
+    /// coordinates (points). Returns false if there is no selection or
+    /// if it is not visible in the viewport.
+    export fn ghostty_surface_selection_bounds(
+        surface: *Surface,
+        result: *SelectionBounds,
+    ) bool {
+        const bounds = surface.core_surface.selectionBounds() orelse return false;
+        result.* = .{
+            .start_x = bounds.start_x,
+            .start_y = bounds.start_y,
+            .end_x = bounds.end_x,
+            .end_y = bounds.end_y,
+        };
+        return true;
+    }
+
+    const SelectionBounds = extern struct {
+        start_x: f64,
+        start_y: f64,
+        end_x: f64,
+        end_y: f64,
+    };
+
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(

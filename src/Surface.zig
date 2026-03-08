@@ -2131,6 +2131,89 @@ pub fn hasSelection(self: *const Surface) bool {
     return self.activeTerminal().screens.active.selection != null;
 }
 
+/// The pixel bounds of a selection in viewport coordinates (points).
+/// Coordinates are in the same space as Text.Viewport (divided by content scale).
+pub const SelectionBounds = struct {
+    /// Top-left of the selection start (first selected cell, top-left corner).
+    start_x: f64,
+    start_y: f64,
+
+    /// Bottom-right of the selection end (last selected cell, bottom-right corner).
+    end_x: f64,
+    end_y: f64,
+};
+
+/// Returns the pixel bounds of the current selection in viewport coordinates
+/// (points, same space as Text.Viewport). Returns null if there is no
+/// selection or if the selection is not visible in the viewport.
+///
+/// Precondition: the renderer_state mutex must NOT be held.
+pub fn selectionBounds(self: *Surface) ?SelectionBounds {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    return self.selectionBoundsLocked();
+}
+
+/// Same as selectionBounds but the renderer_state mutex must already be held.
+pub fn selectionBoundsLocked(self: *Surface) ?SelectionBounds {
+    const t = self.activeTerminal();
+    const sel = t.screens.active.selection orelse return null;
+    const screen: *terminal.Screen = t.screens.active;
+
+    // Get the ordered top-left and bottom-right pins.
+    const tl_pin = sel.topLeft(screen);
+    const br_pin = sel.bottomRight(screen);
+
+    // Get viewport boundaries.
+    const vp_tl_pin = screen.pages.getTopLeft(.viewport);
+    const vp_br_pin = screen.pages.getBottomRight(.viewport) orelse return null;
+
+    // If the selection is entirely outside the viewport, return null.
+    if (br_pin.before(vp_tl_pin)) return null;
+    if (vp_br_pin.before(tl_pin)) return null;
+
+    // Compute viewport coordinates for both endpoints.
+    // If a pin is outside the viewport, clamp to the viewport edge.
+    const tl_pt: terminal.Point = screen.pages.pointFromPin(
+        .viewport,
+        tl_pin,
+    ) orelse .{ .viewport = .{} }; // Before viewport: top-left corner
+
+    const br_pt: terminal.Point = screen.pages.pointFromPin(
+        .viewport,
+        br_pin,
+    ) orelse screen.pages.pointFromPin(
+        .viewport,
+        vp_br_pin,
+    ).?; // After viewport: bottom-right of viewport
+
+    const tl_coord = tl_pt.coord();
+    const br_coord = br_pt.coord();
+
+    // Convert to pixel positions (in points, divided by content scale).
+    const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
+
+    // Start position: top-left corner of the first selected cell.
+    const start_x: f64 = (@as(f64, @floatFromInt(tl_coord.x * self.size.cell.width)) +
+        @as(f64, @floatFromInt(self.size.padding.left))) / content_scale.x;
+    const start_y: f64 = (@as(f64, @floatFromInt(tl_coord.y * self.size.cell.height)) +
+        @as(f64, @floatFromInt(self.size.padding.top))) / content_scale.y;
+
+    // End position: bottom-right corner of the last selected cell.
+    // We add one cell width/height to get the bottom-right corner.
+    const end_x: f64 = (@as(f64, @floatFromInt((br_coord.x + 1) * self.size.cell.width)) +
+        @as(f64, @floatFromInt(self.size.padding.left))) / content_scale.x;
+    const end_y: f64 = (@as(f64, @floatFromInt((br_coord.y + 1) * self.size.cell.height)) +
+        @as(f64, @floatFromInt(self.size.padding.top))) / content_scale.y;
+
+    return .{
+        .start_x = start_x,
+        .start_y = start_y,
+        .end_x = end_x,
+        .end_y = end_y,
+    };
+}
+
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lock();
