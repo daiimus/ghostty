@@ -711,16 +711,17 @@ pub const TmuxExit = struct {
     // Sync with: ghostty_action_tmux_exit_s
     // Reason is stored inline to avoid dangling-pointer issues when
     // the C struct outlives the Zig Action union (the generic cval()
-    // path captures union payloads by value). 23 bytes is sufficient
-    // for all known tmux exit reasons ("detached", "server-exited", etc.).
+    // path captures union payloads by value). 15 bytes is sufficient
+    // for all known tmux exit reasons ("detached", "server-exited",
+    // etc.) and keeps sizeof(C) == 16 for 32-bit ABI compatibility.
     pub const C = extern struct {
-        reason: [23]u8,
+        reason: [15]u8,
         reason_len: u8,
     };
 
     pub fn cval(self: TmuxExit) C {
-        const len: u8 = @intCast(@min(self.reason_len, 23));
-        var c: C = .{ .reason = .{0} ** 23, .reason_len = len };
+        const len: u8 = @intCast(@min(self.reason_len, 15));
+        var c: C = .{ .reason = .{0} ** 15, .reason_len = len };
         @memcpy(c.reason[0..len], self.reason[0..len]);
         return c;
     }

@@ -2448,13 +2448,13 @@ pub const CAPI = struct {
         const handler = &surface.core_surface.io.terminal_stream.handler;
         if (comptime !@TypeOf(handler.*).tmux_enabled) return;
 
-        // Check that we're actually in tmux control mode before
-        // sending raw bytes — without this guard, `detach-client\n`
-        // would be written to the PTY as user input.
+        // Hold the mutex through the entire check-and-queue sequence
+        // to prevent a TOCTOU race where the viewer could be torn down
+        // between the tmux-mode check and the message queue operation.
         surface.core_surface.renderer_state.mutex.lock();
-        const in_tmux = handler.tmux_viewer != null;
-        surface.core_surface.renderer_state.mutex.unlock();
-        if (!in_tmux) return;
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        if (handler.tmux_viewer == null) return;
 
         const io = &surface.core_surface.io;
         const msg = termio.Message.writeReqDirect(
@@ -2464,7 +2464,7 @@ pub const CAPI = struct {
             log.warn("failed to create tmux detach message err={}", .{err});
             return;
         };
-        io.queueMessage(msg, .unlocked);
+        io.queueMessage(msg, .locked);
     }
 
     /// Debug: Get terminal state for debugging scrollback issues
