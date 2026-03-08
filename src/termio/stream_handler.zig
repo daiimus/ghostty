@@ -601,6 +601,16 @@ pub const StreamHandler = struct {
                                 },
                             });
                         },
+
+                        .message => |text| {
+                            const data = try apprt.surface.Message.WriteReq.init(
+                                self.alloc,
+                                text,
+                            );
+                            self.surfaceMessageWriter(.{
+                                .tmux_message = data,
+                            });
+                        },
                     }
                 }
             },

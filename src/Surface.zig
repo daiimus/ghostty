@@ -1284,6 +1284,22 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             // Free the mailbox-owned copy after the action is consumed.
             resp.deinit();
         },
+
+        .tmux_message => |tmux_msg| {
+            const text = tmux_msg.slice();
+            log.info("tmux message: {s}", .{text});
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_message,
+                .{
+                    .data = text.ptr,
+                    .len = text.len,
+                },
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux message err={}", .{err});
+            };
+            tmux_msg.deinit();
+        },
     }
 }
 
