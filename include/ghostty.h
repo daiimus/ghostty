@@ -876,6 +876,12 @@ typedef struct {
   bool is_error;
 } ghostty_action_tmux_command_response_s;
 
+// apprt.action.TmuxExit
+typedef struct {
+  char reason[23];
+  uint8_t reason_len;
+} ghostty_action_tmux_exit_s;
+
 // terminal.Scrollbar
 typedef struct {
   uint64_t total;
@@ -995,6 +1001,7 @@ typedef union {
   ghostty_action_readonly_e readonly;
   ghostty_action_tmux_state_changed_s tmux_state_changed;
   ghostty_action_tmux_command_response_s tmux_command_response;
+  ghostty_action_tmux_exit_s tmux_exit;
 } ghostty_action_u;
 
 typedef struct {
@@ -1273,6 +1280,10 @@ void ghostty_surface_tmux_detach_pane(ghostty_surface_t target);
 // the tmux_command_response action callback. Returns true if queued/sent,
 // false if not in tmux mode or on error.
 bool ghostty_surface_tmux_send_command(ghostty_surface_t, const char*, size_t);
+
+// Request graceful detach from the tmux session. Sends detach-client to tmux,
+// which causes tmux to send %exit (triggering normal cleanup). Thread-safe.
+void ghostty_surface_tmux_detach(ghostty_surface_t surface);
 #endif
 
 ghostty_inspector_t ghostty_surface_inspector(ghostty_surface_t);

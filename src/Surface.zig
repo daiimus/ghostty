@@ -1240,12 +1240,17 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
-        .tmux_exit => {
-            log.info("tmux control mode exited", .{});
+        .tmux_exit => |exit_reason| {
+            const reason = exit_reason.reasonSlice();
+            if (reason.len > 0) {
+                log.info("tmux control mode exited, reason={s}", .{reason});
+            } else {
+                log.info("tmux control mode exited", .{});
+            }
             _ = self.rt_app.performAction(
                 .{ .surface = self },
                 .tmux_exit,
-                {},
+                apprt.action.TmuxExit.init(reason),
             ) catch |err| {
                 log.warn("apprt failed to notify tmux exit err={}", .{err});
             };

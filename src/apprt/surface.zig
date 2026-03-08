@@ -114,7 +114,9 @@ pub const Message = union(enum) {
     tmux_state_changed: TmuxState,
 
     /// tmux control mode: session exited
-    tmux_exit: void,
+    /// The reason buffer contains the human-readable exit reason
+    /// from tmux (e.g., "detached", "server-exited").
+    tmux_exit: TmuxExitReason,
 
     /// tmux control mode: viewer startup complete, user input safe to send
     tmux_ready: void,
@@ -152,6 +154,24 @@ pub const Message = union(enum) {
 
         pub fn deinit(self: TmuxCommandResponse) void {
             self.data.deinit();
+        }
+    };
+
+    /// tmux exit reason sent via the surface message mailbox.
+    pub const TmuxExitReason = struct {
+        reason: [128]u8 = .{0} ** 128,
+        reason_len: u8 = 0,
+
+        pub fn init(reason_str: []const u8) TmuxExitReason {
+            var result: TmuxExitReason = .{};
+            const len: u8 = @intCast(@min(reason_str.len, result.reason.len));
+            @memcpy(result.reason[0..len], reason_str[0..len]);
+            result.reason_len = len;
+            return result;
+        }
+
+        pub fn reasonSlice(self: *const TmuxExitReason) []const u8 {
+            return self.reason[0..self.reason_len];
         }
     };
 

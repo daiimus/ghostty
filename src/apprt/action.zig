@@ -344,7 +344,7 @@ pub const Action = union(Key) {
     tmux_state_changed: TmuxStateChanged,
 
     /// tmux control mode: exited
-    tmux_exit: void,
+    tmux_exit: TmuxExit,
 
     /// tmux control mode: viewer startup complete, user input safe to send
     tmux_ready: void,
@@ -685,6 +685,44 @@ pub const TmuxCommandResponse = struct {
             .len = self.len,
             .is_error = self.is_error,
         };
+    }
+};
+
+/// tmux control mode exit notification with reason
+pub const TmuxExit = struct {
+    /// Human-readable reason for the exit (e.g., "detached",
+    /// "server-exited"). Stored in a fixed-size buffer to avoid
+    /// lifetime issues across the message mailbox boundary.
+    reason: [128]u8 = .{0} ** 128,
+    reason_len: u8 = 0,
+
+    pub fn init(reason: []const u8) TmuxExit {
+        var result: TmuxExit = .{};
+        const len: u8 = @intCast(@min(reason.len, result.reason.len));
+        @memcpy(result.reason[0..len], reason[0..len]);
+        result.reason_len = len;
+        return result;
+    }
+
+    pub fn reasonSlice(self: *const TmuxExit) []const u8 {
+        return self.reason[0..self.reason_len];
+    }
+
+    // Sync with: ghostty_action_tmux_exit_s
+    // Reason is stored inline to avoid dangling-pointer issues when
+    // the C struct outlives the Zig Action union (the generic cval()
+    // path captures union payloads by value). 23 bytes is sufficient
+    // for all known tmux exit reasons ("detached", "server-exited", etc.).
+    pub const C = extern struct {
+        reason: [23]u8,
+        reason_len: u8,
+    };
+
+    pub fn cval(self: TmuxExit) C {
+        const len: u8 = @intCast(@min(self.reason_len, 23));
+        var c: C = .{ .reason = .{0} ** 23, .reason_len = len };
+        @memcpy(c.reason[0..len], self.reason[0..len]);
+        return c;
     }
 };
 

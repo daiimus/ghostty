@@ -202,7 +202,7 @@ pub const Handler = struct {
 
             .tmux => if (comptime build_options.tmux_control_mode) tmux: {
                 self.state.deinit();
-                break :tmux .{ .tmux = .exit };
+                break :tmux .{ .tmux = .{ .exit = .{ .reason = "" } } };
             } else unreachable,
 
             .xtgettcap => |*list| xtgettcap: {
@@ -462,6 +462,7 @@ test "tmux enter and implicit exit" {
         defer cmd.deinit();
         try testing.expect(cmd == .tmux);
         try testing.expect(cmd.tmux == .exit);
+        try testing.expectEqualStrings("", cmd.tmux.exit.reason);
     }
 }
 
@@ -579,6 +580,7 @@ test "tmux: 7-bit ST exits tmux control mode" {
     defer cmd.deinit();
     try testing.expect(cmd == .tmux);
     try testing.expect(cmd.tmux == .exit);
+    try testing.expectEqualStrings("", cmd.tmux.exit.reason);
     try testing.expect(h.state == .inactive);
 }
 
