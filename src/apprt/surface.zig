@@ -126,6 +126,10 @@ pub const Message = union(enum) {
     /// `%begin`/`%end` (or `%error`). Must be freed by the receiver.
     tmux_command_response: TmuxCommandResponse,
 
+    /// tmux display-message notification. The payload is the message
+    /// text, copied via WriteReq.
+    tmux_message: WriteReq,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 

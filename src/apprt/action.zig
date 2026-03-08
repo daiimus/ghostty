@@ -352,6 +352,9 @@ pub const Action = union(Key) {
     /// tmux control mode: response to a user command
     tmux_command_response: TmuxCommandResponse,
 
+    /// tmux control mode: display-message notification
+    tmux_message: TmuxMessage,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -422,6 +425,7 @@ pub const Action = union(Key) {
         tmux_exit,
         tmux_ready,
         tmux_command_response,
+        tmux_message,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -684,6 +688,28 @@ pub const TmuxCommandResponse = struct {
             .data = self.data,
             .len = self.len,
             .is_error = self.is_error,
+        };
+    }
+};
+
+/// tmux control mode `%message` notification.
+/// Carries the message text sent by tmux's `display-message` command.
+pub const TmuxMessage = struct {
+    /// Pointer to the message text.
+    data: [*]const u8,
+    /// Length of the message text.
+    len: usize,
+
+    // Sync with: ghostty_action_tmux_message_s
+    pub const C = extern struct {
+        data: [*]const u8,
+        len: usize,
+    };
+
+    pub fn cval(self: TmuxMessage) C {
+        return .{
+            .data = self.data,
+            .len = self.len,
         };
     }
 };
