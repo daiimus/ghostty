@@ -1311,6 +1311,81 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 log.warn("apprt failed to notify tmux active window change err={}", .{err});
             };
         },
+
+        .tmux_paste_buffer_changed => |req| {
+            const name = req.slice();
+            log.info("tmux paste buffer changed: {s}", .{name});
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_paste_buffer_changed,
+                .{ .data = name.ptr, .len = name.len },
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux paste buffer changed err={}", .{err});
+            };
+            req.deinit();
+        },
+
+        .tmux_paste_buffer_deleted => |req| {
+            const name = req.slice();
+            log.info("tmux paste buffer deleted: {s}", .{name});
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_paste_buffer_deleted,
+                .{ .data = name.ptr, .len = name.len },
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux paste buffer deleted err={}", .{err});
+            };
+            req.deinit();
+        },
+
+        .tmux_sessions_changed => {
+            log.info("tmux sessions changed", .{});
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_sessions_changed,
+                {},
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux sessions changed err={}", .{err});
+            };
+        },
+
+        .tmux_pane_mode_changed => |pane_id| {
+            log.info("tmux pane mode changed: %{}", .{pane_id});
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_pane_mode_changed,
+                .{ .pane_id = pane_id },
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux pane mode changed err={}", .{err});
+            };
+        },
+
+        .tmux_session_renamed => |req| {
+            const name = req.slice();
+            log.info("tmux session renamed: {s}", .{name});
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_session_renamed,
+                .{ .data = name.ptr, .len = name.len },
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux session renamed err={}", .{err});
+            };
+            req.deinit();
+        },
+
+        .tmux_focused_pane_changed => |info| {
+            log.info("tmux focused pane changed: @{} %{}", .{ info.window_id, info.pane_id });
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_focused_pane_changed,
+                .{
+                    .window_id = info.window_id,
+                    .pane_id = info.pane_id,
+                },
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux focused pane changed err={}", .{err});
+            };
+        },
     }
 }
 

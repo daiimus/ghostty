@@ -134,6 +134,32 @@ pub const Message = union(enum) {
     /// Sent when the user switches windows via tmux (e.g., prefix+n).
     tmux_active_window_changed: usize,
 
+    /// tmux paste buffer was created or modified. Payload is the buffer
+    /// name, copied via WriteReq.
+    tmux_paste_buffer_changed: WriteReq,
+
+    /// tmux paste buffer was deleted. Payload is the buffer name,
+    /// copied via WriteReq.
+    tmux_paste_buffer_deleted: WriteReq,
+
+    /// tmux session(s) created or destroyed. No payload.
+    tmux_sessions_changed: void,
+
+    /// A pane's mode changed (entered/exited copy-mode, etc.).
+    /// Payload is the pane ID.
+    tmux_pane_mode_changed: usize,
+
+    /// tmux session was renamed. Payload is the new session name,
+    /// copied via WriteReq.
+    tmux_session_renamed: WriteReq,
+
+    /// The focused pane within a window changed. Payload carries
+    /// both the window ID and the new focused pane ID.
+    tmux_focused_pane_changed: struct {
+        window_id: usize,
+        pane_id: usize,
+    },
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 

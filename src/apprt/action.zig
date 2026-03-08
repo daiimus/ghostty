@@ -358,6 +358,24 @@ pub const Action = union(Key) {
     /// tmux control mode: active window changed
     tmux_active_window_changed: TmuxActiveWindowChanged,
 
+    /// tmux control mode: paste buffer content changed
+    tmux_paste_buffer_changed: TmuxPasteBufferChanged,
+
+    /// tmux control mode: paste buffer deleted
+    tmux_paste_buffer_deleted: TmuxPasteBufferDeleted,
+
+    /// tmux control mode: session list changed
+    tmux_sessions_changed: void,
+
+    /// tmux control mode: pane entered/exited a special mode (copy, etc.)
+    tmux_pane_mode_changed: TmuxPaneModeChanged,
+
+    /// tmux control mode: current session was renamed
+    tmux_session_renamed: TmuxSessionRenamed,
+
+    /// tmux control mode: focused pane changed within a window
+    tmux_focused_pane_changed: TmuxFocusedPaneChanged,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -430,6 +448,12 @@ pub const Action = union(Key) {
         tmux_command_response,
         tmux_message,
         tmux_active_window_changed,
+        tmux_paste_buffer_changed,
+        tmux_paste_buffer_deleted,
+        tmux_sessions_changed,
+        tmux_pane_mode_changed,
+        tmux_session_renamed,
+        tmux_focused_pane_changed,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -769,6 +793,112 @@ pub const TmuxActiveWindowChanged = struct {
     pub fn cval(self: TmuxActiveWindowChanged) C {
         return .{
             .window_id = @intCast(self.window_id),
+        };
+    }
+};
+
+/// tmux control mode `%paste-buffer-changed` notification.
+/// Carries the buffer name that was created or modified.
+pub const TmuxPasteBufferChanged = struct {
+    /// Pointer to the buffer name.
+    data: [*]const u8,
+    /// Length of the buffer name.
+    len: usize,
+
+    // Sync with: ghostty_action_tmux_paste_buffer_changed_s
+    pub const C = extern struct {
+        data: [*]const u8,
+        len: usize,
+    };
+
+    pub fn cval(self: TmuxPasteBufferChanged) C {
+        return .{
+            .data = self.data,
+            .len = self.len,
+        };
+    }
+};
+
+/// tmux control mode `%paste-buffer-deleted` notification.
+/// Carries the buffer name that was deleted.
+pub const TmuxPasteBufferDeleted = struct {
+    /// Pointer to the buffer name.
+    data: [*]const u8,
+    /// Length of the buffer name.
+    len: usize,
+
+    // Sync with: ghostty_action_tmux_paste_buffer_deleted_s
+    pub const C = extern struct {
+        data: [*]const u8,
+        len: usize,
+    };
+
+    pub fn cval(self: TmuxPasteBufferDeleted) C {
+        return .{
+            .data = self.data,
+            .len = self.len,
+        };
+    }
+};
+
+/// tmux control mode `%pane-mode-changed` notification.
+/// Carries the pane ID whose mode changed.
+pub const TmuxPaneModeChanged = struct {
+    /// The numeric pane ID (from `%<id>`).
+    pane_id: usize,
+
+    // Sync with: ghostty_action_tmux_pane_mode_changed_s
+    pub const C = extern struct {
+        pane_id: u32,
+    };
+
+    pub fn cval(self: TmuxPaneModeChanged) C {
+        return .{
+            .pane_id = @intCast(self.pane_id),
+        };
+    }
+};
+
+/// tmux control mode `%session-renamed` notification.
+/// Carries the new session name.
+pub const TmuxSessionRenamed = struct {
+    /// Pointer to the new session name.
+    data: [*]const u8,
+    /// Length of the new session name.
+    len: usize,
+
+    // Sync with: ghostty_action_tmux_session_renamed_s
+    pub const C = extern struct {
+        data: [*]const u8,
+        len: usize,
+    };
+
+    pub fn cval(self: TmuxSessionRenamed) C {
+        return .{
+            .data = self.data,
+            .len = self.len,
+        };
+    }
+};
+
+/// tmux control mode `%window-pane-changed` / focused pane changed.
+/// Carries the window and pane IDs.
+pub const TmuxFocusedPaneChanged = struct {
+    /// The numeric window ID (from `@<id>`).
+    window_id: usize,
+    /// The numeric pane ID (from `%<id>`).
+    pane_id: usize,
+
+    // Sync with: ghostty_action_tmux_focused_pane_changed_s
+    pub const C = extern struct {
+        window_id: u32,
+        pane_id: u32,
+    };
+
+    pub fn cval(self: TmuxFocusedPaneChanged) C {
+        return .{
+            .window_id = @intCast(self.window_id),
+            .pane_id = @intCast(self.pane_id),
         };
     }
 };
