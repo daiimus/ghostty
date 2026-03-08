@@ -449,26 +449,28 @@ pub inline fn queueWrite(
             defer self.renderer_state.mutex.unlock();
 
             if (v.sendKeys(data)) |action| {
-                v.trackFireAndForget();
                 try self.backend.queueWrite(
                     self.alloc,
                     td,
                     action.send_keys,
                     false,
                 );
+                // Increment after successful write so the counter
+                // stays consistent if queueWrite errors.
+                v.trackFireAndForget();
             } else {
                 log.warn("tmux send-keys returned null for {} byte(s), input dropped", .{data.len});
             }
             // Handle linefeed as a separate send-keys for CR.
             if (linefeed) {
                 if (v.sendKeys(&[_]u8{'\r'})) |action| {
-                    v.trackFireAndForget();
                     try self.backend.queueWrite(
                         self.alloc,
                         td,
                         action.send_keys,
                         false,
                     );
+                    v.trackFireAndForget();
                 }
             }
             return;
