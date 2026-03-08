@@ -29,6 +29,22 @@ pub const Parser = struct {
     /// exited and future data dropped).
     max_bytes: usize = 1024 * 1024,
 
+    /// The block ID from the most recent %begin line. Used to validate
+    /// that %end/%error matches the corresponding %begin. The format is
+    /// the raw suffix after "%begin " (e.g. "1234 56 0"). Stored in a
+    /// fixed buffer because the parser's main buffer is cleared between
+    /// %begin and %end/%error.
+    block_id_buf: [64]u8 = undefined,
+    block_id_len: u8 = 0,
+
+    /// Returns the stored block ID, or null if none is stored.
+    pub fn blockId(self: *const Parser) ?[]const u8 {
+        return if (self.block_id_len > 0)
+            self.block_id_buf[0..self.block_id_len]
+        else
+            null;
+    }
+
     const State = enum {
         /// Outside of any active notifications. This should drop any output
         /// unless it is '%' on the first byte of a line. The buffer will be
@@ -160,6 +176,21 @@ pub const Parser = struct {
                     const err = std.mem.startsWith(u8, line, "%error");
                     const output = std.mem.trimRight(u8, written[0..idx], "\r\n");
 
+                    // Validate that the block ID matches the corresponding %begin.
+                    // Format: "%end <id>" or "%error <id>" where <id> should match
+                    // the <id> from the "%begin <id>" that opened this block.
+                    const tag = if (err) "%error" else "%end";
+                    const end_id = std.mem.trimLeft(u8, line[tag.len..], " ");
+                    if (self.blockId()) |begin_id| {
+                        if (!std.mem.eql(u8, begin_id, end_id)) {
+                            log.warn(
+                                "tmux block ID mismatch: begin={s} end={s}",
+                                .{ begin_id, end_id },
+                            );
+                        }
+                    }
+                    self.block_id_len = 0;
+
                     // If it is an error then log it.
                     if (err) log.warn("tmux control mode error={s}", .{output});
 
@@ -198,11 +229,20 @@ pub const Parser = struct {
         // The notification MUST exist because we guard entering the notification
         // state on seeing at least a '%'.
         if (std.mem.eql(u8, cmd, "%begin")) {
-            // We don't use the rest of the tokens for now because tmux
-            // claims to guarantee that begin/end are always in order and
-            // never intermixed. In the future, we should probably validate
-            // this.
-            // TODO(tmuxcc): do this before merge?
+            // Store the block ID (everything after "%begin ") so we can
+            // validate that the corresponding %end/%error has a matching ID.
+            // The format is: %begin <timestamp> <command_number> <flags>
+            const id_start = "%begin".len;
+            const id = if (id_start < line.len)
+                std.mem.trimLeft(u8, line[id_start..], " ")
+            else
+                "";
+            if (id.len > 0 and id.len <= self.block_id_buf.len) {
+                @memcpy(self.block_id_buf[0..id.len], id);
+                self.block_id_len = @intCast(id.len);
+            } else {
+                self.block_id_len = 0;
+            }
 
             // Move to block state because we expect a corresponding end/error
             // and want to accumulate the data.
@@ -1667,4 +1707,64 @@ test "tmux unlinked-window-renamed" {
     try testing.expect(n == .unlinked_window_renamed);
     try testing.expectEqual(8, n.unlinked_window_renamed.id);
     try testing.expectEqualStrings("vim main.zig", n.unlinked_window_renamed.name);
+}
+
+test "tmux block_id stored on begin and cleared on end" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // After %begin, block_id should be set.
+    for ("%begin 1578922740 269 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expectEqualStrings("1578922740 269 1", c.blockId().?);
+
+    // After matching %end, block_id should be cleared.
+    for ("%end 1578922740 269 1") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_end);
+    try testing.expect(c.blockId() == null);
+}
+
+test "tmux block_id mismatch still returns notification" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // Begin with one ID.
+    for ("%begin 1578922740 269 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expectEqualStrings("1578922740 269 1", c.blockId().?);
+
+    // End with a different ID — should still produce notification (warning
+    // is logged but we don't go defunct). This exercises the code path where
+    // a send-keys response interleaves with a queued command.
+    for ("hello\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%end 9999999999 999 0") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_end);
+    try testing.expectEqualStrings("hello", n.block_end);
+    // block_id should be cleared even on mismatch.
+    try testing.expect(c.blockId() == null);
+}
+
+test "tmux block_id mismatch on error still returns notification" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    for ("%begin 1000 1 0\n") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expectEqualStrings("1000 1 0", c.blockId().?);
+
+    // Error with mismatched ID.
+    for ("bad command\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%error 2000 2 0") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_err);
+    try testing.expectEqualStrings("bad command", n.block_err);
+    try testing.expect(c.blockId() == null);
 }

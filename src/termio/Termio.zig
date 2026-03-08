@@ -449,6 +449,7 @@ pub inline fn queueWrite(
             defer self.renderer_state.mutex.unlock();
 
             if (v.sendKeys(data)) |action| {
+                v.trackFireAndForget();
                 try self.backend.queueWrite(
                     self.alloc,
                     td,
@@ -461,6 +462,7 @@ pub inline fn queueWrite(
             // Handle linefeed as a separate send-keys for CR.
             if (linefeed) {
                 if (v.sendKeys(&[_]u8{'\r'})) |action| {
+                    v.trackFireAndForget();
                     try self.backend.queueWrite(
                         self.alloc,
                         td,
