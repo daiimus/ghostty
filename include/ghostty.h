@@ -878,7 +878,7 @@ typedef struct {
 
 // apprt.action.TmuxExit
 typedef struct {
-  const char *reason;
+  char reason[23];
   uint8_t reason_len;
 } ghostty_action_tmux_exit_s;
 

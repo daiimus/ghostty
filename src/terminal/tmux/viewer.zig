@@ -6751,7 +6751,8 @@ test "error response for pane capture is skipped gracefully" {
 }
 
 test "flow control: wait-exit in enable_flow_control command" {
-    // Verify that the enable_flow_control command includes wait-exit
+    // Verify that the enable_flow_control command includes wait-exit.
+    // Drive the full init sequence to the point where flow control is emitted.
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
 
@@ -6763,14 +6764,19 @@ test "flow control: wait-exit in enable_flow_control command" {
                 .id = 1,
                 .name = "$0",
             } } },
+            // First command in queue: tmux_version (display-message)
+            .contains_command = "display-message",
+        },
+        // Version response completes tmux_version → triggers enable_flow_control
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_tags = &.{.command},
             .check = (struct {
                 fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    // Find the command that contains refresh-client -f
                     for (actions) |action| {
                         if (action == .command) {
                             if (std.mem.indexOf(u8, action.command, "refresh-client -f")) |_| {
-                                // Verify it contains wait-exit
+                                // The flow control command MUST contain wait-exit
                                 try testing.expect(
                                     std.mem.indexOf(u8, action.command, "wait-exit") != null,
                                 );
@@ -6778,9 +6784,8 @@ test "flow control: wait-exit in enable_flow_control command" {
                             }
                         }
                     }
-                    // The flow control command might not be in this batch
-                    // (it's queued and will be sent after the first command
-                    // completes), so not finding it here is acceptable.
+                    // Flow control command must be present at this point
+                    return error.FlowControlCommandNotFound;
                 }
             }).check,
         },

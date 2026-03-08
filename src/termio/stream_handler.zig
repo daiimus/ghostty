@@ -395,11 +395,12 @@ pub const StreamHandler = struct {
                     },
 
                     .exit => |exit_info| {
-                        // Extract the exit reason before any cleanup.
-                        // The reason string references the control parser's
-                        // buffer which will be invalidated during cleanup.
-                        const reason = exit_info.reason;
-                        log.info("tmux control mode %exit received, reason=\"{s}\"", .{reason});
+                        // Copy the exit reason into a fixed-size buffer
+                        // BEFORE any cleanup. The reason string references
+                        // the control parser's buffer which may be
+                        // invalidated when the viewer is freed.
+                        const exit_reason = apprt.surface.Message.TmuxExitReason.init(exit_info.reason);
+                        log.info("tmux control mode %exit received, reason=\"{s}\"", .{exit_reason.reasonSlice()});
 
                         // Acknowledge the %exit to tmux. With wait-exit
                         // enabled, tmux holds the connection open until it
@@ -442,12 +443,10 @@ pub const StreamHandler = struct {
 
                         // Notify the surface that tmux control mode
                         // has exited, including the exit reason. The
-                        // viewer's action-based exit path (from
-                        // viewer.next()) also sends this, but we bypass
-                        // viewer.next() entirely here since we're
-                        // handling the raw DCS %exit event.
+                        // reason was copied into exit_reason above
+                        // before viewer teardown, so this is safe.
                         self.surfaceMessageWriter(.{
-                            .tmux_exit = apprt.surface.Message.TmuxExitReason.init(reason),
+                            .tmux_exit = exit_reason,
                         });
 
                         // And always break since we assert below

@@ -2445,8 +2445,19 @@ pub const CAPI = struct {
     /// Request a graceful detach from the tmux session. Sends
     /// `detach-client` to tmux, which will cause tmux to send
     /// %exit back to the client (triggering normal cleanup).
-    /// Safe to call from any thread.
+    /// Safe to call from any thread. No-op if not in tmux mode.
     export fn ghostty_surface_tmux_detach(surface: *Surface) void {
+        const handler = &surface.core_surface.io.terminal_stream.handler;
+        if (comptime !@TypeOf(handler.*).tmux_enabled) return;
+
+        // Check that we're actually in tmux control mode before
+        // sending raw bytes — without this guard, `detach-client\n`
+        // would be written to the PTY as user input.
+        surface.core_surface.renderer_state.mutex.lock();
+        const in_tmux = handler.tmux_viewer != null;
+        surface.core_surface.renderer_state.mutex.unlock();
+        if (!in_tmux) return;
+
         const io = &surface.core_surface.io;
         const msg = termio.Message.writeReqDirect(
             io.alloc,
