@@ -2394,6 +2394,54 @@ pub const CAPI = struct {
         target.core_surface.renderer_thread.wakeup.notify() catch {};
     }
 
+    /// Send an arbitrary tmux command and receive the response
+    /// asynchronously via the `tmux_command_response` action.
+    ///
+    /// The command string should NOT include a trailing newline — it is
+    /// appended automatically. Example: "show-buffer" or "list-buffers".
+    ///
+    /// Returns true if the command was successfully queued (or sent
+    /// immediately), false if not in tmux control mode or on error.
+    ///
+    /// Acquires renderer_state.mutex to synchronize with processOutput.
+    export fn ghostty_surface_tmux_send_command(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) bool {
+        const handler = &surface.core_surface.io.terminal_stream.handler;
+        if (comptime !@TypeOf(handler.*).tmux_enabled) return false;
+
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const viewer = handler.tmux_viewer orelse return false;
+
+        // Append a trailing newline to the command. The viewer expects
+        // commands to include the newline.
+        const cmd = std.fmt.allocPrint(viewer.alloc, "{s}\n", .{ptr[0..len]}) catch return false;
+        defer viewer.alloc.free(cmd);
+
+        const action = viewer.queueUserCommand(cmd) catch return false;
+
+        if (action) |act| {
+            switch (act) {
+                .command => |command_str| {
+                    // Need to send this command to tmux stdin immediately.
+                    // Use writeReqDirect to bypass tmux send-keys wrapping.
+                    const msg = termio.Message.writeReqDirect(
+                        surface.core_surface.alloc,
+                        command_str,
+                    ) catch return false;
+                    surface.core_surface.io.queueMessage(msg, .locked);
+                },
+                else => {},
+            }
+        }
+
+        return true;
+    }
+
     /// Debug: Get terminal state for debugging scrollback issues
     export fn ghostty_surface_debug_terminal_state(surface: *Surface) Darwin.TerminalDebugState {
         surface.core_surface.renderer_state.mutex.lock();

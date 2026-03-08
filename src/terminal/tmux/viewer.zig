@@ -244,6 +244,13 @@ pub const Viewer = struct {
         /// commands.
         ready,
 
+        /// Response to a user command queued via `queueUserCommand`.
+        /// Contains the block content returned by tmux between
+        /// `%begin`/`%end` (or `%error`). The `is_error` flag indicates
+        /// whether the response was a `%error` block. The `content` slice
+        /// is valid until the next call to `next()`.
+        command_response: CommandResponse,
+
         /// Send a `send-keys` command directly to tmux stdin for user
         /// input routing. Unlike `command`, this is fire-and-forget and
         /// must NOT go through the command queue (which would serialize
@@ -274,6 +281,15 @@ pub const Viewer = struct {
                 try writer.writeAll(" }");
             }
         }
+    };
+
+    /// Response from a user-initiated tmux command.
+    pub const CommandResponse = struct {
+        /// The block content returned by tmux. Points into the parser's
+        /// buffer and is valid until the next call to `next()`.
+        content: []const u8,
+        /// Whether the response was a `%error` block.
+        is_error: bool,
     };
 
     pub const Input = union(enum) {
@@ -481,6 +497,46 @@ pub const Viewer = struct {
         }
 
         return .{ .send_keys = buf[0..pos] };
+    }
+
+    /// Queue a user command to be sent through the tmux command queue.
+    /// The response will arrive as a `command_response` action in a
+    /// subsequent call to `next()`.
+    ///
+    /// If the command queue is empty (no command in flight), this returns
+    /// a `.command` action that the caller must send to tmux immediately.
+    /// If a command is already in flight, the user command is appended to
+    /// the queue and will be sent automatically when the current command
+    /// completes — in that case, `null` is returned.
+    ///
+    /// `cmd` must include a trailing newline. The string is copied into
+    /// the viewer's allocator.
+    ///
+    /// Returns `null` if the viewer is not in `command_queue` state (e.g.,
+    /// during startup or after becoming defunct) or if the command was
+    /// queued behind an in-flight command. Returns error on allocation
+    /// failure.
+    pub fn queueUserCommand(self: *Viewer, cmd: []const u8) Allocator.Error!?Action {
+        if (self.state != .command_queue) return null;
+        if (cmd.len == 0) return null;
+
+        const was_empty = self.command_queue.empty();
+        const cmd_copy = try self.alloc.dupe(u8, cmd);
+        errdefer self.alloc.free(cmd_copy);
+
+        try self.command_queue.ensureUnusedCapacity(self.alloc, 1);
+        self.command_queue.appendAssumeCapacity(.{ .user = cmd_copy });
+
+        if (was_empty) {
+            // No command in flight — format and return the command to send.
+            var arena = self.action_arena.promote(self.alloc);
+            defer self.action_arena = arena.state;
+            var builder: std.Io.Writer.Allocating = .init(arena.allocator());
+            (Command{ .user = cmd_copy }).formatCommand(&builder.writer) catch
+                return error.OutOfMemory;
+            return .{ .command = builder.writer.buffered() };
+        }
+        return null;
     }
 
     /// Register an observer for a specific pane. The observer's
@@ -1262,7 +1318,15 @@ pub const Viewer = struct {
 
         // Process our command
         switch (command) {
-            .user => {},
+            .user => {
+                try actions.append(
+                    arena_alloc,
+                    .{ .command_response = .{
+                        .content = content,
+                        .is_error = is_err,
+                    } },
+                );
+            },
 
             .pane_state => try self.receivedPaneState(content),
 
@@ -5792,6 +5856,266 @@ test "pane state: mouse_all_flag takes precedence over lower mouse modes" {
                     try testing.expectEqual(.sgr, t.flags.mouse_format);
                 }
             }).check,
+        },
+    });
+}
+
+test "queueUserCommand returns command when queue is empty" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard startup sequence
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        // Receive initial window layout with one pane
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + pane_state commands (5 total for 1 pane)
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_tags = &.{.ready},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                    try testing.expectEqual(.command_queue, v.state);
+                    // Queue a user command — queue is empty so should return .command
+                    const action = try v.queueUserCommand("show-buffer\n");
+                    try testing.expect(action != null);
+                    try testing.expect(action.? == .command);
+                    // The formatted command should contain "show-buffer"
+                    try testing.expect(std.mem.indexOf(u8, action.?.command, "show-buffer") != null);
+                    // Should end with newline
+                    try testing.expect(std.mem.endsWith(u8, action.?.command, "\n"));
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "queueUserCommand returns null when queue has in-flight command" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard startup sequence
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        // Receive initial window layout with one pane — queue now has
+        // capture-pane commands in flight.
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(!v.command_queue.empty());
+                    // Queue a user command — queue is NOT empty, should return null
+                    const action = try v.queueUserCommand("list-buffers\n");
+                    try testing.expect(action == null);
+                    // But the command should still be queued
+                    try testing.expect(!v.command_queue.empty());
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "command_response emitted on user command block_end" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard startup sequence
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        // Receive initial window layout with one pane
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + pane_state commands
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_tags = &.{.ready},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                    // Queue a user command to get the .command action
+                    const action = try v.queueUserCommand("show-buffer\n");
+                    try testing.expect(action != null);
+                    try testing.expect(action.? == .command);
+                }
+            }).check,
+        },
+        // Now simulate the response arriving as a block_end with content
+        .{
+            .input = .{ .tmux = .{ .block_end = "buffer content here" } },
+            .contains_tags = &.{.command_response},
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    var found = false;
+                    for (actions) |action| {
+                        if (action == .command_response) {
+                            found = true;
+                            try testing.expectEqualStrings("buffer content here", action.command_response.content);
+                            try testing.expect(!action.command_response.is_error);
+                            break;
+                        }
+                    }
+                    try testing.expect(found);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "command_response with is_error on block_err" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard startup sequence
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "list-windows",
+        },
+        // Receive initial window layout with one pane
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0;@0;83;44;bash;b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain capture-pane + pane_state commands
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_tags = &.{.ready},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                    // Queue a user command
+                    const action = try v.queueUserCommand("delete-buffer -b nonexistent\n");
+                    try testing.expect(action != null);
+                    try testing.expect(action.? == .command);
+                }
+            }).check,
+        },
+        // Simulate error response from tmux
+        .{
+            .input = .{ .tmux = .{ .block_err = "no buffer nonexistent" } },
+            .contains_tags = &.{.command_response},
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    var found = false;
+                    for (actions) |action| {
+                        if (action == .command_response) {
+                            found = true;
+                            try testing.expectEqualStrings("no buffer nonexistent", action.command_response.content);
+                            try testing.expect(action.command_response.is_error);
+                            break;
+                        }
+                    }
+                    try testing.expect(found);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
         },
     });
 }

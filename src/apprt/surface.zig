@@ -119,6 +119,11 @@ pub const Message = union(enum) {
     /// tmux control mode: viewer startup complete, user input safe to send
     tmux_ready: void,
 
+    /// tmux control mode: response to a user command.
+    /// The content is the block data returned by tmux between
+    /// `%begin`/`%end` (or `%error`). Must be freed by the receiver.
+    tmux_command_response: TmuxCommandResponse,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
@@ -136,6 +141,18 @@ pub const Message = union(enum) {
         pane_ids: [32]usize,
         /// Actual number of pane IDs in the array
         pane_ids_len: usize,
+    };
+
+    /// Response to a user-initiated tmux command.
+    pub const TmuxCommandResponse = struct {
+        /// The response content. Must be freed via `deinit()`.
+        data: WriteReq,
+        /// Whether the response was a `%error` block.
+        is_error: bool,
+
+        pub fn deinit(self: TmuxCommandResponse) void {
+            self.data.deinit();
+        }
     };
 
     pub const ChildExited = extern struct {
