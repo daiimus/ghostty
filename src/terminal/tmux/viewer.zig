@@ -167,6 +167,9 @@ pub const Viewer = struct {
     /// The current session ID we're attached to.
     session_id: usize,
 
+    /// The current session name (updated on %session-renamed).
+    session_name: ?[]const u8 = null,
+
     /// The tmux server version string (e.g., "3.5a"). We capture this
     /// on startup because it will allow us to change behavior between
     /// versions as necessary.
@@ -357,6 +360,31 @@ pub const Viewer = struct {
         /// message text. Surfaced to the apprt so the UI can show it
         /// as a toast/banner.
         message: []const u8,
+
+        /// A paste buffer was created or modified. The payload is the
+        /// buffer name.
+        paste_buffer_changed: []const u8,
+
+        /// A paste buffer was deleted. The payload is the buffer name.
+        paste_buffer_deleted: []const u8,
+
+        /// A tmux session was created or destroyed. No payload — the
+        /// app should query `list-sessions` to get the updated list.
+        sessions_changed: void,
+
+        /// A pane's mode changed (entered or exited copy-mode, choose-mode,
+        /// etc.). The payload is the pane ID.
+        pane_mode_changed: usize,
+
+        /// A session was renamed. The payload is the new session name.
+        session_renamed: []const u8,
+
+        /// The focused pane within a window changed. The payload carries
+        /// both the window ID and new focused pane ID.
+        focused_pane_changed: struct {
+            window_id: usize,
+            pane_id: usize,
+        },
 
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
@@ -948,6 +976,7 @@ pub const Viewer = struct {
             // which pane tmux considers focused in each window (e.g.,
             // when switching windows, the apprt needs to highlight the
             // correct pane rather than falling back to the first pane).
+            // Also emit an action so the apprt can update focus indicators.
             .window_pane_changed => |info| {
                 for (self.windows.items) |*win| {
                     if (win.id == info.window_id) {
@@ -955,13 +984,30 @@ pub const Viewer = struct {
                         break;
                     }
                 }
+
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(arena.allocator(), .{
+                    .focused_pane_changed = .{
+                        .window_id = info.window_id,
+                        .pane_id = info.pane_id,
+                    },
+                }) catch {
+                    log.warn("failed to emit focused pane changed action", .{});
+                    return self.defunct();
+                };
             },
 
-            // We ignore this one. It means a session was created or
-            // destroyed. If it was our own session we will get an exit
-            // notification very soon. If it is another session we don't
-            // care.
-            .sessions_changed => {},
+            // A session was created or destroyed. Emit an action so
+            // the apprt can refresh its session list if it has one.
+            .sessions_changed => {
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(arena.allocator(), .{ .sessions_changed = {} }) catch {
+                    log.warn("failed to emit sessions changed action", .{});
+                    return self.defunct();
+                };
+            },
 
             // Window was renamed. Update our stored name and notify the apprt.
             .window_renamed => |info| {
@@ -1008,15 +1054,31 @@ pub const Viewer = struct {
             .client_session_changed,
             => {},
 
-            // Pane mode changes (copy mode, choose mode, etc.). The viewer
-            // doesn't track mode state — the apprt can observe this via the
-            // C API if it wants to show a UI indicator.
-            .pane_mode_changed => {},
+            // Pane mode changes (copy mode, choose mode, etc.). Emit
+            // an action so the apprt can show a UI indicator.
+            .pane_mode_changed => |info| {
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(arena.allocator(), .{ .pane_mode_changed = info.pane_id }) catch {
+                    log.warn("failed to emit pane mode changed action", .{});
+                    return self.defunct();
+                };
+            },
 
-            // Session renamed. We track sessions by ID, not name, so this
-            // is informational. The apprt can pick up the new name via
-            // session queries if needed.
-            .session_renamed => {},
+            // Session renamed. Update our stored session name and emit
+            // an action so the apprt can update its display.
+            .session_renamed => |info| {
+                if (info.id == self.session_id) {
+                    self.session_name = info.name;
+                }
+
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(arena.allocator(), .{ .session_renamed = info.name }) catch {
+                    log.warn("failed to emit session renamed action", .{});
+                    return self.defunct();
+                };
+            },
 
             // Unlinked window notifications are for windows in sessions other
             // than the one we're attached to. The viewer only manages the
@@ -1101,6 +1163,34 @@ pub const Viewer = struct {
                     log.warn("failed to append message action", .{});
                     return self.defunct();
                 };
+            },
+
+            // Paste buffer created or modified. Surface to the apprt so
+            // it can auto-sync clipboard if desired.
+            .paste_buffer_changed => |name| {
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(arena.allocator(), .{ .paste_buffer_changed = name }) catch {
+                    log.warn("failed to append paste buffer changed action", .{});
+                    return self.defunct();
+                };
+            },
+
+            // Paste buffer deleted. Surface to the apprt.
+            .paste_buffer_deleted => |name| {
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(arena.allocator(), .{ .paste_buffer_deleted = name }) catch {
+                    log.warn("failed to append paste buffer deleted action", .{});
+                    return self.defunct();
+                };
+            },
+
+            // Configuration file error. Log as a warning — this is
+            // informational and not critical enough to surface to the
+            // apprt as an action.
+            .config_error => |text| {
+                log.warn("tmux config error: {s}", .{text});
             },
         }
 

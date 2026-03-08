@@ -617,6 +617,57 @@ pub const StreamHandler = struct {
                                 .tmux_active_window_changed = window_id,
                             });
                         },
+
+                        .paste_buffer_changed => |name| {
+                            const data = try apprt.surface.Message.WriteReq.init(
+                                self.alloc,
+                                name,
+                            );
+                            self.surfaceMessageWriter(.{
+                                .tmux_paste_buffer_changed = data,
+                            });
+                        },
+
+                        .paste_buffer_deleted => |name| {
+                            const data = try apprt.surface.Message.WriteReq.init(
+                                self.alloc,
+                                name,
+                            );
+                            self.surfaceMessageWriter(.{
+                                .tmux_paste_buffer_deleted = data,
+                            });
+                        },
+
+                        .sessions_changed => {
+                            self.surfaceMessageWriter(.{
+                                .tmux_sessions_changed = {},
+                            });
+                        },
+
+                        .pane_mode_changed => |pane_id| {
+                            self.surfaceMessageWriter(.{
+                                .tmux_pane_mode_changed = pane_id,
+                            });
+                        },
+
+                        .session_renamed => |name| {
+                            const data = try apprt.surface.Message.WriteReq.init(
+                                self.alloc,
+                                name,
+                            );
+                            self.surfaceMessageWriter(.{
+                                .tmux_session_renamed = data,
+                            });
+                        },
+
+                        .focused_pane_changed => |info| {
+                            self.surfaceMessageWriter(.{
+                                .tmux_focused_pane_changed = .{
+                                    .window_id = info.window_id,
+                                    .pane_id = info.pane_id,
+                                },
+                            });
+                        },
                     }
                 }
             },
