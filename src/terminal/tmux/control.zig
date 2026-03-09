@@ -210,10 +210,10 @@ pub const Parser = struct {
             if (line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
             break :line line;
         };
-        const cmd = cmd: {
-            const idx = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
-            break :cmd line[0..idx];
-        };
+        const space_pos = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+        const cmd = line[0..space_pos];
+        // Payload after the command token (empty if no space follows the command).
+        const payload = if (space_pos < line.len) line[space_pos + 1 ..] else "";
 
         // The notification MUST exist because we guard entering the notification
         // state on seeing at least a '%'.
@@ -221,11 +221,7 @@ pub const Parser = struct {
             // Store the block ID (everything after "%begin ") so we can
             // validate that the corresponding %end/%error has a matching ID.
             // The format is: %begin <timestamp> <command_number> <flags>
-            const id_start = "%begin".len;
-            const id = if (id_start < line.len)
-                std.mem.trim(u8, line[id_start..], " \r\n\t")
-            else
-                "";
+            const id = std.mem.trim(u8, payload, " \r\n\t");
             if (id.len > 0 and id.len <= self.block_id_buf.len) {
                 @memcpy(self.block_id_buf[0..id.len], id);
                 self.block_id_len = @intCast(id.len);
@@ -240,7 +236,7 @@ pub const Parser = struct {
             return null;
         } else if (std.mem.eql(u8, cmd, "%output")) cmd: {
             // Format: %output %<pane_id> <data>
-            const rest = line["%output ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '%') break :cmd;
             const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
             const id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
@@ -259,7 +255,7 @@ pub const Parser = struct {
             return .{ .output = .{ .pane_id = id, .data = data } };
         } else if (std.mem.eql(u8, cmd, "%session-changed")) cmd: {
             // Format: %session-changed $<session_id> <name>
-            const rest = line["%session-changed ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '$') break :cmd;
             const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
             const id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
@@ -271,11 +267,8 @@ pub const Parser = struct {
             // Important: do not clear buffer here since name points to it
             self.state = .idle;
             return .{ .session_changed = .{ .id = id, .name = name } };
-        } else if (std.mem.eql(u8, cmd, "%sessions-changed")) cmd: {
-            if (!std.mem.eql(u8, line, "%sessions-changed")) {
-                log.warn("failed to match notification cmd={s} line=\"{s}\"", .{ cmd, line });
-                break :cmd;
-            }
+        } else if (std.mem.eql(u8, cmd, "%sessions-changed")) {
+            // %sessions-changed has no payload. Ignore any trailing content.
 
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
@@ -284,7 +277,7 @@ pub const Parser = struct {
             // Format: %layout-change @<window_id> <layout> <visible_layout> <raw_flags>
             // Parse right-to-left because the flags field may be empty or
             // contain spaces, but layout strings never contain spaces.
-            const rest = line["%layout-change ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '@') break :cmd;
 
             // Find the space after the window ID.
@@ -313,7 +306,7 @@ pub const Parser = struct {
             } };
         } else if (std.mem.eql(u8, cmd, "%window-add")) cmd: {
             // Format: %window-add @<window_id>
-            const rest = line["%window-add ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '@') break :cmd;
             const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
@@ -324,7 +317,7 @@ pub const Parser = struct {
             return .{ .window_add = .{ .id = id } };
         } else if (std.mem.eql(u8, cmd, "%window-renamed")) cmd: {
             // Format: %window-renamed @<window_id> <name>
-            const rest = line["%window-renamed ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '@') break :cmd;
             const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
             const id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
@@ -338,7 +331,7 @@ pub const Parser = struct {
             return .{ .window_renamed = .{ .id = id, .name = name } };
         } else if (std.mem.eql(u8, cmd, "%window-pane-changed")) cmd: {
             // Format: %window-pane-changed @<window_id> %<pane_id>
-            const rest = line["%window-pane-changed ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '@') break :cmd;
             const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
             const window_id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
@@ -355,8 +348,7 @@ pub const Parser = struct {
             return .{ .window_pane_changed = .{ .window_id = window_id, .pane_id = pane_id } };
         } else if (std.mem.eql(u8, cmd, "%client-detached")) cmd: {
             // Format: %client-detached <client>
-            if (line.len <= "%client-detached ".len) break :cmd;
-            const client = line["%client-detached ".len..];
+            const client = payload;
             if (client.len == 0) break :cmd;
 
             // Important: do not clear buffer here since client points to it
@@ -366,7 +358,7 @@ pub const Parser = struct {
             // Format: %client-session-changed <client> $<session_id> <name>
             // Parse right-to-left: find the last " $" to split client from
             // session, avoiding ambiguity when client names contain spaces.
-            const rest = line["%client-session-changed ".len..];
+            const rest = payload;
 
             // Find " $" — the session ID delimiter. Search from the end
             // to handle client names that might contain spaces.
@@ -387,7 +379,7 @@ pub const Parser = struct {
             return .{ .client_session_changed = .{ .client = client, .session_id = session_id, .name = name } };
         } else if (std.mem.eql(u8, cmd, "%pause")) cmd: {
             // Flow control: %pause %<pane_id>
-            const rest = line["%pause ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '%') break :cmd;
             const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
@@ -398,7 +390,7 @@ pub const Parser = struct {
             return .{ .pause = .{ .pane_id = id } };
         } else if (std.mem.eql(u8, cmd, "%continue")) cmd: {
             // Flow control: %continue %<pane_id>
-            const rest = line["%continue ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '%') break :cmd;
             const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
@@ -410,7 +402,7 @@ pub const Parser = struct {
         } else if (std.mem.eql(u8, cmd, "%extended-output")) cmd: {
             // Flow control: %extended-output %<pane_id> <age_ms> : <data>
             // The " : " separator separates metadata from the actual output data.
-            const rest = line["%extended-output ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '%') break :cmd;
             const space1 = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
             const id = std.fmt.parseInt(usize, rest[1..][0..space1], 10) catch {
@@ -433,7 +425,7 @@ pub const Parser = struct {
             return .{ .extended_output = .{ .pane_id = id, .age_ms = age_ms, .data = data } };
         } else if (std.mem.eql(u8, cmd, "%window-close")) cmd: {
             // Format: %window-close @<window_id>
-            const rest = line["%window-close ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '@') break :cmd;
             const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
@@ -444,7 +436,7 @@ pub const Parser = struct {
             return .{ .window_close = .{ .id = id } };
         } else if (std.mem.eql(u8, cmd, "%session-window-changed")) cmd: {
             // Format: %session-window-changed $<session_id> @<window_id>
-            const rest = line["%session-window-changed ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '$') break :cmd;
             const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
             const session_id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
@@ -465,7 +457,7 @@ pub const Parser = struct {
             // or for session-scope subscriptions:
             //   %subscription-changed name $session - - - : value
             // We extract the subscription name and the value after " : ".
-            const rest = line["%subscription-changed ".len..];
+            const rest = payload;
 
             // The name is the first space-delimited token.
             const name_end = std.mem.indexOfScalar(u8, rest, ' ') orelse break :cmd;
@@ -483,7 +475,7 @@ pub const Parser = struct {
             return .{ .subscription_changed = .{ .name = name, .value = value } };
         } else if (std.mem.eql(u8, cmd, "%pane-mode-changed")) cmd: {
             // Format: %pane-mode-changed %<pane_id>
-            const rest = line["%pane-mode-changed ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '%') break :cmd;
             const pane_id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
@@ -494,7 +486,7 @@ pub const Parser = struct {
             return .{ .pane_mode_changed = .{ .pane_id = pane_id } };
         } else if (std.mem.eql(u8, cmd, "%session-renamed")) cmd: {
             // Format: %session-renamed $<session_id> <name>
-            const rest = line["%session-renamed ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '$') break :cmd;
             const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
             const id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
@@ -508,7 +500,7 @@ pub const Parser = struct {
             return .{ .session_renamed = .{ .id = id, .name = name } };
         } else if (std.mem.eql(u8, cmd, "%unlinked-window-add")) cmd: {
             // Format: %unlinked-window-add @<window_id>
-            const rest = line["%unlinked-window-add ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '@') break :cmd;
             const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
@@ -519,7 +511,7 @@ pub const Parser = struct {
             return .{ .unlinked_window_add = .{ .id = id } };
         } else if (std.mem.eql(u8, cmd, "%unlinked-window-close")) cmd: {
             // Format: %unlinked-window-close @<window_id>
-            const rest = line["%unlinked-window-close ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '@') break :cmd;
             const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
@@ -530,7 +522,7 @@ pub const Parser = struct {
             return .{ .unlinked_window_close = .{ .id = id } };
         } else if (std.mem.eql(u8, cmd, "%unlinked-window-renamed")) cmd: {
             // Format: %unlinked-window-renamed @<window_id> <name>
-            const rest = line["%unlinked-window-renamed ".len..];
+            const rest = payload;
             if (rest.len == 0 or rest[0] != '@') break :cmd;
             const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
             const id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
@@ -545,61 +537,41 @@ pub const Parser = struct {
         } else if (std.mem.eql(u8, cmd, "%paste-buffer-changed")) {
             // %paste-buffer-changed <name>
             // Sent when a paste buffer is created or changed.
-            const name = if (cmd.len < line.len)
-                std.mem.trimLeft(u8, line[cmd.len..], " ")
-            else
-                "";
 
-            // Do not clear buffer — name points into it.
+            // Do not clear buffer — payload points into it.
             self.state = .idle;
-            return .{ .paste_buffer_changed = name };
+            return .{ .paste_buffer_changed = payload };
         } else if (std.mem.eql(u8, cmd, "%paste-buffer-deleted")) {
             // %paste-buffer-deleted <name>
             // Sent when a paste buffer is deleted.
-            const name = if (cmd.len < line.len)
-                std.mem.trimLeft(u8, line[cmd.len..], " ")
-            else
-                "";
 
-            // Do not clear buffer — name points into it.
+            // Do not clear buffer — payload points into it.
             self.state = .idle;
-            return .{ .paste_buffer_deleted = name };
+            return .{ .paste_buffer_deleted = payload };
         } else if (std.mem.eql(u8, cmd, "%config-error")) {
             // %config-error <error>
             // Sent when an error occurs in a configuration file.
             // Added in tmux 3.4.
-            const text = if (cmd.len < line.len)
-                std.mem.trimLeft(u8, line[cmd.len..], " ")
-            else
-                "";
 
-            // Do not clear buffer — text points into it.
+            // Do not clear buffer — payload points into it.
             self.state = .idle;
-            return .{ .config_error = text };
+            return .{ .config_error = payload };
         } else if (std.mem.eql(u8, cmd, "%message")) {
             // %message <text>
             // Sent when tmux generates a display-message. The payload is
             // the remainder of the line after the command name.
-            const text = if (cmd.len < line.len)
-                std.mem.trimLeft(u8, line[cmd.len..], " ")
-            else
-                "";
 
-            // Do not clear buffer — text points into it.
+            // Do not clear buffer — payload points into it.
             self.state = .idle;
-            return .{ .message = text };
+            return .{ .message = payload };
         } else if (std.mem.eql(u8, cmd, "%exit")) {
             // tmux sends %exit when the control mode client is exiting.
             // The optional reason string follows the command (e.g.,
             // "%exit detached", "%exit server-exited").
-            const reason = if (cmd.len < line.len)
-                std.mem.trimLeft(u8, line[cmd.len..], " ")
-            else
-                "";
 
             // Important: do not clear buffer here since reason points to it
             self.state = .idle;
-            return .{ .exit = .{ .reason = reason } };
+            return .{ .exit = .{ .reason = payload } };
         } else {
             // Unknown notification, log it and return to idle state.
             log.warn("unknown tmux control mode notification={s}", .{cmd});
@@ -862,6 +834,34 @@ test "tmux output" {
     try testing.expect(n == .output);
     try testing.expectEqual(42, n.output.pane_id);
     try testing.expectEqualStrings("foo bar baz", n.output.data);
+}
+
+test "tmux output empty data" {
+    // %output with an empty data field (just pane ID and trailing space)
+    // should be parsed as output with empty data, not rejected.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%output %7 ") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .output);
+    try testing.expectEqual(7, n.output.pane_id);
+    try testing.expectEqualStrings("", n.output.data);
+}
+
+test "tmux output truncated no payload" {
+    // Malformed: "%output" with no space or payload should not panic.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%output") |byte| try testing.expect(try c.put(byte) == null);
+    const n = try c.put('\n');
+    // Should return null (failed to parse), not panic.
+    try testing.expect(n == null);
 }
 
 test "tmux session-changed" {
