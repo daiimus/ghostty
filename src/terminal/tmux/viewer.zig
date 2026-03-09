@@ -1490,17 +1490,6 @@ pub const Viewer = struct {
                 return err;
             };
 
-            // Build the window value before appending so that errdefer
-            // can clean up partial allocations if a later step fails.
-            const name: []const u8 = if (data.window_name.len > 0)
-                try self.alloc.dupe(u8, data.window_name)
-            else
-                "";
-            errdefer if (name.len > 0) self.alloc.free(name);
-
-            const raw_layout = try self.alloc.dupe(u8, data.window_layout);
-            errdefer self.alloc.free(raw_layout);
-
             try windows.append(self.alloc, .{
                 .id = data.window_id,
                 .width = data.window_width,
@@ -1536,8 +1525,9 @@ pub const Viewer = struct {
         try actions.append(arena_alloc, .{ .windows = arena_windows });
 
         // Sync up our layouts. This will populate unknown panes, prune, etc.
-        // On success, syncLayouts takes ownership of the window internals
-        // (layout_arena, name, raw_layout) by shallow-copying into self.windows.
+        // On success, syncLayouts takes ownership of the window layout_arena
+        // by shallow-copying into self.windows. Fork-only metadata (name,
+        // raw_layout) is stored separately in window_metadata.
         // We only need to free the ArrayList backing store afterward.
         try self.syncLayouts(windows.items);
         windows.deinit(self.alloc);
@@ -6416,42 +6406,4 @@ test "flow control: wait-exit in enable_flow_control command" {
             }).check,
         },
     });
-}
-
-test "session_renamed persists name across subsequent next() calls" {
-    // Verify that session_name is heap-duped and survives parser buffer
-    // reuse from subsequent next() calls. We use a mutable buffer to
-    // simulate the real failure mode: info.name points into a parser
-    // buffer that gets overwritten on the next parse.
-    var viewer = try Viewer.init(testing.allocator);
-    defer viewer.deinit();
-
-    // Bootstrap the viewer into connected state.
-    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
-    _ = viewer.next(.{ .tmux = .{ .session_changed = .{
-        .id = 1,
-        .name = "initial",
-    } } });
-
-    // Create a mutable buffer simulating a parser buffer.
-    var buf: [32]u8 = undefined;
-    const original_name = "renamed-session";
-    @memcpy(buf[0..original_name.len], original_name);
-    const name_slice: []const u8 = buf[0..original_name.len];
-
-    // Feed session_renamed with a pointer into our mutable buffer.
-    _ = viewer.next(.{ .tmux = .{ .session_renamed = .{
-        .id = 1,
-        .name = name_slice,
-    } } });
-
-    // session_name should be duped and match the original.
-    try testing.expectEqualStrings(original_name, viewer.session_name.?);
-
-    // Overwrite the mutable buffer (simulating parser buffer reuse).
-    @memset(buf[0..original_name.len], 'X');
-
-    // If session_name was an unowned pointer, it would now read "XXXXXXXXXXXXXXX".
-    // Because it was duped, it should still be "renamed-session".
-    try testing.expectEqualStrings(original_name, viewer.session_name.?);
 }
