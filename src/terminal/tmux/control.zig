@@ -275,8 +275,10 @@ pub const Parser = struct {
             return .{ .sessions_changed = {} };
         } else if (std.mem.eql(u8, cmd, "%layout-change")) cmd: {
             // Format: %layout-change @<window_id> <layout> <visible_layout> <raw_flags>
-            // Parse right-to-left because the flags field may be empty or
-            // contain spaces, but layout strings never contain spaces.
+            // Parse left-to-right: window_id, layout, and visible_layout are
+            // space-delimited tokens that never contain spaces. Everything
+            // after the third space is raw_flags (which may be empty or
+            // contain spaces).
             const rest = payload;
             if (rest.len == 0 or rest[0] != '@') break :cmd;
 
@@ -468,6 +470,20 @@ pub const Parser = struct {
             // remainder of the line. The value may be empty.
             const after_name = rest[name_end..];
             const sep = std.mem.indexOf(u8, after_name, " : ") orelse break :cmd;
+
+            // Validate the metadata between name and " : ". Expected format:
+            //   " $session @window idx %pane"  or  " $session - - -"
+            // i.e., a leading space followed by exactly 4 space-delimited
+            // tokens, with the first starting with '$'.
+            if (sep == 0) break :cmd; // must have at least the leading space and metadata
+            const meta = after_name[1..sep]; // skip the leading space
+            if (meta.len == 0 or meta[0] != '$') break :cmd;
+            var space_count: usize = 0;
+            for (meta) |ch| {
+                if (ch == ' ') space_count += 1;
+            }
+            if (space_count != 3) break :cmd;
+
             const value = after_name[sep + " : ".len ..];
 
             // Important: do not clear buffer here since name and value point to it
@@ -1339,6 +1355,20 @@ test "tmux extended-output zero age" {
     try testing.expectEqual(0, n.extended_output.pane_id);
     try testing.expectEqual(0, n.extended_output.age_ms);
     try testing.expectEqualStrings("$", n.extended_output.data);
+}
+
+test "tmux extended-output empty data" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%extended-output %1 0 : ") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .extended_output);
+    try testing.expectEqual(1, n.extended_output.pane_id);
+    try testing.expectEqual(0, n.extended_output.age_ms);
+    try testing.expectEqualStrings("", n.extended_output.data);
 }
 
 test "tmux subscription-changed session scope" {
