@@ -2070,21 +2070,34 @@ pub const CAPI = struct {
         // keeps our renderer_state.terminal pointed at the correct pane
         // terminal after syncLayouts() rebuilds the pane map.
         //
-        // Unregister any previous observer for this surface first
-        // (identified by terminal_ptr — each surface has exactly one
-        // renderer_state.terminal field at a unique address).
-        viewer.unregisterObserverByPtr(&surface.core_surface.renderer_state.terminal);
-        if (!viewer.registerObserver(
+        // We register the new observer BEFORE unregistering the old one
+        // to avoid a window where the surface has no observer at all.
+        // registerObserver rejects duplicates by (pane_id, terminal_ptr)
+        // pair, so having both old and new registrations momentarily is
+        // fine as long as pane_id differs (which it does when switching).
+        const registered = viewer.registerObserver(
             pane_id,
             &surface.core_surface.renderer_state.terminal,
             observerWakeup,
             @ptrCast(&surface.core_surface.renderer_thread.wakeup),
-        )) {
-            // Registration failed (OOM or duplicate). Roll back to
+        );
+
+        if (registered) {
+            // Success — now safe to remove the old observer.
+            // Use unregisterObserver with prev_pane_id (not ByPtr) to
+            // avoid accidentally removing the registration we just added.
+            if (prev_pane_id) |pid| {
+                viewer.unregisterObserver(pid, &surface.core_surface.renderer_state.terminal);
+            }
+        } else if (prev_pane_id != null and prev_pane_id.? == pane_id) {
+            // Re-registration to the same pane — observer already exists,
+            // nothing to do (terminal pointer is already correct).
+        } else {
+            // Registration failed (OOM or pane gone). Roll back to
             // prevent the surface from rendering a pane terminal that
             // the viewer won't fix up after layout changes.
             surface.core_surface.renderer_state.terminal = prev_terminal;
-            if (prev_pane_id) |pid| viewer.setActivePaneId(pid);
+            viewer.setActivePaneId(prev_pane_id);
             log.warn("tmux observer registration failed for pane {}", .{pane_id});
             return false;
         }
@@ -2403,19 +2416,19 @@ pub const CAPI = struct {
         // we still hold the shared lock.
         target.core_surface.renderer_state.terminal = binding.original_terminal;
 
-        // Now restore the original mutex. We must unlock the shared mutex
-        // (which we currently hold) and then set the field. The brief
-        // moment between unlock and field assignment is safe because:
+        // Now restore the original mutex pointer. We must unlock the shared
+        // mutex (which we currently hold) and then reassign the pointer field.
+        // The brief moment between unlock and pointer assignment is safe because:
         //
         // 1. The renderer thread may try to lock the old (shared) mutex,
         //    which was just unlocked — it will acquire it harmlessly and
         //    release immediately (no shared state depends on it anymore
         //    since we already restored the terminal pointer above).
         //
-        // 2. std.Thread.Mutex is a small value type (word-sized on most
-        //    platforms), so the struct assignment is practically atomic.
-        //    Even if tearing occurred, the renderer's next lock attempt
-        //    would block until the field is fully written.
+        // 2. renderer_state.mutex is a *std.Thread.Mutex (pointer), and
+        //    pointer assignment on all supported platforms (aarch64, x86_64)
+        //    is naturally aligned and single-word, so the store is atomic
+        //    at the hardware level. There is no risk of a torn read.
         //
         // 3. The tmux_pane_binding = null below ensures subsequent render
         //    cycles use the surface's own terminal, not the shared pane.
