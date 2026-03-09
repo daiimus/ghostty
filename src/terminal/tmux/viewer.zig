@@ -2027,7 +2027,7 @@ pub const Viewer = struct {
     fn receivedOutput(
         self: *Viewer,
         id: usize,
-        data: []const u8,
+        raw_data: []const u8,
     ) !void {
         const entry = self.panes.getEntry(id) orelse {
             log.info("received output for untracked pane id={}", .{id});
@@ -2035,6 +2035,16 @@ pub const Viewer = struct {
         };
         const pane: *Pane = entry.value_ptr;
         const t: *Terminal = &pane.terminal;
+
+        // Decode tmux octal escapes (\NNN for bytes <32 and backslash)
+        // in-place on a mutable copy. This is deferred from the parser
+        // (control.zig) to avoid unnecessary work for untracked or
+        // discarded pane output. We dupe because the input slice may
+        // alias read-only memory (e.g. string literals in tests, or
+        // comptime-known data in the parser's notification union).
+        const buf = try self.alloc.dupe(u8, raw_data);
+        defer self.alloc.free(buf);
+        const data = control.Parser.unescapeOctal(buf);
 
         // Use pane's persistent parser state to handle CSI sequences
         // that span multiple %output messages. We start with the

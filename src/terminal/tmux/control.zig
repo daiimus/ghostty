@@ -243,12 +243,11 @@ pub const Parser = struct {
                 break :cmd;
             };
 
-            // tmux control mode encodes bytes <32 and backslash as octal
-            // escapes (\NNN) in %output data. Decode in-place — this is
-            // safe because the buffer is heap-allocated and we own it, and
-            // decoded output is always <= encoded length.
-            const raw = @constCast(rest[1 + space_idx + 1 ..]);
-            const data = unescapeOctal(raw);
+            // Data is returned raw — still octal-escaped per tmux's
+            // control.c encoding (bytes <32 and backslash as \NNN).
+            // Decoding is deferred to the consumer (viewer.zig) to
+            // avoid work for untracked or discarded pane output.
+            const data = rest[1 + space_idx + 1 ..];
 
             // Important: do not clear buffer here since data points to it
             self.state = .idle;
@@ -418,9 +417,9 @@ pub const Parser = struct {
                 break :cmd;
             };
 
-            // Unescape octal sequences in the data, same as %output.
-            const raw = @constCast(after_id[sep + " : ".len ..]);
-            const data = unescapeOctal(raw);
+            // Data is returned raw (still octal-escaped), same as %output.
+            // Consumer is responsible for decoding.
+            const data = after_id[sep + " : ".len ..];
 
             // Important: do not clear buffer here since data points to it
             self.state = .idle;
@@ -631,10 +630,12 @@ pub const Notification = union(enum) {
     block_end: []const u8,
     block_err: []const u8,
 
-    /// Raw output from a pane.
+    /// Raw output from a pane. Data is still octal-escaped per tmux's
+    /// control.c encoding (bytes <32 and backslash as \NNN). The consumer
+    /// is responsible for calling unescapeOctal() before interpretation.
     output: struct {
         pane_id: usize,
-        data: []const u8, // unescaped (octal \NNN decoded in-place)
+        data: []const u8, // raw, octal-escaped per tmux control.c
     },
 
     /// The client is now attached to the session with ID session-id, which is
@@ -1072,50 +1073,46 @@ test "tmux output with octal escapes" {
     const alloc = testing.allocator;
 
     // Simulate: %output %2 hello\033[31mworld
-    // tmux sends ESC as \033 in %output data
+    // tmux sends ESC as \033 in %output data.
+    // Parser now returns raw (still-escaped) data; decoding is
+    // deferred to the consumer (viewer.zig).
     var c: Parser = .{ .buffer = .init(alloc) };
     defer c.deinit();
     for ("%output %2 hello\\033[31mworld") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .output);
     try testing.expectEqual(2, n.output.pane_id);
-    // Data should be decoded: "hello" + ESC + "[31mworld"
-    try testing.expectEqual(@as(usize, 15), n.output.data.len);
-    try testing.expectEqualStrings("hello", n.output.data[0..5]);
-    try testing.expectEqual(@as(u8, 0x1B), n.output.data[5]);
-    try testing.expectEqualStrings("[31mworld", n.output.data[6..]);
+    // Data is raw: literal "hello\033[31mworld" (backslash + digits, not ESC byte)
+    try testing.expectEqualStrings("hello\\033[31mworld", n.output.data);
 }
 
 test "tmux output with escaped backslash" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    // %output %5 path\\134file => "path\file"
+    // %output %5 path\134file — raw data, not decoded
     var c: Parser = .{ .buffer = .init(alloc) };
     defer c.deinit();
     for ("%output %5 path\\134file") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .output);
     try testing.expectEqual(5, n.output.pane_id);
-    try testing.expectEqualStrings("path\\file", n.output.data);
+    try testing.expectEqualStrings("path\\134file", n.output.data);
 }
 
 test "tmux output with CR LF" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    // %output %1 line1\015\012line2
+    // %output %1 line1\015\012line2 — raw data, not decoded
     var c: Parser = .{ .buffer = .init(alloc) };
     defer c.deinit();
     for ("%output %1 line1\\015\\012line2") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .output);
     try testing.expectEqual(1, n.output.pane_id);
-    try testing.expectEqual(@as(usize, 12), n.output.data.len);
-    try testing.expectEqualStrings("line1", n.output.data[0..5]);
-    try testing.expectEqual(@as(u8, 0x0D), n.output.data[5]);
-    try testing.expectEqual(@as(u8, 0x0A), n.output.data[6]);
-    try testing.expectEqualStrings("line2", n.output.data[7..]);
+    // Data is raw: literal "line1\015\012line2" (backslash + digits, not CR/LF bytes)
+    try testing.expectEqualStrings("line1\\015\\012line2", n.output.data);
 }
 
 test "tmux output with raw UTF-8 box drawing" {
@@ -1148,7 +1145,7 @@ test "tmux output with mixed UTF-8 and octal escapes" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    // ESC[31m (octal-escaped ESC) + ┄ (raw UTF-8) + ESC[0m (octal-escaped ESC)
+    // Octal-escaped ESC sequences + raw UTF-8 — parser returns raw data
     var c: Parser = .{ .buffer = .init(alloc) };
     defer c.deinit();
 
@@ -1157,14 +1154,8 @@ test "tmux output with mixed UTF-8 and octal escapes" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .output);
     try testing.expectEqual(1, n.output.pane_id);
-    // Expected: ESC + "[31m" + e2 94 84 + ESC + "[0m"
-    // ESC=1 + [31m=4 + ┄=3 + ESC=1 + [0m=3 = 12 bytes
-    try testing.expectEqual(@as(usize, 12), n.output.data.len);
-    try testing.expectEqual(@as(u8, 0x1B), n.output.data[0]); // ESC
-    try testing.expectEqualStrings("[31m", n.output.data[1..5]);
-    try testing.expectEqualStrings("\xe2\x94\x84", n.output.data[5..8]); // ┄
-    try testing.expectEqual(@as(u8, 0x1B), n.output.data[8]); // ESC
-    try testing.expectEqualStrings("[0m", n.output.data[9..12]);
+    // Data is raw: literal "\033[31m" + raw UTF-8 ┄ + literal "\033[0m"
+    try testing.expectEqualStrings("\\033[31m\xe2\x94\x84\\033[0m", n.output.data);
 }
 
 test "tmux output with 4-byte emoji pass-through" {
@@ -1246,7 +1237,7 @@ test "tmux output with 4-byte emoji and octal-escaped SGR" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    // Octal-escaped ESC[31m + raw 4-byte emoji + octal-escaped ESC[0m
+    // Octal-escaped ESC sequences + raw 4-byte emoji — parser returns raw data
     var c: Parser = .{ .buffer = .init(alloc) };
     defer c.deinit();
 
@@ -1255,14 +1246,8 @@ test "tmux output with 4-byte emoji and octal-escaped SGR" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .output);
     try testing.expectEqual(4, n.output.pane_id);
-    // Expected: ESC + "[31m" + f0 9f 98 80 + ESC + "[0m"
-    // ESC=1 + [31m=4 + 😀=4 + ESC=1 + [0m=3 = 13 bytes
-    try testing.expectEqual(@as(usize, 13), n.output.data.len);
-    try testing.expectEqual(@as(u8, 0x1B), n.output.data[0]); // ESC
-    try testing.expectEqualStrings("[31m", n.output.data[1..5]);
-    try testing.expectEqualStrings("\xf0\x9f\x98\x80", n.output.data[5..9]); // 😀
-    try testing.expectEqual(@as(u8, 0x1B), n.output.data[9]); // ESC
-    try testing.expectEqualStrings("[0m", n.output.data[10..13]);
+    // Data is raw: literal "\033[31m" + raw UTF-8 😀 + literal "\033[0m"
+    try testing.expectEqualStrings("\\033[31m\xf0\x9f\x98\x80\\033[0m", n.output.data);
 }
 
 test "tmux window-close" {
@@ -1334,13 +1319,13 @@ test "tmux extended-output with octal escapes" {
 
     var c: Parser = .{ .buffer = .init(alloc) };
     defer c.deinit();
-    // \033[31m = ESC [ 3 1 m (red SGR)
+    // \033[31m = octal-escaped ESC — parser returns raw data
     for ("%extended-output %5 1200 : \\033[31mred") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .extended_output);
     try testing.expectEqual(5, n.extended_output.pane_id);
     try testing.expectEqual(1200, n.extended_output.age_ms);
-    try testing.expectEqualStrings("\x1b[31mred", n.extended_output.data);
+    try testing.expectEqualStrings("\\033[31mred", n.extended_output.data);
 }
 
 test "tmux extended-output zero age" {
