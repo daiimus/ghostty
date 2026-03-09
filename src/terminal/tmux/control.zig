@@ -6,7 +6,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../../quirks.zig").inlineAssert;
-const oni = @import("oniguruma");
 
 const log = std.log.scoped(.terminal_tmux);
 
@@ -148,15 +147,7 @@ pub const Parser = struct {
             // complete notification we need to parse.
             .notification => if (byte == '\n') {
                 // We have a complete notification, parse it.
-                return self.parseNotification() catch {
-                    // If parsing failed, then we do not mark the state
-                    // as broken because we may be able to continue parsing
-                    // other types of notifications.
-                    //
-                    // In the future we may want to emit a notification
-                    // here about unknown or unsupported notifications.
-                    return null;
-                };
+                return self.parseNotification();
             },
 
             // If we're in a block then we accumulate until we see a newline
@@ -211,9 +202,7 @@ pub const Parser = struct {
         return null;
     }
 
-    const ParseError = error{RegexError};
-
-    fn parseNotification(self: *Parser) ParseError!?Notification {
+    fn parseNotification(self: *Parser) ?Notification {
         assert(self.state == .notification);
 
         const line = line: {
@@ -250,69 +239,34 @@ pub const Parser = struct {
             self.buffer.clearRetainingCapacity();
             return null;
         } else if (std.mem.eql(u8, cmd, "%output")) cmd: {
-            var re = oni.Regex.init(
-                "^%output %([0-9]+) (.+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Format: %output %<pane_id> <data>
+            const rest = line["%output ".len..];
+            if (rest.len == 0 or rest[0] != '%') break :cmd;
+            const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
 
             // tmux control mode encodes bytes <32 and backslash as octal
             // escapes (\NNN) in %output data. Decode in-place — this is
             // safe because the buffer is heap-allocated and we own it, and
             // decoded output is always <= encoded length.
-            const raw = @constCast(line[@intCast(starts[2])..@intCast(ends[2])]);
+            const raw = @constCast(rest[1 + space_idx + 1 ..]);
             const data = unescapeOctal(raw);
 
             // Important: do not clear buffer here since data points to it
             self.state = .idle;
             return .{ .output = .{ .pane_id = id, .data = data } };
         } else if (std.mem.eql(u8, cmd, "%session-changed")) cmd: {
-            var re = oni.Regex.init(
-                "^%session-changed \\$([0-9]+) (.+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Format: %session-changed $<session_id> <name>
+            const rest = line["%session-changed ".len..];
+            if (rest.len == 0 or rest[0] != '$') break :cmd;
+            const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
-            const name = line[@intCast(starts[2])..@intCast(ends[2])];
+            const name = rest[1 + space_idx + 1 ..];
+            if (name.len == 0) break :cmd;
 
             // Important: do not clear buffer here since name points to it
             self.state = .idle;
@@ -327,34 +281,27 @@ pub const Parser = struct {
             self.state = .idle;
             return .{ .sessions_changed = {} };
         } else if (std.mem.eql(u8, cmd, "%layout-change")) cmd: {
-            var re = oni.Regex.init(
-                "^%layout-change @([0-9]+) (.+) (.+) (.*)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
+            // Format: %layout-change @<window_id> <layout> <visible_layout> <raw_flags>
+            // Parse right-to-left because the flags field may be empty or
+            // contain spaces, but layout strings never contain spaces.
+            const rest = line["%layout-change ".len..];
+            if (rest.len == 0 or rest[0] != '@') break :cmd;
 
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Find the space after the window ID.
+            const id_end = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..][0..id_end], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
 
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
-            const layout = line[@intCast(starts[2])..@intCast(ends[2])];
-            const visible_layout = line[@intCast(starts[3])..@intCast(ends[3])];
-            const raw_flags = line[@intCast(starts[4])..@intCast(ends[4])];
+            // Remainder after "@<id> " is "<layout> <visible_layout> <raw_flags>"
+            const after_id = rest[1 + id_end + 1 ..];
+            const layout_end = std.mem.indexOfScalar(u8, after_id, ' ') orelse break :cmd;
+            const layout = after_id[0..layout_end];
+
+            const after_layout = after_id[layout_end + 1 ..];
+            const vis_end = std.mem.indexOfScalar(u8, after_layout, ' ') orelse break :cmd;
+            const visible_layout = after_layout[0..vis_end];
+            const raw_flags = after_layout[vis_end + 1 ..];
 
             // Important: do not clear buffer here since layout strings point to it
             self.state = .idle;
@@ -365,324 +312,149 @@ pub const Parser = struct {
                 .raw_flags = raw_flags,
             } };
         } else if (std.mem.eql(u8, cmd, "%window-add")) cmd: {
-            var re = oni.Regex.init(
-                "^%window-add @([0-9]+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Format: %window-add @<window_id>
+            const rest = line["%window-add ".len..];
+            if (rest.len == 0 or rest[0] != '@') break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
 
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .window_add = .{ .id = id } };
         } else if (std.mem.eql(u8, cmd, "%window-renamed")) cmd: {
-            var re = oni.Regex.init(
-                "^%window-renamed @([0-9]+) (.+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Format: %window-renamed @<window_id> <name>
+            const rest = line["%window-renamed ".len..];
+            if (rest.len == 0 or rest[0] != '@') break :cmd;
+            const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
-            const name = line[@intCast(starts[2])..@intCast(ends[2])];
+            const name = rest[1 + space_idx + 1 ..];
+            if (name.len == 0) break :cmd;
 
             // Important: do not clear buffer here since name points to it
             self.state = .idle;
             return .{ .window_renamed = .{ .id = id, .name = name } };
         } else if (std.mem.eql(u8, cmd, "%window-pane-changed")) cmd: {
-            var re = oni.Regex.init(
-                "^%window-pane-changed @([0-9]+) %([0-9]+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Format: %window-pane-changed @<window_id> %<pane_id>
+            const rest = line["%window-pane-changed ".len..];
+            if (rest.len == 0 or rest[0] != '@') break :cmd;
+            const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
+            const window_id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const window_id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
-            const pane_id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[2])..@intCast(ends[2])],
-                10,
-            ) catch unreachable;
+            const pane_part = rest[1 + space_idx + 1 ..];
+            if (pane_part.len == 0 or pane_part[0] != '%') break :cmd;
+            const pane_id = std.fmt.parseInt(usize, pane_part[1..], 10) catch {
+                break :cmd;
+            };
 
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .window_pane_changed = .{ .window_id = window_id, .pane_id = pane_id } };
         } else if (std.mem.eql(u8, cmd, "%client-detached")) cmd: {
-            var re = oni.Regex.init(
-                "^%client-detached (.+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
-                break :cmd;
-            };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const client = line[@intCast(starts[1])..@intCast(ends[1])];
+            // Format: %client-detached <client>
+            if (line.len <= "%client-detached ".len) break :cmd;
+            const client = line["%client-detached ".len..];
+            if (client.len == 0) break :cmd;
 
             // Important: do not clear buffer here since client points to it
             self.state = .idle;
             return .{ .client_detached = .{ .client = client } };
         } else if (std.mem.eql(u8, cmd, "%client-session-changed")) cmd: {
-            var re = oni.Regex.init(
-                "^%client-session-changed (.+) \\$([0-9]+) (.+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
+            // Format: %client-session-changed <client> $<session_id> <name>
+            // Parse right-to-left: find the last " $" to split client from
+            // session, avoiding ambiguity when client names contain spaces.
+            const rest = line["%client-session-changed ".len..];
 
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Find " $" — the session ID delimiter. Search from the end
+            // to handle client names that might contain spaces.
+            const dollar_pos = std.mem.lastIndexOf(u8, rest, " $") orelse break :cmd;
+            const client = rest[0..dollar_pos];
+            if (client.len == 0) break :cmd;
+
+            const after_dollar = rest[dollar_pos + 2 ..]; // skip " $"
+            const space_idx = std.mem.indexOfScalar(u8, after_dollar, ' ') orelse break :cmd;
+            const session_id = std.fmt.parseInt(usize, after_dollar[0..space_idx], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const client = line[@intCast(starts[1])..@intCast(ends[1])];
-            const session_id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[2])..@intCast(ends[2])],
-                10,
-            ) catch unreachable;
-            const name = line[@intCast(starts[3])..@intCast(ends[3])];
+            const name = after_dollar[space_idx + 1 ..];
+            if (name.len == 0) break :cmd;
 
             // Important: do not clear buffer here since client/name point to it
             self.state = .idle;
             return .{ .client_session_changed = .{ .client = client, .session_id = session_id, .name = name } };
         } else if (std.mem.eql(u8, cmd, "%pause")) cmd: {
-            // Flow control: %pause %{pane_id}
-            var re = oni.Regex.init(
-                "^%pause %([0-9]+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Flow control: %pause %<pane_id>
+            const rest = line["%pause ".len..];
+            if (rest.len == 0 or rest[0] != '%') break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
 
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .pause = .{ .pane_id = id } };
         } else if (std.mem.eql(u8, cmd, "%continue")) cmd: {
-            // Flow control: %continue %{pane_id}
-            var re = oni.Regex.init(
-                "^%continue %([0-9]+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Flow control: %continue %<pane_id>
+            const rest = line["%continue ".len..];
+            if (rest.len == 0 or rest[0] != '%') break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
 
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .continue_pane = .{ .pane_id = id } };
         } else if (std.mem.eql(u8, cmd, "%extended-output")) cmd: {
-            // Flow control: %extended-output %{pane_id} {age_ms} : {data}
-            // The ` : ` separator separates metadata from the actual output data.
-            var re = oni.Regex.init(
-                "^%extended-output %([0-9]+) ([0-9]+) : (.+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Flow control: %extended-output %<pane_id> <age_ms> : <data>
+            // The " : " separator separates metadata from the actual output data.
+            const rest = line["%extended-output ".len..];
+            if (rest.len == 0 or rest[0] != '%') break :cmd;
+            const space1 = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..][0..space1], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
 
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
-
-            const age_ms = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[2])..@intCast(ends[2])],
-                10,
-            ) catch unreachable;
+            const after_id = rest[1 + space1 + 1 ..];
+            // Find the " : " separator between age_ms and data.
+            const sep = std.mem.indexOf(u8, after_id, " : ") orelse break :cmd;
+            const age_ms = std.fmt.parseInt(usize, after_id[0..sep], 10) catch {
+                break :cmd;
+            };
 
             // Unescape octal sequences in the data, same as %output.
-            const raw = @constCast(line[@intCast(starts[3])..@intCast(ends[3])]);
+            const raw = @constCast(after_id[sep + " : ".len ..]);
             const data = unescapeOctal(raw);
 
             // Important: do not clear buffer here since data points to it
             self.state = .idle;
             return .{ .extended_output = .{ .pane_id = id, .age_ms = age_ms, .data = data } };
         } else if (std.mem.eql(u8, cmd, "%window-close")) cmd: {
-            var re = oni.Regex.init(
-                "^%window-close @([0-9]+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Format: %window-close @<window_id>
+            const rest = line["%window-close ".len..];
+            if (rest.len == 0 or rest[0] != '@') break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
 
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .window_close = .{ .id = id } };
         } else if (std.mem.eql(u8, cmd, "%session-window-changed")) cmd: {
-            var re = oni.Regex.init(
-                "^%session-window-changed \\$([0-9]+) @([0-9]+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Format: %session-window-changed $<session_id> @<window_id>
+            const rest = line["%session-window-changed ".len..];
+            if (rest.len == 0 or rest[0] != '$') break :cmd;
+            const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
+            const session_id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const session_id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
-            const window_id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[2])..@intCast(ends[2])],
-                10,
-            ) catch unreachable;
+            const win_part = rest[1 + space_idx + 1 ..];
+            if (win_part.len == 0 or win_part[0] != '@') break :cmd;
+            const window_id = std.fmt.parseInt(usize, win_part[1..], 10) catch {
+                break :cmd;
+            };
 
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
@@ -693,188 +465,79 @@ pub const Parser = struct {
             // or for session-scope subscriptions:
             //   %subscription-changed name $session - - - : value
             // We extract the subscription name and the value after " : ".
-            var re = oni.Regex.init(
-                "^%subscription-changed ([^ ]+) \\$[0-9]+ [^ ]+ [^ ]+ [^ ]+ : (.*)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                // Fall through to the unknown-notification cleanup path
-                // rather than returning an error, which would leave the
-                // parser stuck in .notification state.
-                break :cmd;
-            };
-            defer re.deinit();
+            const rest = line["%subscription-changed ".len..];
 
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
-                break :cmd;
-            };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
+            // The name is the first space-delimited token.
+            const name_end = std.mem.indexOfScalar(u8, rest, ' ') orelse break :cmd;
+            const name = rest[0..name_end];
+            if (name.len == 0) break :cmd;
 
-            const name = line[@intCast(starts[1])..@intCast(ends[1])];
-            const value = line[@intCast(starts[2])..@intCast(ends[2])];
+            // The value comes after " : ". Search for the separator in the
+            // remainder of the line. The value may be empty.
+            const after_name = rest[name_end..];
+            const sep = std.mem.indexOf(u8, after_name, " : ") orelse break :cmd;
+            const value = after_name[sep + " : ".len ..];
 
             // Important: do not clear buffer here since name and value point to it
             self.state = .idle;
             return .{ .subscription_changed = .{ .name = name, .value = value } };
         } else if (std.mem.eql(u8, cmd, "%pane-mode-changed")) cmd: {
-            // %pane-mode-changed %<pane_id>
-            var re = oni.Regex.init(
-                "^%pane-mode-changed %([0-9]+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Format: %pane-mode-changed %<pane_id>
+            const rest = line["%pane-mode-changed ".len..];
+            if (rest.len == 0 or rest[0] != '%') break :cmd;
+            const pane_id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const pane_id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
 
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .pane_mode_changed = .{ .pane_id = pane_id } };
         } else if (std.mem.eql(u8, cmd, "%session-renamed")) cmd: {
-            // %session-renamed $<session_id> <name>
-            var re = oni.Regex.init(
-                "^%session-renamed \\$([0-9]+) (.+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Format: %session-renamed $<session_id> <name>
+            const rest = line["%session-renamed ".len..];
+            if (rest.len == 0 or rest[0] != '$') break :cmd;
+            const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
-            const name = line[@intCast(starts[2])..@intCast(ends[2])];
+            const name = rest[1 + space_idx + 1 ..];
+            if (name.len == 0) break :cmd;
 
             // Do not clear buffer — name points into it.
             self.state = .idle;
             return .{ .session_renamed = .{ .id = id, .name = name } };
         } else if (std.mem.eql(u8, cmd, "%unlinked-window-add")) cmd: {
-            // %unlinked-window-add @<window_id>
-            var re = oni.Regex.init(
-                "^%unlinked-window-add @([0-9]+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Format: %unlinked-window-add @<window_id>
+            const rest = line["%unlinked-window-add ".len..];
+            if (rest.len == 0 or rest[0] != '@') break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
 
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .unlinked_window_add = .{ .id = id } };
         } else if (std.mem.eql(u8, cmd, "%unlinked-window-close")) cmd: {
-            // %unlinked-window-close @<window_id>
-            var re = oni.Regex.init(
-                "^%unlinked-window-close @([0-9]+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Format: %unlinked-window-close @<window_id>
+            const rest = line["%unlinked-window-close ".len..];
+            if (rest.len == 0 or rest[0] != '@') break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
 
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .unlinked_window_close = .{ .id = id } };
         } else if (std.mem.eql(u8, cmd, "%unlinked-window-renamed")) cmd: {
-            // %unlinked-window-renamed @<window_id> <name>
-            var re = oni.Regex.init(
-                "^%unlinked-window-renamed @([0-9]+) (.+)$",
-                .{ .capture_group = true },
-                oni.Encoding.utf8,
-                oni.Syntax.default,
-                null,
-            ) catch |err| {
-                log.warn("regex init failed error={}", .{err});
-                return error.RegexError;
-            };
-            defer re.deinit();
-
-            var region = re.search(line, .{}) catch |err| {
-                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+            // Format: %unlinked-window-renamed @<window_id> <name>
+            const rest = line["%unlinked-window-renamed ".len..];
+            if (rest.len == 0 or rest[0] != '@') break :cmd;
+            const space_idx = std.mem.indexOfScalar(u8, rest[1..], ' ') orelse break :cmd;
+            const id = std.fmt.parseInt(usize, rest[1..][0..space_idx], 10) catch {
                 break :cmd;
             };
-            defer region.deinit();
-            const starts = region.starts();
-            const ends = region.ends();
-
-            const id = std.fmt.parseInt(
-                usize,
-                line[@intCast(starts[1])..@intCast(ends[1])],
-                10,
-            ) catch unreachable;
-            const name = line[@intCast(starts[2])..@intCast(ends[2])];
+            const name = rest[1 + space_idx + 1 ..];
+            if (name.len == 0) break :cmd;
 
             // Do not clear buffer — name points into it.
             self.state = .idle;
