@@ -630,12 +630,13 @@ pub const StreamHandler = struct {
                 for (viewer.next(.{ .tmux = tmux })) |action| {
                     log.info("tmux viewer action={f}", .{action});
                     switch (action) {
-                        .exit => |reason| {
+                        .exit => {
                             // Notify the surface that tmux control mode has exited.
                             // This path is for viewer-internal exits (e.g., OOM
                             // causing defunct()), not for %exit from tmux.
+                            // The exit reason (if any) is on the viewer field.
                             self.surfaceMessageWriter(.{
-                                .tmux_exit = apprt.surface.Message.TmuxExitReason.init(reason),
+                                .tmux_exit = apprt.surface.Message.TmuxExitReason.init(viewer.exit_reason),
                             });
                         },
 
@@ -777,8 +778,8 @@ pub const StreamHandler = struct {
                 // Handle fork-specific surface notifications directly from
                 // the raw control notification, without going through the
                 // viewer's Action enum. The viewer still tracks internal
-                // state for these (e.g., active_window_id, session_name,
-                // focused_pane_id) but no longer emits actions for them.
+                // state for these (e.g., active_window_id, focused_pane_id)
+                // but no longer emits actions for them.
                 switch (tmux) {
                     .session_window_changed => |info| {
                         if (info.session_id == viewer.session_id) {

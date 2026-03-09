@@ -167,9 +167,6 @@ pub const Viewer = struct {
     /// The current session ID we're attached to.
     session_id: usize,
 
-    /// The current session name (updated on %session-renamed).
-    session_name: ?[]const u8 = null,
-
     /// The tmux server version string (e.g., "3.5a"). We capture this
     /// on startup because it will allow us to change behavior between
     /// versions as necessary.
@@ -226,6 +223,14 @@ pub const Viewer = struct {
     /// clears this field. This replaces the former `.send_keys` emission
     /// from the pause handler.
     pause_continue_pane_id: ?usize = null,
+
+    /// Set by the `.exit` notification handlers when tmux provides a
+    /// human-readable reason string (e.g., "detached", "server-exited").
+    /// The caller (stream_handler) checks this after next() returns an
+    /// `.exit` action. Points into the control parser's buffer and is
+    /// valid until the next call to `next()`. Empty string if no reason
+    /// was provided or exit was due to internal error (defunct).
+    exit_reason: []const u8 = "",
 
     /// The currently active pane ID for user input routing. This is set
     /// by the apprt (e.g., when a user focuses a pane in the GUI) and
@@ -336,9 +341,8 @@ pub const Viewer = struct {
 
     pub const Action = union(enum) {
         /// Tmux has closed the control mode connection, we should end
-        /// our viewer session in some way. The reason string describes
-        /// why the exit occurred (e.g., "detached", "server-exited").
-        exit: []const u8,
+        /// our viewer session in some way.
+        exit,
 
         /// Send a command to tmux, e.g. `list-windows`. The caller
         /// should not worry about parsing this or reading what command
@@ -677,7 +681,10 @@ pub const Viewer = struct {
             // I don't think this is technically possible (reading the
             // tmux source code), but if we see an exit we can semantically
             // handle this without issue.
-            .exit => |info| return self.defunctWithReason(info.reason),
+            .exit => |info| {
+                self.exit_reason = info.reason;
+                return self.defunct();
+            },
 
             // Any begin and end (even error) is fine! Now we wait for
             // session-changed to get the initial session ID. session-changed
@@ -705,7 +712,10 @@ pub const Viewer = struct {
         switch (n) {
             .enter => unreachable,
 
-            .exit => |info| return self.defunctWithReason(info.reason),
+            .exit => |info| {
+                self.exit_reason = info.reason;
+                return self.defunct();
+            },
 
             .session_changed => |info| {
                 self.session_id = info.id;
@@ -754,7 +764,10 @@ pub const Viewer = struct {
 
         switch (n) {
             .enter => unreachable,
-            .exit => |info| return self.defunctWithReason(info.reason),
+            .exit => |info| {
+                self.exit_reason = info.reason;
+                return self.defunct();
+            },
 
             inline .block_end,
             .block_err,
@@ -879,22 +892,11 @@ pub const Viewer = struct {
             // Pane mode changes — forwarded by stream_handler directly.
             .pane_mode_changed => {},
 
-            // Session renamed. Update our stored session name. The
-            // stream_handler sends the surface notification directly
-            // from the raw control notification.
-            .session_renamed => |info| {
-                if (info.id == self.session_id) {
-                    // Dupe the name into self.alloc since info.name is
-                    // a view into the parser buffer, invalidated on the next
-                    // call to next().
-                    const duped = self.alloc.dupe(u8, info.name) catch {
-                        log.warn("failed to dupe session name", .{});
-                        return self.defunct();
-                    };
-                    if (self.session_name) |old| self.alloc.free(old);
-                    self.session_name = duped;
-                }
-            },
+            // Session renamed. The stream_handler sends the surface
+            // notification directly from the raw control notification.
+            // The viewer doesn't need the session name for any internal
+            // logic — it's purely a display concern for the apprt.
+            .session_renamed => {},
 
             // Unlinked window notifications are for windows in sessions other
             // than the one we're attached to. The viewer only manages the
@@ -1982,12 +1984,8 @@ pub const Viewer = struct {
     }
 
     fn defunct(self: *Viewer) []const Action {
-        return self.defunctWithReason("");
-    }
-
-    fn defunctWithReason(self: *Viewer, reason: []const u8) []const Action {
         self.state = .defunct;
-        return self.singleAction(.{ .exit = reason });
+        return self.singleAction(.exit);
     }
 
     /// Request a graceful detach from the tmux session. This sends
@@ -2373,14 +2371,8 @@ test "exit propagates reason" {
             .input = .{ .tmux = .{ .exit = .{ .reason = "detached" } } },
             .contains_tags = &.{.exit},
             .check = (struct {
-                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    for (actions) |action| {
-                        if (action == .exit) {
-                            try testing.expectEqualStrings("detached", action.exit);
-                            return;
-                        }
-                    }
-                    return error.TestUnexpectedResult;
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqualStrings("detached", v.exit_reason);
                 }
             }).check,
         },
@@ -2396,14 +2388,8 @@ test "exit with server-exited reason" {
             .input = .{ .tmux = .{ .exit = .{ .reason = "server-exited" } } },
             .contains_tags = &.{.exit},
             .check = (struct {
-                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    for (actions) |action| {
-                        if (action == .exit) {
-                            try testing.expectEqualStrings("server-exited", action.exit);
-                            return;
-                        }
-                    }
-                    return error.TestUnexpectedResult;
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqualStrings("server-exited", v.exit_reason);
                 }
             }).check,
         },
