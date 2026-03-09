@@ -8,7 +8,14 @@
 #include <cassert>
 #include <cstddef>
 
+HWY_BEFORE_NAMESPACE();
+namespace ghostty {
+namespace HWY_NAMESPACE {
+
 // Compile-time helper: find the last non-zero element in a zero-padded array.
+// Defined inside the per-target namespace because Highway's foreach_target
+// self-inclusion compiles this file once per SIMD target; a global-scope
+// definition would trigger a redefinition error.
 template <typename T, size_t N>
 constexpr T lastNonZero(const T (&arr)[N]) {
   for (size_t i = N; i > 0; --i) {
@@ -16,10 +23,6 @@ constexpr T lastNonZero(const T (&arr)[N]) {
   }
   return 0;
 }
-
-HWY_BEFORE_NAMESPACE();
-namespace ghostty {
-namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
 
