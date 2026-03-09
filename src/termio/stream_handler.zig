@@ -651,22 +651,6 @@ pub const StreamHandler = struct {
                             ));
                         },
 
-                        .send_keys => |send_keys| {
-                            // Fire-and-forget: write directly to tmux stdin,
-                            // bypassing the command queue. The %begin/%end
-                            // response will be discarded as unexpected block
-                            // output by the viewer's nextCommand().
-                            // Use writeReqDirect because this is already a
-                            // formatted send-keys command — it must NOT be
-                            // re-wrapped by queueWrite's tmux intercept.
-                            assert(send_keys.len > 0);
-                            assert(send_keys[send_keys.len - 1] == '\n');
-                            self.messageWriter(try termio.Message.writeReqDirect(
-                                self.alloc,
-                                send_keys,
-                            ));
-                        },
-
                         .windows => |windows| {
                             // syncLayouts() (or sessionChanged()) has
                             // replaced the viewer's panes map, freeing the
@@ -722,44 +706,72 @@ pub const StreamHandler = struct {
 
                             self.surfaceMessageWriter(.{ .tmux_state_changed = state });
                         },
-
-                        .ready => {
-                            // Viewer startup complete — user input is safe to send
-                            self.surfaceMessageWriter(.tmux_ready);
-
-                            // Send the current client size to tmux. All resize
-                            // events during startup fired before the viewer
-                            // existed, so tmux still has the stale 24x80 from
-                            // the previous session. We send a catch-up
-                            // refresh-client now that the viewer is ready.
-                            const grid = self.size.grid();
-                            var buf: [64]u8 = undefined;
-                            const refresh_cmd = std.fmt.bufPrint(&buf, "refresh-client -C {d}x{d}\n", .{
-                                grid.columns,
-                                grid.rows,
-                            }) catch unreachable;
-                            self.messageWriter(try termio.Message.writeReqDirect(
-                                self.alloc,
-                                refresh_cmd,
-                            ));
-                        },
-
-                        .command_response => |resp| {
-                            // User command response — copy content through
-                            // the surface mailbox using WriteReq (handles
-                            // small inline or heap allocation).
-                            const data = try apprt.surface.Message.WriteReq.init(
-                                self.alloc,
-                                resp.content,
-                            );
-                            self.surfaceMessageWriter(.{
-                                .tmux_command_response = .{
-                                    .data = data,
-                                    .is_error = resp.is_error,
-                                },
-                            });
-                        },
                     }
+                }
+
+                // Handle fork-specific signals set by the viewer as fields
+                // rather than Action variants. These replace the former
+                // .ready, .command_response, and .send_keys actions.
+
+                if (viewer.ready_just_fired) {
+                    viewer.ready_just_fired = false;
+
+                    // Viewer startup complete — user input is safe to send
+                    self.surfaceMessageWriter(.tmux_ready);
+
+                    // Send the current client size to tmux. All resize
+                    // events during startup fired before the viewer
+                    // existed, so tmux still has the stale 24x80 from
+                    // the previous session. We send a catch-up
+                    // refresh-client now that the viewer is ready.
+                    const grid = self.size.grid();
+                    var buf: [64]u8 = undefined;
+                    const refresh_cmd = std.fmt.bufPrint(&buf, "refresh-client -C {d}x{d}\n", .{
+                        grid.columns,
+                        grid.rows,
+                    }) catch unreachable;
+                    self.messageWriter(try termio.Message.writeReqDirect(
+                        self.alloc,
+                        refresh_cmd,
+                    ));
+                }
+
+                if (viewer.last_command_response) |resp| {
+                    viewer.last_command_response = null;
+
+                    // User command response — copy content through
+                    // the surface mailbox using WriteReq (handles
+                    // small inline or heap allocation).
+                    const data = try apprt.surface.Message.WriteReq.init(
+                        self.alloc,
+                        resp.content,
+                    );
+                    self.surfaceMessageWriter(.{
+                        .tmux_command_response = .{
+                            .data = data,
+                            .is_error = resp.is_error,
+                        },
+                    });
+                }
+
+                if (viewer.pause_continue_pane_id) |pane_id| {
+                    viewer.pause_continue_pane_id = null;
+
+                    // Flow control: send `refresh-client -A '%N:continue'`
+                    // to resume the paused pane. This is fire-and-forget:
+                    // the %begin/%end response is consumed by the viewer's
+                    // pending_fire_and_forget counter.
+                    var buf: [64]u8 = undefined;
+                    const continue_cmd = std.fmt.bufPrint(
+                        &buf,
+                        "refresh-client -A '%{d}:continue'\n",
+                        .{pane_id},
+                    ) catch unreachable;
+                    self.messageWriter(try termio.Message.writeReqDirect(
+                        self.alloc,
+                        continue_cmd,
+                    ));
+                    viewer.trackFireAndForget();
                 }
 
                 // Handle fork-specific surface notifications directly from

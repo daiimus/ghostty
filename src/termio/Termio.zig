@@ -448,11 +448,11 @@ pub inline fn queueWrite(
         if (viewer) |v| {
             defer self.renderer_state.mutex.unlock();
 
-            if (v.sendKeys(data)) |action| {
+            if (v.sendKeys(data)) |send_keys_cmd| {
                 try self.backend.queueWrite(
                     self.alloc,
                     td,
-                    action.send_keys,
+                    send_keys_cmd,
                     false,
                 );
                 // Increment after successful write so the counter
@@ -463,11 +463,11 @@ pub inline fn queueWrite(
             }
             // Handle linefeed as a separate send-keys for CR.
             if (linefeed) {
-                if (v.sendKeys(&[_]u8{'\r'})) |action| {
+                if (v.sendKeys(&[_]u8{'\r'})) |send_keys_cmd| {
                     try self.backend.queueWrite(
                         self.alloc,
                         td,
-                        action.send_keys,
+                        send_keys_cmd,
                         false,
                     );
                     v.trackFireAndForget();

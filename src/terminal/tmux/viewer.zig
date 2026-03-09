@@ -206,6 +206,27 @@ pub const Viewer = struct {
     /// when the queue drains again (e.g., after layout changes).
     initial_ready_sent: bool,
 
+    /// Set to true by nextCommand() when the initial ready signal fires.
+    /// The caller (stream_handler) checks this after next() returns,
+    /// handles the notification, and clears it. This replaces the former
+    /// `.ready` Action variant.
+    ready_just_fired: bool = false,
+
+    /// Set by receivedCommandOutput() when a user command response arrives.
+    /// The caller (stream_handler) checks this after next() returns,
+    /// handles the notification, and clears it. This replaces the former
+    /// `.command_response` Action variant. The content slice points into
+    /// the parser's buffer and is valid until the next call to `next()`.
+    last_command_response: ?CommandResponse = null,
+
+    /// Set by the `.pause` notification handler when a pane needs a
+    /// `refresh-client -A continue` command sent. The caller
+    /// (stream_handler) checks this after next() returns, formats and
+    /// sends the continue command, calls trackFireAndForget(), and
+    /// clears this field. This replaces the former `.send_keys` emission
+    /// from the pause handler.
+    pause_continue_pane_id: ?usize = null,
+
     /// The currently active pane ID for user input routing. This is set
     /// by the apprt (e.g., when a user focuses a pane in the GUI) and
     /// is used by `sendKeys` to target `send-keys` commands. When null,
@@ -331,28 +352,6 @@ pub const Viewer = struct {
         /// are guaranteed to be stable. Additionally, tmux (as of Dec 2025)
         /// never reuses window IDs within a server process lifetime.
         windows: []const Window,
-
-        /// The initial command queue has drained after startup. This is
-        /// emitted once after the viewer finishes processing all startup
-        /// commands (tmux_version, list_windows, capture-pane for each
-        /// pane, pane_state). The apprt can use this signal to know that
-        /// user input is safe to send without interleaving with viewer
-        /// commands.
-        ready,
-
-        /// Response to a user command queued via `queueUserCommand`.
-        /// Contains the block content returned by tmux between
-        /// `%begin`/`%end` (or `%error`). The `is_error` flag indicates
-        /// whether the response was a `%error` block. The `content` slice
-        /// is valid until the next call to `next()`.
-        command_response: CommandResponse,
-
-        /// Send a `send-keys` command directly to tmux stdin for user
-        /// input routing. Unlike `command`, this is fire-and-forget and
-        /// must NOT go through the command queue (which would serialize
-        /// every keystroke behind `%begin/%end` responses). The caller
-        /// writes this directly to the backend. Includes trailing newline.
-        send_keys: []const u8,
 
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
@@ -525,7 +524,7 @@ pub const Viewer = struct {
     ///
     /// The returned slice is arena-allocated and valid until the next
     /// call to `next()` (which resets the action arena).
-    pub fn sendKeys(self: *Viewer, data: []const u8) ?Action {
+    pub fn sendKeys(self: *Viewer, data: []const u8) ?[]const u8 {
         if (data.len == 0) return null;
 
         const pane_id = self.active_pane_id orelse return null;
@@ -585,7 +584,7 @@ pub const Viewer = struct {
             pos += 3;
         }
 
-        return .{ .send_keys = buf[0..pos] };
+        return buf[0..pos];
     }
 
     /// Queue a user command to be sent through the tmux command queue.
@@ -914,27 +913,11 @@ pub const Viewer = struct {
                     entry.value_ptr.paused = true;
                     log.info("pane {} paused by tmux flow control, sending continue", .{info.pane_id});
 
-                    // Format: refresh-client -A '%N:continue'\n
-                    var arena = self.action_arena.promote(self.alloc);
-                    defer self.action_arena = arena.state;
-                    const arena_alloc = arena.allocator();
-
-                    const continue_cmd = std.fmt.allocPrint(
-                        arena_alloc,
-                        "refresh-client -A '%{d}:continue'\n",
-                        .{info.pane_id},
-                    ) catch {
-                        log.warn("failed to format continue command for pane {}", .{info.pane_id});
-                        return self.defunct();
-                    };
-                    // Use .send_keys (fire-and-forget to tmux stdin)
-                    // rather than .command (which goes through the
-                    // %begin/%end command queue). The continue command
-                    // must be sent immediately, not serialized behind
-                    // pending commands.
-                    actions.append(arena_alloc, .{ .send_keys = continue_cmd }) catch
-                        return self.defunct();
-                    self.trackFireAndForget();
+                    // Signal the caller (stream_handler) to send a
+                    // `refresh-client -A '%N:continue'` command for this
+                    // pane. The caller formats and sends it directly,
+                    // then calls trackFireAndForget().
+                    self.pause_continue_pane_id = info.pane_id;
                 } else {
                     log.warn("received %pause for unknown pane {}", .{info.pane_id});
                 }
@@ -1036,8 +1019,7 @@ pub const Viewer = struct {
                 // is now safe to send without interleaving with viewer
                 // commands.
                 self.initial_ready_sent = true;
-
-                self.appendAction(&actions, .ready) catch return self.defunct();
+                self.ready_just_fired = true;
             }
         }
 
@@ -1379,13 +1361,10 @@ pub const Viewer = struct {
 
         switch (command) {
             .user => {
-                try actions.append(
-                    arena_alloc,
-                    .{ .command_response = .{
-                        .content = content,
-                        .is_error = is_err,
-                    } },
-                );
+                self.last_command_response = .{
+                    .content = content,
+                    .is_error = is_err,
+                };
             },
 
             .pane_state => try self.receivedPaneState(content),
@@ -2278,20 +2257,21 @@ const TestStep = struct {
     input: Viewer.Input,
     contains_tags: []const std.meta.Tag(Viewer.Action) = &.{},
     contains_command: []const u8 = "",
-    contains_send_keys: []const u8 = "",
+    /// Expect the viewer's ready_just_fired flag to be set after this step.
+    expect_ready: bool = false,
+    /// Expect the viewer's pause_continue_pane_id to be set to this pane
+    /// after this step.
+    expect_pause_continue_pane: ?usize = null,
     check: ?*const fn (viewer: *Viewer, []const Viewer.Action) anyerror!void = null,
     check_command: ?*const fn (viewer: *Viewer, []const u8) anyerror!void = null,
 
     fn run(self: TestStep, viewer: *Viewer) !void {
         const actions = viewer.next(self.input);
 
-        // Common mistake, forgetting the newline on a command or send_keys.
+        // Common mistake, forgetting the newline on a command.
         for (actions) |action| {
             if (action == .command) {
                 try testing.expect(std.mem.endsWith(u8, action.command, "\n"));
-            }
-            if (action == .send_keys) {
-                try testing.expect(std.mem.endsWith(u8, action.send_keys, "\n"));
             }
         }
 
@@ -2319,17 +2299,15 @@ const TestStep = struct {
             try testing.expect(found);
         }
 
-        if (self.contains_send_keys.len > 0) {
-            var found = false;
-            for (actions) |action| {
-                if (action == .send_keys and
-                    std.mem.startsWith(u8, action.send_keys, self.contains_send_keys))
-                {
-                    found = true;
-                    break;
-                }
-            }
-            try testing.expect(found);
+        // Check field-based signals (replacements for former Action variants).
+        if (self.expect_ready) {
+            try testing.expect(viewer.ready_just_fired);
+            viewer.ready_just_fired = false;
+        }
+
+        if (self.expect_pause_continue_pane) |expected_pane| {
+            try testing.expectEqual(expected_pane, viewer.pause_continue_pane_id.?);
+            viewer.pause_continue_pane_id = null;
         }
 
         if (self.check) |check_fn| {
@@ -3342,10 +3320,9 @@ test "sendKeys basic formatting" {
     viewer.setActivePaneId(2);
 
     // "ls\r" = 0x6C 0x73 0x0D
-    const action = viewer.sendKeys("ls\r");
-    try testing.expect(action != null);
-    try testing.expect(action.? == .send_keys);
-    try testing.expectEqualStrings("send-keys -H -t %2 6C 73 0D\n", action.?.send_keys);
+    const result = viewer.sendKeys("ls\r");
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("send-keys -H -t %2 6C 73 0D\n", result.?);
 }
 
 test "sendKeys single byte" {
@@ -3358,9 +3335,9 @@ test "sendKeys single byte" {
     viewer.setActivePaneId(0);
 
     // Single byte: 'a' = 0x61
-    const action = viewer.sendKeys("a");
-    try testing.expect(action != null);
-    try testing.expectEqualStrings("send-keys -H -t %0 61\n", action.?.send_keys);
+    const result = viewer.sendKeys("a");
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("send-keys -H -t %0 61\n", result.?);
 }
 
 test "sendKeys escape sequence" {
@@ -3373,9 +3350,9 @@ test "sendKeys escape sequence" {
     viewer.setActivePaneId(10);
 
     // ESC [ A (cursor up) = 0x1B 0x5B 0x41
-    const action = viewer.sendKeys("\x1B[A");
-    try testing.expect(action != null);
-    try testing.expectEqualStrings("send-keys -H -t %10 1B 5B 41\n", action.?.send_keys);
+    const result = viewer.sendKeys("\x1B[A");
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("send-keys -H -t %10 1B 5B 41\n", result.?);
 }
 
 test "sendKeys empty data returns null" {
@@ -3449,17 +3426,17 @@ test "sendKeys after setActivePaneId round-trip" {
     try testing.expectEqual(@as(?usize, 5), viewer.active_pane_id);
 
     // sendKeys should now format for pane %5.
-    const action = viewer.sendKeys("a");
-    try testing.expect(action != null);
-    try testing.expectEqualStrings("send-keys -H -t %5 61\n", action.?.send_keys);
+    const result = viewer.sendKeys("a");
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("send-keys -H -t %5 61\n", result.?);
 
     // Switch to pane %2.
     viewer.setActivePaneId(2);
     try testing.expectEqual(@as(?usize, 2), viewer.active_pane_id);
 
-    const action2 = viewer.sendKeys("b");
-    try testing.expect(action2 != null);
-    try testing.expectEqualStrings("send-keys -H -t %2 62\n", action2.?.send_keys);
+    const result2 = viewer.sendKeys("b");
+    try testing.expect(result2 != null);
+    try testing.expectEqualStrings("send-keys -H -t %2 62\n", result2.?);
 
     // Set active to a non-existent pane — should be ignored.
     viewer.setActivePaneId(99);
@@ -5599,13 +5576,13 @@ test "flow control: pause sets pane paused and sends continue" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
         },
         // Now send %pause for pane 5
         .{
             .input = .{ .tmux = .{ .pause = .{ .pane_id = 5 } } },
-            // Should emit a send_keys action with the continue command
-            .contains_send_keys = "refresh-client -A '%5:continue'",
+            // Should set pause_continue_pane_id for the caller to handle
+            .expect_pause_continue_pane = 5,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane = v.panes.getEntry(5).?.value_ptr;
@@ -5660,12 +5637,12 @@ test "flow control: continue clears pane paused state" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
         },
         // Pause pane 5
         .{
             .input = .{ .tmux = .{ .pause = .{ .pane_id = 5 } } },
-            .contains_send_keys = "refresh-client -A '%5:continue'",
+            .expect_pause_continue_pane = 5,
         },
         // Continue pane 5
         .{
@@ -5724,7 +5701,7 @@ test "flow control: extended output feeds terminal" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
         },
         // Send extended output to pane 5
         .{
@@ -5795,18 +5772,16 @@ test "flow control: pause unknown pane is no-op" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
         },
         // Pause for non-existent pane 999 — should not crash
         .{
             .input = .{ .tmux = .{ .pause = .{ .pane_id = 999 } } },
             .check = (struct {
-                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    // No send_keys should be emitted for unknown pane
-                    for (actions) |action| {
-                        if (action == .send_keys) {
-                            return error.UnexpectedSendKeys;
-                        }
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // pause_continue_pane_id should NOT be set for unknown pane
+                    if (v.pause_continue_pane_id != null) {
+                        return error.UnexpectedPauseContinue;
                     }
                 }
             }).check,
@@ -5870,7 +5845,7 @@ test "pane state: mouse_all_flag sets flags.mouse_event to any" {
                 \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;1;0;0;0;0;1;0;0;0;43;8,16,24,32,40,48,56,64,72,80
                 ,
             } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
@@ -5937,7 +5912,7 @@ test "pane state: mouse_button_flag sets flags.mouse_event to button" {
                 \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;1;0;0;1;0;0;0;0;43;8,16,24,32,40,48,56,64,72,80
                 ,
             } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
@@ -5998,7 +5973,7 @@ test "pane state: mouse_standard_flag sets flags.mouse_event to x10" {
                 \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;1;0;0;0;0;0;43;8,16,24,32,40,48,56,64,72,80
                 ,
             } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
@@ -6058,7 +6033,7 @@ test "pane state: no mouse flags leaves flags.mouse_event as none" {
                 \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;43;8,16,24,32,40,48,56,64,72,80
                 ,
             } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
@@ -6117,7 +6092,7 @@ test "pane state: mouse_all_flag takes precedence over lower mouse modes" {
                 \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;1;1;1;1;1;1;0;0;0;43;8,16,24,32,40,48,56,64,72,80
                 ,
             } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
@@ -6177,7 +6152,7 @@ test "queueUserCommand returns command when queue is empty" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expect(v.command_queue.empty());
@@ -6309,7 +6284,7 @@ test "command_response emitted on user command block_end" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expect(v.command_queue.empty());
@@ -6323,19 +6298,13 @@ test "command_response emitted on user command block_end" {
         // Now simulate the response arriving as a block_end with content
         .{
             .input = .{ .tmux = .{ .block_end = "buffer content here" } },
-            .contains_tags = &.{.command_response},
             .check = (struct {
-                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    var found = false;
-                    for (actions) |action| {
-                        if (action == .command_response) {
-                            found = true;
-                            try testing.expectEqualStrings("buffer content here", action.command_response.content);
-                            try testing.expect(!action.command_response.is_error);
-                            break;
-                        }
-                    }
-                    try testing.expect(found);
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const resp = v.last_command_response orelse
+                        return error.MissingCommandResponse;
+                    try testing.expectEqualStrings("buffer content here", resp.content);
+                    try testing.expect(!resp.is_error);
+                    v.last_command_response = null;
                 }
             }).check,
         },
@@ -6390,7 +6359,7 @@ test "command_response with is_error on block_err" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expect(v.command_queue.empty());
@@ -6404,19 +6373,13 @@ test "command_response with is_error on block_err" {
         // Simulate error response from tmux
         .{
             .input = .{ .tmux = .{ .block_err = "no buffer nonexistent" } },
-            .contains_tags = &.{.command_response},
             .check = (struct {
-                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    var found = false;
-                    for (actions) |action| {
-                        if (action == .command_response) {
-                            found = true;
-                            try testing.expectEqualStrings("no buffer nonexistent", action.command_response.content);
-                            try testing.expect(action.command_response.is_error);
-                            break;
-                        }
-                    }
-                    try testing.expect(found);
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const resp = v.last_command_response orelse
+                        return error.MissingCommandResponse;
+                    try testing.expectEqualStrings("no buffer nonexistent", resp.content);
+                    try testing.expect(resp.is_error);
+                    v.last_command_response = null;
                 }
             }).check,
         },
@@ -6474,7 +6437,7 @@ test "fire-and-forget counter tracks send-keys responses" {
                 \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;43;8,16,24,32,40,48,56,64,72,80
                 ,
             } },
-            .contains_tags = &.{.ready},
+            .expect_ready = true,
         },
     });
 
