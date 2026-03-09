@@ -759,32 +759,43 @@ pub const StreamHandler = struct {
                                 },
                             });
                         },
-
-                        .active_window_changed => |window_id| {
-                            self.surfaceMessageWriter(.{
-                                .tmux_active_window_changed = window_id,
-                            });
-                        },
-
-                        .session_renamed => |name| {
-                            const data = try apprt.surface.Message.WriteReq.init(
-                                self.alloc,
-                                name,
-                            );
-                            self.surfaceMessageWriter(.{
-                                .tmux_session_renamed = data,
-                            });
-                        },
-
-                        .focused_pane_changed => |info| {
-                            self.surfaceMessageWriter(.{
-                                .tmux_focused_pane_changed = .{
-                                    .window_id = info.window_id,
-                                    .pane_id = info.pane_id,
-                                },
-                            });
-                        },
                     }
+                }
+
+                // Handle fork-specific surface notifications directly from
+                // the raw control notification, without going through the
+                // viewer's Action enum. The viewer still tracks internal
+                // state for these (e.g., active_window_id, session_name,
+                // focused_pane_id) but no longer emits actions for them.
+                switch (tmux) {
+                    .session_window_changed => |info| {
+                        if (info.session_id == viewer.session_id) {
+                            self.surfaceMessageWriter(.{
+                                .tmux_active_window_changed = info.window_id,
+                            });
+                        }
+                    },
+
+                    .session_renamed => |info| {
+                        const data = try apprt.surface.Message.WriteReq.init(
+                            self.alloc,
+                            info.name,
+                        );
+                        self.surfaceMessageWriter(.{
+                            .tmux_session_renamed = data,
+                        });
+                    },
+
+                    .window_pane_changed => |info| {
+                        self.surfaceMessageWriter(.{
+                            .tmux_focused_pane_changed = .{
+                                .window_id = info.window_id,
+                                .pane_id = info.pane_id,
+                            },
+                        });
+                    },
+
+                    else => {},
                 }
             },
 

@@ -347,27 +347,12 @@ pub const Viewer = struct {
         /// is valid until the next call to `next()`.
         command_response: CommandResponse,
 
-        /// The active window in our session changed. The apprt should
-        /// update its tab/window highlight to reflect the new active
-        /// window. The payload is the new window ID.
-        active_window_changed: usize,
-
         /// Send a `send-keys` command directly to tmux stdin for user
         /// input routing. Unlike `command`, this is fire-and-forget and
         /// must NOT go through the command queue (which would serialize
         /// every keystroke behind `%begin/%end` responses). The caller
         /// writes this directly to the backend. Includes trailing newline.
         send_keys: []const u8,
-
-        /// A session was renamed. The payload is the new session name.
-        session_renamed: []const u8,
-
-        /// The focused pane within a window changed. The payload carries
-        /// both the window ID and new focused pane ID.
-        focused_pane_changed: struct {
-            window_id: usize,
-            pane_id: usize,
-        },
 
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
@@ -839,7 +824,8 @@ pub const Viewer = struct {
             // which pane tmux considers focused in each window (e.g.,
             // when switching windows, the apprt needs to highlight the
             // correct pane rather than falling back to the first pane).
-            // Also emit an action so the apprt can update focus indicators.
+            // The stream_handler sends the surface notification directly
+            // from the raw control notification.
             .window_pane_changed => |info| {
                 for (self.windows.items) |*win| {
                     if (win.id == info.window_id) {
@@ -847,16 +833,6 @@ pub const Viewer = struct {
                         break;
                     }
                 }
-
-                self.appendAction(&actions, .{
-                    .focused_pane_changed = .{
-                        .window_id = info.window_id,
-                        .pane_id = info.pane_id,
-                    },
-                }) catch {
-                    log.warn("failed to emit focused pane changed action", .{});
-                    return self.defunct();
-                };
             },
 
             // Sessions changed — forwarded by stream_handler directly.
@@ -887,15 +863,11 @@ pub const Viewer = struct {
 
             // The active window in our session changed (e.g., the user
             // switched windows via tmux prefix+n). Track it so the apprt
-            // can highlight the correct tab.
+            // can highlight the correct tab. The stream_handler sends the
+            // surface notification directly from the raw control notification.
             .session_window_changed => |info| {
                 if (info.session_id == self.session_id) {
                     self.active_window_id = info.window_id;
-
-                    self.appendAction(&actions, .{ .active_window_changed = info.window_id }) catch {
-                        log.warn("failed to emit active window changed action, becoming defunct", .{});
-                        return self.defunct();
-                    };
                 }
             },
 
@@ -908,8 +880,9 @@ pub const Viewer = struct {
             // Pane mode changes — forwarded by stream_handler directly.
             .pane_mode_changed => {},
 
-            // Session renamed. Update our stored session name and emit
-            // an action so the apprt can update its display.
+            // Session renamed. Update our stored session name. The
+            // stream_handler sends the surface notification directly
+            // from the raw control notification.
             .session_renamed => |info| {
                 if (info.id == self.session_id) {
                     // Dupe the name into self.alloc since info.name is
@@ -922,11 +895,6 @@ pub const Viewer = struct {
                     if (self.session_name) |old| self.alloc.free(old);
                     self.session_name = duped;
                 }
-
-                self.appendAction(&actions, .{ .session_renamed = info.name }) catch {
-                    log.warn("failed to emit session renamed action", .{});
-                    return self.defunct();
-                };
             },
 
             // Unlinked window notifications are for windows in sessions other
