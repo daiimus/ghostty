@@ -1752,17 +1752,25 @@ pub const Viewer = struct {
                 return err;
             };
 
+            // Build the window value before appending so that errdefer
+            // can clean up partial allocations if a later step fails.
+            const name: []const u8 = if (data.window_name.len > 0)
+                try self.alloc.dupe(u8, data.window_name)
+            else
+                "";
+            errdefer if (name.len > 0) self.alloc.free(name);
+
+            const raw_layout = try self.alloc.dupe(u8, data.window_layout);
+            errdefer self.alloc.free(raw_layout);
+
             try windows.append(self.alloc, .{
                 .id = data.window_id,
                 .width = data.window_width,
                 .height = data.window_height,
                 .layout_arena = arena.state,
                 .layout = layout,
-                .name = if (data.window_name.len > 0)
-                    try self.alloc.dupe(u8, data.window_name)
-                else
-                    "",
-                .raw_layout = try self.alloc.dupe(u8, data.window_layout),
+                .name = name,
+                .raw_layout = raw_layout,
             });
         }
 
@@ -2086,12 +2094,9 @@ pub const Viewer = struct {
             stream.parser = .init();
             stream.deinit();
         }
-        // Explicit catch + return instead of `try` to log the error with
-        // the pane ID context before propagating.
-        stream.nextSlice(data) catch |err| {
-            log.info("failed to process output for pane id={}: {}", .{ id, err });
-            return err;
-        };
+        // Use try — callers catch and log with their own context
+        // (pane ID, whether it's extended output, etc.).
+        try stream.nextSlice(data);
 
         // Wake all observer renderers bound to this pane so they
         // re-render the new content. On iOS there is no display link,
