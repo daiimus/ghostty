@@ -1473,7 +1473,8 @@ pub const Viewer = struct {
         //
         // No errdefer cleanup needed for the queued commands: the command
         // variants are value types (union enum) that don't own heap memory,
-        // and on error the viewer goes defunct (self.deinit clears the queue).
+        // and any queued commands are reclaimed when the viewer is eventually
+        // deinitialized by its owner.
         {
             var panes_it = panes.iterator();
             var added: bool = false;
@@ -7215,46 +7216,38 @@ test "flow control: wait-exit in enable_flow_control command" {
 
 test "session_renamed persists name across subsequent next() calls" {
     // Verify that session_name is heap-duped and survives parser buffer
-    // reuse from subsequent next() calls.
+    // reuse from subsequent next() calls. We use a mutable buffer to
+    // simulate the real failure mode: info.name points into a parser
+    // buffer that gets overwritten on the next parse.
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
 
-    try testViewer(&viewer, &.{
-        // Initial startup
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{
-            .input = .{ .tmux = .{ .session_changed = .{
-                .id = 1,
-                .name = "initial",
-            } } },
-            .contains_command = "display-message",
-        },
-        // Deliver session_renamed notification
-        .{
-            .input = .{ .tmux = .{ .session_renamed = .{
-                .id = 1,
-                .name = "renamed-session",
-            } } },
-            .contains_tags = &.{.session_renamed},
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqualStrings("renamed-session", v.session_name.?);
-                }
-            }).check,
-        },
-        // Process another notification to force parser buffer reuse.
-        // If session_name was an unowned pointer, it would be invalid now.
-        .{
-            .input = .{ .tmux = .{ .session_renamed = .{
-                .id = 1,
-                .name = "overwritten-buffer-content",
-            } } },
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    // After the second rename, session_name should be the new name
-                    try testing.expectEqualStrings("overwritten-buffer-content", v.session_name.?);
-                }
-            }).check,
-        },
-    });
+    // Bootstrap the viewer into connected state.
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+    _ = viewer.next(.{ .tmux = .{ .session_changed = .{
+        .id = 1,
+        .name = "initial",
+    } } });
+
+    // Create a mutable buffer simulating a parser buffer.
+    var buf: [32]u8 = undefined;
+    const original_name = "renamed-session";
+    @memcpy(buf[0..original_name.len], original_name);
+    const name_slice: []const u8 = buf[0..original_name.len];
+
+    // Feed session_renamed with a pointer into our mutable buffer.
+    _ = viewer.next(.{ .tmux = .{ .session_renamed = .{
+        .id = 1,
+        .name = name_slice,
+    } } });
+
+    // session_name should be duped and match the original.
+    try testing.expectEqualStrings(original_name, viewer.session_name.?);
+
+    // Overwrite the mutable buffer (simulating parser buffer reuse).
+    @memset(buf[0..original_name.len], 'X');
+
+    // If session_name was an unowned pointer, it would now read "XXXXXXXXXXXXXXX".
+    // Because it was duped, it should still be "renamed-session".
+    try testing.expectEqualStrings(original_name, viewer.session_name.?);
 }
