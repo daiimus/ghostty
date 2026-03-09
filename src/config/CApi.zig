@@ -155,9 +155,12 @@ fn config_trigger_(
 }
 
 export fn ghostty_config_diagnostics_count(self: *Config) u32 {
-    // Safe to @intCast: diagnostic counts are bounded by the number of
-    // config keys, which is far below u32 max.
-    return @intCast(self._diagnostics.items().len);
+    // Clamp to u32 max so the narrowing conversion from usize is explicit
+    // and cannot overflow, even if diagnostics grow beyond config keys
+    // (e.g. via CLI args or recursive config-file loads).
+    const len = self._diagnostics.items().len;
+    if (len > std.math.maxInt(u32)) return std.math.maxInt(u32);
+    return @intCast(len);
 }
 
 export fn ghostty_config_get_diagnostic(self: *Config, idx: u32) Diagnostic {
