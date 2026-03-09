@@ -2086,8 +2086,15 @@ pub const CAPI = struct {
             // Success — now safe to remove the old observer.
             // Use unregisterObserver with prev_pane_id (not ByPtr) to
             // avoid accidentally removing the registration we just added.
+            // Guard: only unregister if the previous pane differs from the
+            // new one. When prev_pane_id == pane_id (e.g. first observer
+            // registration after set_active_pane_input_only), unregistering
+            // with the same terminal_ptr would remove the observer we just
+            // registered, leaving the surface without fixup coverage.
             if (prev_pane_id) |pid| {
-                viewer.unregisterObserver(pid, &surface.core_surface.renderer_state.terminal);
+                if (pid != pane_id) {
+                    viewer.unregisterObserver(pid, &surface.core_surface.renderer_state.terminal);
+                }
             }
         } else if (prev_pane_id != null and prev_pane_id.? == pane_id) {
             // Re-registration to the same pane — observer already exists,
@@ -2097,7 +2104,20 @@ pub const CAPI = struct {
             // prevent the surface from rendering a pane terminal that
             // the viewer won't fix up after layout changes.
             surface.core_surface.renderer_state.terminal = prev_terminal;
-            viewer.setActivePaneId(prev_pane_id);
+
+            // Restore the previous active pane if it still exists in the
+            // viewer's pane map; otherwise clear it to avoid leaving
+            // active_pane_id pointing at the new pane when we've reverted
+            // the renderer terminal.
+            if (prev_pane_id) |pid| {
+                if (viewer.panes.getPtr(pid) != null) {
+                    viewer.setActivePaneId(prev_pane_id);
+                } else {
+                    viewer.setActivePaneId(null);
+                }
+            } else {
+                viewer.setActivePaneId(null);
+            }
             log.warn("tmux observer registration failed for pane {}", .{pane_id});
             return false;
         }
@@ -2425,15 +2445,17 @@ pub const CAPI = struct {
         //    release immediately (no shared state depends on it anymore
         //    since we already restored the terminal pointer above).
         //
-        // 2. renderer_state.mutex is a *std.Thread.Mutex (pointer), and
-        //    pointer assignment on all supported platforms (aarch64, x86_64)
-        //    is naturally aligned and single-word, so the store is atomic
-        //    at the hardware level. There is no risk of a torn read.
+        // 2. We use @atomicStore to make the pointer swap visible to other
+        //    threads under Zig's memory model. The renderer thread reads
+        //    this field without @atomicLoad, but the subsequent .lock()
+        //    call is itself a synchronization point (acquire fence), so
+        //    the renderer always sees the fully-initialized mutex object
+        //    regardless of which pointer value it reads.
         //
         // 3. The tmux_pane_binding = null below ensures subsequent render
         //    cycles use the surface's own terminal, not the shared pane.
         target.core_surface.renderer_state.mutex.unlock();
-        target.core_surface.renderer_state.mutex = binding.original_mutex;
+        @atomicStore(*std.Thread.Mutex, &target.core_surface.renderer_state.mutex, binding.original_mutex, .release);
         target.core_surface.tmux_pane_binding = null;
 
         // Wake the target's renderer to redraw with its own terminal.
@@ -3163,34 +3185,43 @@ pub const CAPI = struct {
                 matches.append(arena_alloc, cloned) catch continue;
             }
 
-            _ = surface.renderer_thread.mailbox.push(
+            const pushed = surface.renderer_thread.mailbox.push(
                 .{ .search_viewport_matches = .{
                     .arena = arena,
                     .matches = matches.items,
                 } },
                 .forever,
             );
-            arena_transferred = true;
-            surface.renderer_thread.wakeup.notify() catch {};
+            // Only mark transferred if push succeeded (non-zero return).
+            // On failure (e.g. spurious wakeup while full), the defer
+            // will deinit the arena to prevent a leak.
+            arena_transferred = pushed > 0;
+            if (arena_transferred) {
+                surface.renderer_thread.wakeup.notify() catch {};
+            }
         }
 
         /// Helper: Notify renderer about selected match (using Flattened highlight)
         fn notifySelectedMatch(surface: *CoreSurface, hl: terminal.highlight.Flattened) void {
             var arena: std.heap.ArenaAllocator = .init(surface.alloc);
-            errdefer arena.deinit();
+            var arena_transferred = false;
+            defer if (!arena_transferred) arena.deinit();
             const arena_alloc = arena.allocator();
 
             // Clone the flattened highlight
             const cloned = hl.clone(arena_alloc) catch return;
 
-            _ = surface.renderer_thread.mailbox.push(
+            const pushed = surface.renderer_thread.mailbox.push(
                 .{ .search_selected_match = .{
                     .arena = arena,
                     .match = cloned,
                 } },
                 .forever,
             );
-            surface.renderer_thread.wakeup.notify() catch {};
+            arena_transferred = pushed > 0;
+            if (arena_transferred) {
+                surface.renderer_thread.wakeup.notify() catch {};
+            }
         }
 
         export fn ghostty_surface_set_display_id(ptr: *Surface, display_id: u32) void {
