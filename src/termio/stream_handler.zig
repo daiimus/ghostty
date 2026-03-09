@@ -81,6 +81,13 @@ pub const StreamHandler = struct {
     /// viewer stay aligned with upstream.
     tmux_observers: if (tmux_enabled) ObserverList else void = if (tmux_enabled) .empty else {},
 
+    /// The currently active tmux window ID, as reported by
+    /// `%session-window-changed`. Tracked here (not on the viewer) because
+    /// it is fork-only GUI state that the apprt polls via C API. Null
+    /// until the first `%session-window-changed` notification. Cleared
+    /// when the active window is closed.
+    tmux_active_window_id: if (tmux_enabled) ?usize else void = if (tmux_enabled) null else {},
+
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
     /// to wake up the termio thread.
@@ -597,6 +604,9 @@ pub const StreamHandler = struct {
                             self.tmux_viewer = null;
                         }
 
+                        // Clear fork-only GUI state.
+                        self.tmux_active_window_id = null;
+
                         // Notify the surface that tmux control mode
                         // has exited, including the exit reason. The
                         // reason was copied into exit_reason above
@@ -705,6 +715,17 @@ pub const StreamHandler = struct {
                                 }
                             }
 
+                            // Clear active window ID if the window was
+                            // removed (e.g., window_close). This was
+                            // previously done by the viewer but is now
+                            // tracked here as fork-only GUI state.
+                            if (self.tmux_active_window_id) |awid| {
+                                const still_exists = for (windows) |w| {
+                                    if (w.id == awid) break true;
+                                } else false;
+                                if (!still_exists) self.tmux_active_window_id = null;
+                            }
+
                             self.surfaceMessageWriter(.{ .tmux_state_changed = state });
                         },
                     }
@@ -777,12 +798,12 @@ pub const StreamHandler = struct {
 
                 // Handle fork-specific surface notifications directly from
                 // the raw control notification, without going through the
-                // viewer's Action enum. The viewer still tracks internal
-                // state for these (e.g., active_window_id, focused_pane_id)
-                // but no longer emits actions for them.
+                // viewer's Action enum. The viewer treats these as no-ops
+                // (matching upstream), while we track GUI state here.
                 switch (tmux) {
                     .session_window_changed => |info| {
                         if (info.session_id == viewer.session_id) {
+                            self.tmux_active_window_id = info.window_id;
                             self.surfaceMessageWriter(.{
                                 .tmux_active_window_changed = info.window_id,
                             });

@@ -2274,8 +2274,9 @@ pub const CAPI = struct {
         surface.core_surface.renderer_state.mutex.lock();
         defer surface.core_surface.renderer_state.mutex.unlock();
 
-        const viewer = handler.tmux_viewer orelse return -1;
-        const id = viewer.active_window_id orelse return -1;
+        // active_window_id is tracked by stream_handler (fork-only GUI
+        // state), not by the viewer.
+        const id = handler.tmux_active_window_id orelse return -1;
         return @intCast(id);
     }
 

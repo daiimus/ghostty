@@ -244,11 +244,6 @@ pub const Viewer = struct {
     /// no pane is active and `sendKeys` will return null.
     active_pane_id: ?usize,
 
-    /// The currently active window ID, as reported by tmux via
-    /// `%session-window-changed`. This lets the apprt know which window
-    /// tab should be highlighted. Null until the first notification.
-    active_window_id: ?usize,
-
     /// Count of fire-and-forget commands (e.g., send-keys, flow control
     /// continue) whose %begin/%end responses have not yet arrived. When
     /// a block response arrives with an empty command queue, this counter
@@ -488,7 +483,6 @@ pub const Viewer = struct {
             .action_single = undefined,
             .initial_ready_sent = false,
             .active_pane_id = null,
-            .active_window_id = null,
             .pending_fire_and_forget = 0,
         };
     }
@@ -889,15 +883,9 @@ pub const Viewer = struct {
                 };
             },
 
-            // The active window in our session changed (e.g., the user
-            // switched windows via tmux prefix+n). Track it so the apprt
-            // can highlight the correct tab. The stream_handler sends the
-            // surface notification directly from the raw control notification.
-            .session_window_changed => |info| {
-                if (info.session_id == self.session_id) {
-                    self.active_window_id = info.window_id;
-                }
-            },
+            // The active window changed. Stream_handler tracks this
+            // directly from the raw control notification for the apprt.
+            .session_window_changed => {},
 
             // This is for other clients, which we don't do anything about.
             // For us, we'll get `exit` or `session_changed`, respectively.
@@ -1169,11 +1157,6 @@ pub const Viewer = struct {
         if (self.window_metadata.fetchRemove(window_id)) |kv| {
             var md = kv.value;
             md.deinit(self.alloc);
-        }
-
-        // Clear active_window_id if it was this window.
-        if (self.active_window_id) |awid| {
-            if (awid == window_id) self.active_window_id = null;
         }
 
         // Sync layouts to prune orphaned panes. This re-evaluates which
@@ -3756,163 +3739,6 @@ test "window_close removes window and orphaned panes" {
                     try testing.expectEqual(1, v.panes.count());
                     try testing.expect(v.panes.contains(0));
                     try testing.expect(!v.panes.contains(2));
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
-            .contains_tags = &.{.exit},
-        },
-    });
-}
-
-test "window_close clears active_window_id" {
-    var viewer = try Viewer.init(testing.allocator);
-    defer viewer.deinit();
-
-    try testViewer(&viewer, &.{
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{
-            .input = .{ .tmux = .{ .session_changed = .{
-                .id = 1,
-                .name = "test",
-            } } },
-            .contains_command = "display-message",
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "refresh-client",
-        },
-        // Flow control response, triggers register_subscriptions
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_command = "refresh-client",
-        },
-        // Subscription registration response, triggers list-windows
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_command = "list-windows",
-        },
-        .{
-            .input = .{ .tmux = .{
-                .block_end =
-                \\$1;@0;83;44;bash;b7dd,83x44,0,0,0
-                ,
-            } },
-            .contains_tags = &.{ .windows, .command },
-        },
-        // Drain capture-pane commands + pane_state
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        // Set active_window_id via session-window-changed
-        .{
-            .input = .{ .tmux = .{ .session_window_changed = .{
-                .session_id = 1,
-                .window_id = 0,
-            } } },
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(@as(?usize, 0), v.active_window_id);
-                }
-            }).check,
-        },
-        // Close the active window
-        .{
-            .input = .{ .tmux = .{ .window_close = .{ .id = 0 } } },
-            .contains_tags = &.{.windows},
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(0, v.windows.items.len);
-                    // active_window_id should be cleared
-                    try testing.expectEqual(@as(?usize, null), v.active_window_id);
-                }
-            }).check,
-        },
-        .{
-            .input = .{ .tmux = .{ .exit = .{ .reason = "" } } },
-            .contains_tags = &.{.exit},
-        },
-    });
-}
-
-test "session_window_changed sets active_window_id" {
-    var viewer = try Viewer.init(testing.allocator);
-    defer viewer.deinit();
-
-    try testViewer(&viewer, &.{
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{
-            .input = .{ .tmux = .{ .session_changed = .{
-                .id = 1,
-                .name = "test",
-            } } },
-            .contains_command = "display-message",
-        },
-        .{
-            .input = .{ .tmux = .{ .block_end = "3.5a" } },
-            .contains_command = "refresh-client",
-        },
-        // Flow control response, triggers register_subscriptions
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_command = "refresh-client",
-        },
-        // Subscription registration response, triggers list-windows
-        .{
-            .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_command = "list-windows",
-        },
-        .{
-            .input = .{ .tmux = .{
-                .block_end =
-                \\$1;@0;83;44;bash;b7dd,83x44,0,0,0
-                ,
-            } },
-            .contains_tags = &.{ .windows, .command },
-        },
-        // Drain capture-pane commands + pane_state
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        // active_window_id starts null
-        .{
-            .input = .{ .tmux = .{ .session_window_changed = .{
-                .session_id = 1,
-                .window_id = 0,
-            } } },
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(@as(?usize, 0), v.active_window_id);
-                }
-            }).check,
-        },
-        // Switch to window @3
-        .{
-            .input = .{ .tmux = .{ .session_window_changed = .{
-                .session_id = 1,
-                .window_id = 3,
-            } } },
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(@as(?usize, 3), v.active_window_id);
-                }
-            }).check,
-        },
-        // Different session — should be ignored
-        .{
-            .input = .{ .tmux = .{ .session_window_changed = .{
-                .session_id = 99,
-                .window_id = 7,
-            } } },
-            .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    // Should still be 3, not 7
-                    try testing.expectEqual(@as(?usize, 3), v.active_window_id);
                 }
             }).check,
         },
