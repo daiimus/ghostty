@@ -611,10 +611,10 @@ pub const Viewer = struct {
         defer self.action_arena = arena.state;
         const arena_alloc = arena.allocator();
 
-        // Calculate the pane ID digit count manually to avoid allocation.
+        // Calculate the pane ID digit count manually to size the buffer once.
         // This is a hot path (every keystroke in tmux mode), so we compute
-        // the decimal width inline rather than using std.fmt which would
-        // require a temporary buffer or allocation.
+        // the decimal width inline instead of using a formatting helper like
+        // std.fmt.allocPrint that would perform an extra pass and allocation.
         var id_digits: usize = 1;
         {
             var n = pane_id;
@@ -1092,7 +1092,7 @@ pub const Viewer = struct {
                 if (info.id == self.session_id) {
                     // Dupe the name into self.alloc since info.name is
                     // a view into the parser buffer, invalidated on the next
-                    // next() call.
+                    // call to next().
                     const duped = self.alloc.dupe(u8, info.name) catch {
                         log.warn("failed to dupe session name", .{});
                         return self.defunct();
