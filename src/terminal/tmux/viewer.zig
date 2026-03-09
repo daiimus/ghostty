@@ -456,7 +456,7 @@ pub const Viewer = struct {
             // name and raw_layout use empty string "" as a sentinel for
             // "no name" / "no layout". Empty string literals are static
             // (not heap-allocated), so we must not free them. Non-empty
-            // values are heap-duped in receivedListWindows.
+            // values are heap-duped by the viewer.
             if (self.name.len > 0) alloc.free(self.name);
             if (self.raw_layout.len > 0) alloc.free(self.raw_layout);
             self.layout_arena.promote(alloc).deinit();
@@ -1091,7 +1091,7 @@ pub const Viewer = struct {
             .session_renamed => |info| {
                 if (info.id == self.session_id) {
                     // Dupe the name into self.alloc since info.name is
-                    // a view into the parser buffer, invalidated on next
+                    // a view into the parser buffer, invalidated on the next
                     // next() call.
                     const duped = self.alloc.dupe(u8, info.name) catch {
                         log.warn("failed to dupe session name", .{});
@@ -7207,6 +7207,52 @@ test "flow control: wait-exit in enable_flow_control command" {
                     }
                     // Flow control command must be present at this point
                     return error.FlowControlCommandNotFound;
+                }
+            }).check,
+        },
+    });
+}
+
+test "session_renamed persists name across subsequent next() calls" {
+    // Verify that session_name is heap-duped and survives parser buffer
+    // reuse from subsequent next() calls.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "initial",
+            } } },
+            .contains_command = "display-message",
+        },
+        // Deliver session_renamed notification
+        .{
+            .input = .{ .tmux = .{ .session_renamed = .{
+                .id = 1,
+                .name = "renamed-session",
+            } } },
+            .contains_tags = &.{.session_renamed},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqualStrings("renamed-session", v.session_name.?);
+                }
+            }).check,
+        },
+        // Process another notification to force parser buffer reuse.
+        // If session_name was an unowned pointer, it would be invalid now.
+        .{
+            .input = .{ .tmux = .{ .session_renamed = .{
+                .id = 1,
+                .name = "overwritten-buffer-content",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // After the second rename, session_name should be the new name
+                    try testing.expectEqualStrings("overwritten-buffer-content", v.session_name.?);
                 }
             }).check,
         },
