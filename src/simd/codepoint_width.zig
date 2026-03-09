@@ -26,14 +26,14 @@ test "codepointWidth basic" {
     // try testing.expectEqual(@as(i8, 1), @import("uucode").get(.width, 0x100));
 }
 
-// Exhaustive verification — slow in debug mode (~30s), fast in release.
-// IMPORTANT: UNCOMMENT THIS WHENEVER MAKING CODEPOINTWIDTH CHANGES.
+// Exhaustive verification: always enabled. Slow in debug mode (~30s), fast in release.
+// This test guards changes to codepointWidth by ensuring it stays consistent with uucode.
 test "codepointWidth matches uucode" {
     const testing = std.testing;
     const uucode = @import("uucode");
 
     const min = 0xFF + 1; // start outside ascii
-    const max = std.math.maxInt(u21) + 1;
+    const max = uucode.config.max_code_point + 1;
     for (min..max) |cp| {
         // Skip surrogates — not valid Unicode scalar values.
         if (cp >= 0xD800 and cp <= 0xDFFF) continue;
