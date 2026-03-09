@@ -188,6 +188,12 @@ pub const Viewer = struct {
     /// The panes in the current session, mapped by pane ID.
     panes: PanesMap,
 
+    /// Fork-only metadata for windows (name, raw_layout, focused_pane_id).
+    /// Keyed by window ID. Kept separate from the Window struct so that
+    /// the Window struct matches upstream. Metadata survives session
+    /// changes for windows that persist across sessions.
+    window_metadata: WindowMetadataMap,
+
     /// The arena used for the prior action allocated state. This contains
     /// the contents for the actions as well as the actions slice itself.
     action_arena: ArenaAllocator.State,
@@ -261,6 +267,7 @@ pub const Viewer = struct {
 
     pub const CommandQueue = CircBuf(Command, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, Pane);
+    pub const WindowMetadataMap = std.AutoHashMapUnmanaged(usize, WindowMetadata);
 
     /// A parsed tmux version for comparison purposes. Tmux versions
     /// follow the format "major.minor[suffix]" where suffix is an
@@ -402,26 +409,34 @@ pub const Viewer = struct {
         height: usize,
         layout_arena: ArenaAllocator.State,
         layout: Layout,
+
+        pub fn deinit(self: *Window, alloc: Allocator) void {
+            self.layout_arena.promote(alloc).deinit();
+        }
+    };
+
+    /// Fork-only metadata for tmux windows that does not belong on the
+    /// Window struct (which should match upstream). Keyed by window ID.
+    pub const WindowMetadata = struct {
         /// The window name (e.g., "bash", "vim"). Owned by the Viewer's
         /// allocator (duped from tmux output). Empty string if unknown.
-        name: []const u8,
+        name: []const u8 = "",
         /// The raw tmux layout string (e.g., "b7dd,83x44,0,0,0"). Owned by
         /// the Viewer's allocator. This crosses the C API boundary so Swift
         /// can parse it with its own layout parser. Empty string if unknown.
-        raw_layout: []const u8,
+        raw_layout: []const u8 = "",
         /// The pane that tmux considers focused in this window.
         /// Set by `%window-pane-changed` notifications. `null` means
         /// we haven't received a focus notification for this window yet.
         focused_pane_id: ?usize = null,
 
-        pub fn deinit(self: *Window, alloc: Allocator) void {
+        pub fn deinit(self: *WindowMetadata, alloc: Allocator) void {
             // name and raw_layout use empty string "" as a sentinel for
             // "no name" / "no layout". Empty string literals are static
             // (not heap-allocated), so we must not free them. Non-empty
             // values are heap-duped by the viewer.
             if (self.name.len > 0) alloc.free(self.name);
             if (self.raw_layout.len > 0) alloc.free(self.raw_layout);
-            self.layout_arena.promote(alloc).deinit();
         }
     };
 
@@ -466,6 +481,7 @@ pub const Viewer = struct {
             .command_queue = command_queue,
             .windows = .empty,
             .panes = .empty,
+            .window_metadata = .empty,
             .action_arena = .{},
             // Safety: action_single is only accessed via singleAction(),
             // which writes the element before returning a slice over it.
@@ -481,6 +497,11 @@ pub const Viewer = struct {
         {
             for (self.windows.items) |*window| window.deinit(self.alloc);
             self.windows.deinit(self.alloc);
+        }
+        {
+            var it = self.window_metadata.iterator();
+            while (it.next()) |kv| kv.value_ptr.deinit(self.alloc);
+            self.window_metadata.deinit(self.alloc);
         }
         {
             var it = self.command_queue.iterator(.forward);
@@ -832,18 +853,13 @@ pub const Viewer = struct {
                 return self.defunct();
             },
 
-            // The active pane changed. Track it so the apprt can query
-            // which pane tmux considers focused in each window (e.g.,
-            // when switching windows, the apprt needs to highlight the
-            // correct pane rather than falling back to the first pane).
-            // The stream_handler sends the surface notification directly
-            // from the raw control notification.
+            // The active pane changed. Track it in the metadata map
+            // so the apprt can query which pane tmux considers focused
+            // in each window. The stream_handler sends the surface
+            // notification directly from the raw control notification.
             .window_pane_changed => |info| {
-                for (self.windows.items) |*win| {
-                    if (win.id == info.window_id) {
-                        win.focused_pane_id = info.pane_id;
-                        break;
-                    }
+                if (self.window_metadata.getPtr(info.window_id)) |md| {
+                    md.focused_pane_id = info.pane_id;
                 }
             },
 
@@ -1067,9 +1083,11 @@ pub const Viewer = struct {
             };
         };
 
-        // Stash the raw layout string so it can cross the C API boundary.
-        if (window.raw_layout.len > 0) self.alloc.free(window.raw_layout);
-        window.raw_layout = try self.alloc.dupe(u8, layout_str);
+        // Stash the raw layout string in the metadata map.
+        if (self.window_metadata.getPtr(window_id)) |md| {
+            if (md.raw_layout.len > 0) self.alloc.free(md.raw_layout);
+            md.raw_layout = try self.alloc.dupe(u8, layout_str);
+        }
 
         // Reset our arena so we can build up actions.
         var arena = self.action_arena.promote(self.alloc);
@@ -1096,27 +1114,31 @@ pub const Viewer = struct {
         try self.queueCommands(&.{.list_windows});
     }
 
-    /// When a window is renamed, update the stored name and emit a
-    /// `.windows` action so the apprt can refresh its tab bar.
+    /// When a window is renamed, update the stored name in the metadata
+    /// map and emit a `.windows` action so the apprt can refresh its tab bar.
     fn windowRenamed(
         self: *Viewer,
         actions: *std.ArrayList(Action),
         window_id: usize,
         new_name: []const u8,
     ) !void {
-        const window: *Window = window: for (self.windows.items) |*w| {
-            if (w.id == window_id) break :window w;
-        } else {
+        // Verify the window exists in our window list.
+        const found = for (self.windows.items) |*w| {
+            if (w.id == window_id) break true;
+        } else false;
+        if (!found) {
             log.info("window rename for unknown window id={}", .{window_id});
             return;
-        };
+        }
 
-        // Replace the old name with the new one.
-        if (window.name.len > 0) self.alloc.free(window.name);
-        window.name = if (new_name.len > 0)
-            try self.alloc.dupe(u8, new_name)
-        else
-            "";
+        // Update the name in the metadata map.
+        if (self.window_metadata.getPtr(window_id)) |md| {
+            if (md.name.len > 0) self.alloc.free(md.name);
+            md.name = if (new_name.len > 0)
+                try self.alloc.dupe(u8, new_name)
+            else
+                "";
+        }
 
         // Notify the apprt that windows changed so it can refresh.
         try self.appendAction(actions, .{ .windows = self.windows.items });
@@ -1141,6 +1163,12 @@ pub const Viewer = struct {
         } else {
             log.info("window close for unknown window id={}", .{window_id});
             return;
+        }
+
+        // Clean up fork-only metadata for this window.
+        if (self.window_metadata.fetchRemove(window_id)) |kv| {
+            var md = kv.value;
+            md.deinit(self.alloc);
         }
 
         // Clear active_window_id if it was this window.
@@ -1496,9 +1524,24 @@ pub const Viewer = struct {
                 .height = data.window_height,
                 .layout_arena = arena.state,
                 .layout = layout,
-                .name = name,
-                .raw_layout = raw_layout,
             });
+
+            // Store fork-only metadata separately, keyed by window ID.
+            // If there's already an entry (from a prior list-windows),
+            // update it rather than replacing (to preserve focused_pane_id).
+            const md_result = try self.window_metadata.getOrPut(self.alloc, data.window_id);
+            if (!md_result.found_existing) {
+                md_result.value_ptr.* = .{};
+            }
+            // Update name
+            if (md_result.value_ptr.name.len > 0) self.alloc.free(md_result.value_ptr.name);
+            md_result.value_ptr.name = if (data.window_name.len > 0)
+                try self.alloc.dupe(u8, data.window_name)
+            else
+                "";
+            // Update raw_layout
+            if (md_result.value_ptr.raw_layout.len > 0) self.alloc.free(md_result.value_ptr.raw_layout);
+            md_result.value_ptr.raw_layout = try self.alloc.dupe(u8, data.window_layout);
         }
 
         // Setup our windows action so the caller can process GUI
@@ -3569,8 +3612,10 @@ test "window name and raw layout from list-windows" {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(1, v.windows.items.len);
                     const window = v.windows.items[0];
-                    try testing.expectEqualStrings("vim", window.name);
-                    try testing.expectEqualStrings("b7dd,83x44,0,0,0", window.raw_layout);
+                    _ = window; // Window struct no longer has fork-only fields
+                    const md = v.window_metadata.get(v.windows.items[0].id).?;
+                    try testing.expectEqualStrings("vim", md.name);
+                    try testing.expectEqualStrings("b7dd,83x44,0,0,0", md.raw_layout);
                 }
             }).check,
         },
@@ -3632,7 +3677,8 @@ test "window_renamed updates name" {
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(1, v.windows.items.len);
-                    try testing.expectEqualStrings("vim", v.windows.items[0].name);
+                    const md = v.window_metadata.get(v.windows.items[0].id).?;
+                    try testing.expectEqualStrings("vim", md.name);
                 }
             }).check,
         },
@@ -3914,9 +3960,10 @@ test "layout_change stashes raw layout" {
             .contains_tags = &.{ .windows, .command },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const md = v.window_metadata.get(v.windows.items[0].id).?;
                     try testing.expectEqualStrings(
                         "b7dd,83x44,0,0,0",
-                        v.windows.items[0].raw_layout,
+                        md.raw_layout,
                     );
                 }
             }).check,
@@ -3938,9 +3985,10 @@ test "layout_change stashes raw layout" {
             .contains_tags = &.{.windows},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const md = v.window_metadata.get(v.windows.items[0].id).?;
                     try testing.expectEqualStrings(
                         "e07b,83x44,0,0[83x22,0,0,0,83x21,0,23,2]",
-                        v.windows.items[0].raw_layout,
+                        md.raw_layout,
                     );
                 }
             }).check,

@@ -2215,16 +2215,19 @@ pub const CAPI = struct {
         if (index >= windows.len) return std.mem.zeroes(TmuxWindowInfo);
 
         const win = windows[index];
-        const copy_len = @min(win.name.len, name_buf_len);
+
+        // Look up fork-only metadata (name) from the separate map.
+        const name = if (viewer.window_metadata.get(win.id)) |md| md.name else "";
+        const copy_len = @min(name.len, name_buf_len);
         if (out_name) |buf| {
-            @memcpy(buf[0..copy_len], win.name[0..copy_len]);
+            @memcpy(buf[0..copy_len], name[0..copy_len]);
         }
 
         return .{
             .id = win.id,
             .width = win.width,
             .height = win.height,
-            .name_len = win.name.len,
+            .name_len = name.len,
         };
     }
 
@@ -2250,7 +2253,8 @@ pub const CAPI = struct {
         const windows = viewer.windows.items;
         if (index >= windows.len) return 0;
 
-        const layout = windows[index].raw_layout;
+        // Look up fork-only metadata (raw_layout) from the separate map.
+        const layout = if (viewer.window_metadata.get(windows[index].id)) |md| md.raw_layout else "";
         const copy_len = @min(layout.len, buf_len);
         if (out_buf) |buf| {
             @memcpy(buf[0..copy_len], layout[0..copy_len]);
@@ -2292,7 +2296,9 @@ pub const CAPI = struct {
         const windows = viewer.windows.items;
         if (window_index >= windows.len) return -1;
 
-        const id = windows[window_index].focused_pane_id orelse return -1;
+        // Look up fork-only metadata (focused_pane_id) from the separate map.
+        const md = viewer.window_metadata.get(windows[window_index].id) orelse return -1;
+        const id = md.focused_pane_id orelse return -1;
         return @intCast(id);
     }
 
