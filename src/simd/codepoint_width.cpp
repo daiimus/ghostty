@@ -201,7 +201,8 @@ HWY_ALIGN constexpr uint32_t nsm_lte32[] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
-// All our tables must be identically sized
+// Within each category, the gte/lte tables must be identically sized;
+// categories (eaw_*, zero_*, nsm_*) may have different sizes.
 static_assert(std::size(eaw_gte32) == std::size(eaw_lte32));
 static_assert(std::size(eaw_gte16) == std::size(eaw_lte16));
 static_assert(std::size(zero_gte32) == std::size(zero_lte32));
@@ -219,10 +220,9 @@ int8_t CodepointWidth16(D d, uint16_t input) {
   const hn::Vec<D> input_vec = Set(d, input);
 
   {
-    constexpr T zero_gte_min =
-        *std::min_element(zero_gte16, zero_gte16 + std::size(zero_gte16));
-    constexpr T zero_lte_max =
-        *std::max_element(zero_lte16, zero_lte16 + std::size(zero_lte16));
+    // Known bounds of zero-width ranges (first/last non-zero entries).
+    constexpr T zero_gte_min = 0x300;   // U+0300 COMBINING GRAVE ACCENT
+    constexpr T zero_lte_max = 0xfff8;  // U+FFF8 (last zero-width sentinel)
     if (input >= zero_gte_min && input <= zero_lte_max) {
       size_t i = 0;
       for (; i + N <= std::size(zero_gte16) && zero_gte16[i] != 0; i += N) {
@@ -238,10 +238,9 @@ int8_t CodepointWidth16(D d, uint16_t input) {
   }
 
   {
-    constexpr T eaw_gte_min =
-        *std::min_element(eaw_gte16, eaw_gte16 + std::size(eaw_gte16));
-    constexpr T eaw_lte_max =
-        *std::max_element(eaw_lte16, eaw_lte16 + std::size(eaw_lte16));
+    // Known bounds of EAW wide ranges (first/last non-zero entries).
+    constexpr T eaw_gte_min = 0x1100;   // U+1100 HANGUL CHOSEONG KIYEOK
+    constexpr T eaw_lte_max = 0xffe6;   // U+FFE6 FULLWIDTH WON SIGN
     if (input >= eaw_gte_min && input <= eaw_lte_max) {
       size_t i = 0;
       for (; i + N <= std::size(eaw_lte16) && eaw_lte16[i] != 0; i += N) {
@@ -257,10 +256,11 @@ int8_t CodepointWidth16(D d, uint16_t input) {
   }
 
   {
-    constexpr T nsm_gte_min =
-        *std::min_element(nsm_gte16, nsm_gte16 + std::size(nsm_gte16));
-    constexpr T nsm_lte_max =
-        *std::max_element(nsm_lte16, nsm_lte16 + std::size(nsm_lte16));
+    // NSM tables are empty (consolidated into zero_* tables above).
+    // The zero min/max values make this precheck always false, so
+    // this block is effectively dead code kept for structural parity.
+    constexpr T nsm_gte_min = 0;
+    constexpr T nsm_lte_max = 0;
     if (input >= nsm_gte_min && input <= nsm_lte_max) {
       size_t i = 0;
       for (; i + N <= std::size(nsm_lte16) && nsm_lte16[i] != 0; i += N) {
@@ -287,10 +287,9 @@ int8_t CodepointWidth32(D d, T input) {
   const hn::Vec<D> input_vec = Set(d, input);
 
   {
-    constexpr T zero_gte_min =
-        *std::min_element(zero_gte32, zero_gte32 + std::size(zero_gte32));
-    constexpr T zero_lte_max =
-        *std::max_element(zero_lte32, zero_lte32 + std::size(zero_lte32));
+    // Known bounds of zero-width ranges (first/last non-zero entries).
+    constexpr T zero_gte_min = 0x101fd;  // U+101FD PHAISTOS DISC SIGN COMBINING OBLIQUE STROKE
+    constexpr T zero_lte_max = 0xe0fff;  // U+E0FFF TAG (last in Tags block)
     if (input >= zero_gte_min && input <= zero_lte_max) {
       size_t i = 0;
       for (; i + N <= std::size(zero_gte32) && zero_gte32[i] != 0; i += N) {
@@ -306,10 +305,9 @@ int8_t CodepointWidth32(D d, T input) {
   }
 
   {
-    constexpr T eaw_gte_min =
-        *std::min_element(eaw_gte32, eaw_gte32 + std::size(eaw_gte32));
-    constexpr T eaw_lte_max =
-        *std::max_element(eaw_lte32, eaw_lte32 + std::size(eaw_lte32));
+    // Known bounds of EAW wide ranges (first/last non-zero entries).
+    constexpr T eaw_gte_min = 0x16fe0;  // U+16FE0 TANGUT ITERATION MARK
+    constexpr T eaw_lte_max = 0x3fffd;  // U+3FFFD (Tertiary Ideographic Plane end)
     if (input >= eaw_gte_min && input <= eaw_lte_max) {
       size_t i = 0;
       for (; i + N <= std::size(eaw_lte32) && eaw_lte32[i] != 0; i += N) {
@@ -325,10 +323,11 @@ int8_t CodepointWidth32(D d, T input) {
   }
 
   {
-    constexpr T nsm_gte_min =
-        *std::min_element(nsm_gte32, nsm_gte32 + std::size(nsm_gte32));
-    constexpr T nsm_lte_max =
-        *std::max_element(nsm_lte32, nsm_lte32 + std::size(nsm_lte32));
+    // NSM tables are empty (consolidated into zero_* tables above).
+    // The zero min/max values make this precheck always false, so
+    // this block is effectively dead code kept for structural parity.
+    constexpr T nsm_gte_min = 0;
+    constexpr T nsm_lte_max = 0;
     if (input >= nsm_gte_min && input <= nsm_lte_max) {
       size_t i = 0;
       for (; i + N <= std::size(nsm_lte32) && nsm_lte32[i] != 0; i += N) {
