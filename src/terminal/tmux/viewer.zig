@@ -510,6 +510,15 @@ pub const Viewer = struct {
         self.action_arena.promote(self.alloc).deinit();
     }
 
+    /// Promote the action arena, append a single action, and save the
+    /// arena state back. This consolidates the arena-promote-append
+    /// boilerplate used at many call sites that only need one append.
+    fn appendAction(self: *Viewer, actions: *std.ArrayList(Action), action: Action) Allocator.Error!void {
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        try actions.append(arena.allocator(), action);
+    }
+
     /// Set the active pane for user input routing. The pane_id must
     /// refer to a pane that exists in our panes map, or be null to
     /// clear the active pane. If the pane_id is not null and does not
@@ -565,11 +574,17 @@ pub const Viewer = struct {
         const hex_len = data.len * 3; // "XX " per byte (last space becomes \n)
         const total_len = prefix_len + hex_len;
 
-        const buf = arena_alloc.alloc(u8, total_len) catch return null;
+        const buf = arena_alloc.alloc(u8, total_len) catch {
+            log.warn("sendKeys: failed to allocate {} bytes for pane {}", .{ total_len, pane_id });
+            return null;
+        };
 
         // Write prefix.
         var pos: usize = 0;
-        const prefix = std.fmt.bufPrint(buf[0..prefix_len], "send-keys -H -t %{d} ", .{pane_id}) catch return null;
+        const prefix = std.fmt.bufPrint(buf[0..prefix_len], "send-keys -H -t %{d} ", .{pane_id}) catch {
+            log.warn("sendKeys: failed to format prefix for pane {}", .{pane_id});
+            return null;
+        };
         pos = prefix.len;
 
         // Write hex bytes.
@@ -833,9 +848,7 @@ pub const Viewer = struct {
                     }
                 }
 
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                actions.append(arena.allocator(), .{
+                self.appendAction(&actions, .{
                     .focused_pane_changed = .{
                         .window_id = info.window_id,
                         .pane_id = info.pane_id,
@@ -879,9 +892,7 @@ pub const Viewer = struct {
                 if (info.session_id == self.session_id) {
                     self.active_window_id = info.window_id;
 
-                    var arena = self.action_arena.promote(self.alloc);
-                    defer self.action_arena = arena.state;
-                    actions.append(arena.allocator(), .{ .active_window_changed = info.window_id }) catch {
+                    self.appendAction(&actions, .{ .active_window_changed = info.window_id }) catch {
                         log.warn("failed to emit active window changed action, becoming defunct", .{});
                         return self.defunct();
                     };
@@ -912,9 +923,7 @@ pub const Viewer = struct {
                     self.session_name = duped;
                 }
 
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                actions.append(arena.allocator(), .{ .session_renamed = info.name }) catch {
+                self.appendAction(&actions, .{ .session_renamed = info.name }) catch {
                     log.warn("failed to emit session renamed action", .{});
                     return self.defunct();
                 };
@@ -1060,13 +1069,7 @@ pub const Viewer = struct {
                 // commands.
                 self.initial_ready_sent = true;
 
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-
-                actions.append(
-                    arena.allocator(),
-                    .ready,
-                ) catch return self.defunct();
+                self.appendAction(&actions, .ready) catch return self.defunct();
             }
         }
 
@@ -1164,9 +1167,7 @@ pub const Viewer = struct {
             "";
 
         // Notify the apprt that windows changed so it can refresh.
-        var arena = self.action_arena.promote(self.alloc);
-        defer self.action_arena = arena.state;
-        try actions.append(arena.allocator(), .{ .windows = self.windows.items });
+        try self.appendAction(actions, .{ .windows = self.windows.items });
     }
 
     /// When a window is closed, remove it from our list, prune any panes
@@ -1200,9 +1201,7 @@ pub const Viewer = struct {
         try self.syncLayouts(self.windows.items);
 
         // Notify the apprt.
-        var arena = self.action_arena.promote(self.alloc);
-        defer self.action_arena = arena.state;
-        try actions.append(arena.allocator(), .{ .windows = self.windows.items });
+        try self.appendAction(actions, .{ .windows = self.windows.items });
     }
 
     fn syncLayouts(
@@ -1603,7 +1602,19 @@ pub const Viewer = struct {
             // captures alternate last), so we must restore the correct screen here.
             // Without this, the renderer would show the alternate screen (blank for
             // a normal shell), and subsequent %output would write to the wrong screen.
-            _ = try t.switchScreen(screen_key);
+            //
+            // Use the lightweight switchTo when the screen already exists to avoid
+            // the side effects of switchScreen (clearing selection, ending
+            // hyperlinks, copying charset state, setting dirty flags). Fall back
+            // to switchScreen only when the screen hasn't been initialized yet
+            // (e.g., first time seeing the alternate screen).
+            if (t.screens.active_key != screen_key) {
+                if (t.screens.get(screen_key) != null) {
+                    t.screens.switchTo(screen_key);
+                } else {
+                    _ = try t.switchScreen(screen_key);
+                }
+            }
 
             // Set cursor position on the appropriate screen (tmux uses 0-based)
             if (t.screens.get(screen_key)) |screen| {
@@ -1918,47 +1929,9 @@ pub const Viewer = struct {
                 if (gop.found_existing) break :pane;
                 errdefer _ = panes_new.swapRemove(gop.key_ptr.*);
 
-                // If we already have this pane, it is already initialized
-                // so just copy it over.
-                if (panes_old.getEntry(id)) |entry| {
-                    gop.value_ptr.* = entry.value_ptr.*;
-
-                    // Resize the pane terminal if tmux assigned it new
-                    // dimensions (e.g. after refresh-client -C). Without
-                    // this, the pane's Terminal grid stays at its old size
-                    // and output is rendered with the wrong dimensions.
-                    const new_cols: size.CellCountInt = std.math.cast(
-                        size.CellCountInt,
-                        layout.width,
-                    ) orelse {
-                        log.warn("pane {} layout width {} overflows CellCountInt, skipping", .{ id, layout.width });
-                        _ = panes_new.swapRemove(gop.key_ptr.*);
-                        break :pane;
-                    };
-                    const new_rows: size.CellCountInt = std.math.cast(
-                        size.CellCountInt,
-                        layout.height,
-                    ) orelse {
-                        log.warn("pane {} layout height {} overflows CellCountInt, skipping", .{ id, layout.height });
-                        _ = panes_new.swapRemove(gop.key_ptr.*);
-                        break :pane;
-                    };
-                    if (gop.value_ptr.terminal.cols != new_cols or
-                        gop.value_ptr.terminal.rows != new_rows)
-                    {
-                        try gop.value_ptr.terminal.resize(
-                            gpa_alloc,
-                            new_cols,
-                            new_rows,
-                        );
-                    }
-
-                    break :pane;
-                }
-
                 // Validate layout dimensions fit in CellCountInt before
-                // creating the terminal. Oversized dimensions from a
-                // corrupted or adversarial layout would panic on @intCast.
+                // using them. Oversized dimensions from a corrupted or
+                // adversarial layout would panic on @intCast.
                 const cols: size.CellCountInt = std.math.cast(
                     size.CellCountInt,
                     layout.width,
@@ -1975,6 +1948,29 @@ pub const Viewer = struct {
                     _ = panes_new.swapRemove(gop.key_ptr.*);
                     break :pane;
                 };
+
+                // If we already have this pane, it is already initialized
+                // so just copy it over.
+                if (panes_old.getEntry(id)) |entry| {
+                    gop.value_ptr.* = entry.value_ptr.*;
+
+                    // Resize the pane terminal if tmux assigned it new
+                    // dimensions (e.g. after refresh-client -C). Without
+                    // this, the pane's Terminal grid stays at its old size
+                    // and output is rendered with the wrong dimensions.
+                    if (gop.value_ptr.terminal.cols != cols or
+                        gop.value_ptr.terminal.rows != rows)
+                    {
+                        try gop.value_ptr.terminal.resize(
+                            gpa_alloc,
+                            cols,
+                            rows,
+                        );
+                    }
+
+                    break :pane;
+                }
+
                 var t: Terminal = try .init(gpa_alloc, .{
                     .cols = cols,
                     .rows = rows,
