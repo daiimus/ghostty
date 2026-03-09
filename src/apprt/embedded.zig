@@ -216,7 +216,7 @@ pub const App = struct {
     /// to run on every keypress.
     pub fn keyboardLayout(self: *const App) input.KeyboardLayout {
         // We only support keyboard layout detection on macOS.
-        if (comptime builtin.os.tag != .macos) return .unknown;
+        if (comptime builtin.target.os.tag != .macos) return .unknown;
 
         // Any layout larger than this is not something we can handle.
         var buf: [256]u8 = undefined;
@@ -439,7 +439,7 @@ pub const Surface = struct {
 
     /// iOS sync search state - used instead of xev-based search thread
     /// Only available on Darwin (macOS/iOS)
-    ios_sync_search: if (builtin.os.tag.isDarwin()) ?IosSyncSearch else void = if (builtin.os.tag.isDarwin()) null else {},
+    ios_sync_search: if (builtin.target.os.tag.isDarwin()) ?IosSyncSearch else void = if (builtin.target.os.tag.isDarwin()) null else {},
 
     /// iOS Sync Search State - wraps ScreenSearch for use without xev
     pub const IosSyncSearch = struct {
@@ -653,7 +653,7 @@ pub const Surface = struct {
 
     pub fn deinit(self: *Surface) void {
         // Clean up iOS sync search if active (Darwin only)
-        if (comptime builtin.os.tag.isDarwin()) {
+        if (comptime builtin.target.os.tag.isDarwin()) {
             if (self.ios_sync_search) |*s| {
                 s.deinit();
                 self.ios_sync_search = null;
@@ -670,6 +670,10 @@ pub const Surface = struct {
         self.app.core_app.deleteSurface(self);
 
         // Clean up our core surface so that all the rendering and IO stop.
+        // Note: core_surface.deinit() handles tmux observer cleanup:
+        //  - Multi-pane observer surfaces are unregistered via tmux_pane_binding
+        //  - The primary tmux surface's observer is cleaned up when the viewer
+        //    is deinited (viewer owns the observer list)
         self.core_surface.deinit();
     }
 
@@ -1952,6 +1956,12 @@ pub const CAPI = struct {
     /// The data should be raw terminal output including any escape sequences.
     /// This function processes the data through the terminal emulator and
     /// triggers a render.
+    ///
+    /// Thread safety: This function is NOT safe to call concurrently on the
+    /// same surface. The caller must serialize calls for a given surface.
+    /// It IS safe to call concurrently on different surfaces. Typically the
+    /// embedder calls this from a single I/O thread per surface (e.g., the
+    /// SSH read callback).
     export fn ghostty_surface_write_output(
         surface: *Surface,
         ptr: [*]const u8,
@@ -2044,6 +2054,10 @@ pub const CAPI = struct {
             return false;
         };
 
+        // Save previous state for rollback on observer registration failure.
+        const prev_pane_id = viewer.active_pane_id;
+        const prev_terminal = surface.core_surface.renderer_state.terminal;
+
         // Set the active pane for user input routing (send-keys).
         viewer.setActivePaneId(pane_id);
 
@@ -2054,16 +2068,57 @@ pub const CAPI = struct {
         // keeps our renderer_state.terminal pointed at the correct pane
         // terminal after syncLayouts() rebuilds the pane map.
         //
-        // Unregister any previous observer for this surface first
-        // (identified by terminal_ptr — each surface has exactly one
-        // renderer_state.terminal field at a unique address).
-        viewer.unregisterObserverByPtr(&surface.core_surface.renderer_state.terminal);
-        _ = viewer.registerObserver(
+        // We register the new observer BEFORE unregistering the old one
+        // to avoid a window where the surface has no observer at all.
+        // registerObserver rejects duplicates by (pane_id, terminal_ptr)
+        // pair, so having both old and new registrations momentarily is
+        // fine as long as pane_id differs (which it does when switching).
+        const registered = viewer.registerObserver(
             pane_id,
             &surface.core_surface.renderer_state.terminal,
             observerWakeup,
             @ptrCast(&surface.core_surface.renderer_thread.wakeup),
         );
+
+        if (registered) {
+            // Success — now safe to remove the old observer.
+            // Use unregisterObserver with prev_pane_id (not ByPtr) to
+            // avoid accidentally removing the registration we just added.
+            // Guard: only unregister if the previous pane differs from the
+            // new one. When prev_pane_id == pane_id (e.g. first observer
+            // registration after set_active_pane_input_only), unregistering
+            // with the same terminal_ptr would remove the observer we just
+            // registered, leaving the surface without fixup coverage.
+            if (prev_pane_id) |pid| {
+                if (pid != pane_id) {
+                    viewer.unregisterObserver(pid, &surface.core_surface.renderer_state.terminal);
+                }
+            }
+        } else if (prev_pane_id != null and prev_pane_id.? == pane_id) {
+            // Re-registration to the same pane — observer already exists,
+            // nothing to do (terminal pointer is already correct).
+        } else {
+            // Registration failed (OOM or pane gone). Roll back to
+            // prevent the surface from rendering a pane terminal that
+            // the viewer won't fix up after layout changes.
+            surface.core_surface.renderer_state.terminal = prev_terminal;
+
+            // Restore the previous active pane if it still exists in the
+            // viewer's pane map; otherwise clear it to avoid leaving
+            // active_pane_id pointing at the new pane when we've reverted
+            // the renderer terminal.
+            if (prev_pane_id) |pid| {
+                if (viewer.panes.getPtr(pid) != null) {
+                    viewer.setActivePaneId(prev_pane_id);
+                } else {
+                    viewer.setActivePaneId(null);
+                }
+            } else {
+                viewer.setActivePaneId(null);
+            }
+            log.warn("tmux observer registration failed for pane {}", .{pane_id});
+            return false;
+        }
 
         // Trigger a redraw
         surface.core_surface.renderer_thread.wakeup.notify() catch {};
@@ -2379,13 +2434,26 @@ pub const CAPI = struct {
         // we still hold the shared lock.
         target.core_surface.renderer_state.terminal = binding.original_terminal;
 
-        // Now restore the original mutex. We must unlock the shared mutex
-        // (which we currently hold) and then set the field. The brief
-        // moment between unlock and field assignment is safe because the
-        // renderer thread checks the mutex field atomically in its render
-        // loop, and we've already restored the terminal pointer above.
+        // Now restore the original mutex pointer. We must unlock the shared
+        // mutex (which we currently hold) and then reassign the pointer field.
+        // The brief moment between unlock and pointer assignment is safe because:
+        //
+        // 1. The renderer thread may try to lock the old (shared) mutex,
+        //    which was just unlocked — it will acquire it harmlessly and
+        //    release immediately (no shared state depends on it anymore
+        //    since we already restored the terminal pointer above).
+        //
+        // 2. We use @atomicStore to make the pointer swap visible to other
+        //    threads under Zig's memory model. The renderer thread reads
+        //    this field without @atomicLoad, but the subsequent .lock()
+        //    call is itself a synchronization point (acquire fence), so
+        //    the renderer always sees the fully-initialized mutex object
+        //    regardless of which pointer value it reads.
+        //
+        // 3. The tmux_pane_binding = null below ensures subsequent render
+        //    cycles use the surface's own terminal, not the shared pane.
         target.core_surface.renderer_state.mutex.unlock();
-        target.core_surface.renderer_state.mutex = binding.original_mutex;
+        @atomicStore(*std.Thread.Mutex, &target.core_surface.renderer_state.mutex, binding.original_mutex, .release);
         target.core_surface.tmux_pane_binding = null;
 
         // Wake the target's renderer to redraw with its own terminal.
@@ -2417,6 +2485,12 @@ pub const CAPI = struct {
 
         // Append a trailing newline to the command. The viewer expects
         // commands to include the newline.
+        //
+        // Lifetime note: cmd is freed by the defer below, but this is safe
+        // because queueUserCommand() dupes the command string into the
+        // viewer's action_arena, and writeReqDirect() copies data into its
+        // own buffer (either inline or heap-allocated). Neither retains a
+        // reference to cmd after returning.
         const cmd = std.fmt.allocPrint(viewer.alloc, "{s}\n", .{ptr[0..len]}) catch return false;
         defer viewer.alloc.free(cmd);
 
@@ -2467,7 +2541,10 @@ pub const CAPI = struct {
         io.queueMessage(msg, .locked);
     }
 
-    /// Debug: Get terminal state for debugging scrollback issues
+    /// Debug: Get terminal state for debugging scrollback issues.
+    /// Intended for iOS/macOS debugging; exposed unconditionally since the
+    /// return type (TerminalDebugState) is a plain extern struct with no
+    /// platform-specific dependencies.
     export fn ghostty_surface_debug_terminal_state(surface: *Surface) Darwin.TerminalDebugState {
         surface.core_surface.renderer_state.mutex.lock();
         defer surface.core_surface.renderer_state.mutex.unlock();
@@ -2954,8 +3031,6 @@ pub const CAPI = struct {
                 return .{ .total = -1, .selected = -1, .success = false };
             };
 
-            std.log.info("ios_search: search_next called, total={d}", .{sync_search.search.matchesLen()});
-
             // Lock terminal for selection
             surface.renderer_state.mutex.lock();
             defer surface.renderer_state.mutex.unlock();
@@ -2965,8 +3040,6 @@ pub const CAPI = struct {
                 std.log.err("ios_search: select(.next) failed", .{});
                 return .{ .total = -1, .selected = -1, .success = false };
             };
-
-            std.log.info("ios_search: select(.next) returned selected={}", .{selected});
 
             if (!selected) {
                 // No more matches or wrapped - return current state
@@ -2983,19 +3056,13 @@ pub const CAPI = struct {
 
             // Notify renderer of selected match
             if (sync_search.search.selectedMatch()) |match| {
-                std.log.info("ios_search: notifying renderer of selected match", .{});
                 notifySelectedMatch(surface, match);
             }
 
             // Scroll to match using tracked pin (like Thread.zig does)
             if (sync_search.search.selected) |sel| {
                 const screen = surface.renderer_state.terminal.screens.active;
-                std.log.info("ios_search: scrolling to match, pin.y={d}, viewport_before={s}", .{
-                    sel.highlight.start.y,
-                    @tagName(screen.pages.viewport),
-                });
                 screen.scroll(.{ .pin = sel.highlight.start.* });
-                std.log.info("ios_search: viewport_after={s}", .{@tagName(screen.pages.viewport)});
                 surface.renderer_thread.wakeup.notify() catch {};
             }
 
@@ -3095,7 +3162,8 @@ pub const CAPI = struct {
         /// Helper: Update viewport highlights from search results
         fn updateViewportHighlights(surface: *CoreSurface, search: *terminal.search.Screen) void {
             var arena: std.heap.ArenaAllocator = .init(surface.alloc);
-            errdefer arena.deinit();
+            var arena_transferred = false;
+            defer if (!arena_transferred) arena.deinit();
             const arena_alloc = arena.allocator();
 
             // Get viewport matches using ViewportSearch for highlight rendering
@@ -3114,33 +3182,43 @@ pub const CAPI = struct {
                 matches.append(arena_alloc, cloned) catch continue;
             }
 
-            _ = surface.renderer_thread.mailbox.push(
+            const pushed = surface.renderer_thread.mailbox.push(
                 .{ .search_viewport_matches = .{
                     .arena = arena,
                     .matches = matches.items,
                 } },
                 .forever,
             );
-            surface.renderer_thread.wakeup.notify() catch {};
+            // Only mark transferred if push succeeded (non-zero return).
+            // On failure (e.g. spurious wakeup while full), the defer
+            // will deinit the arena to prevent a leak.
+            arena_transferred = pushed > 0;
+            if (arena_transferred) {
+                surface.renderer_thread.wakeup.notify() catch {};
+            }
         }
 
         /// Helper: Notify renderer about selected match (using Flattened highlight)
         fn notifySelectedMatch(surface: *CoreSurface, hl: terminal.highlight.Flattened) void {
             var arena: std.heap.ArenaAllocator = .init(surface.alloc);
-            errdefer arena.deinit();
+            var arena_transferred = false;
+            defer if (!arena_transferred) arena.deinit();
             const arena_alloc = arena.allocator();
 
             // Clone the flattened highlight
             const cloned = hl.clone(arena_alloc) catch return;
 
-            _ = surface.renderer_thread.mailbox.push(
+            const pushed = surface.renderer_thread.mailbox.push(
                 .{ .search_selected_match = .{
                     .arena = arena,
                     .match = cloned,
                 } },
                 .forever,
             );
-            surface.renderer_thread.wakeup.notify() catch {};
+            arena_transferred = pushed > 0;
+            if (arena_transferred) {
+                surface.renderer_thread.wakeup.notify() catch {};
+            }
         }
 
         export fn ghostty_surface_set_display_id(ptr: *Surface, display_id: u32) void {
