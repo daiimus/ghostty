@@ -885,39 +885,12 @@ typedef struct {
   uint8_t reason_len;
 } ghostty_action_tmux_exit_s;
 
-// apprt.action.TmuxMessage
-// Pointer lifetime: data is valid only for the duration of the action
-// callback invocation. The consumer must copy data if needed beyond that.
-typedef struct {
-  const char* data;
-  size_t len;
-} ghostty_action_tmux_message_s;
 
 // apprt.action.TmuxActiveWindowChanged
 typedef struct {
   uint32_t window_id;
 } ghostty_action_tmux_active_window_changed_s;
 
-// apprt.action.TmuxPasteBufferChanged
-// Pointer lifetime: data is valid only for the duration of the action
-// callback invocation. The consumer must copy data if needed beyond that.
-typedef struct {
-  const char* data;
-  size_t len;
-} ghostty_action_tmux_paste_buffer_changed_s;
-
-// apprt.action.TmuxPasteBufferDeleted
-// Pointer lifetime: data is valid only for the duration of the action
-// callback invocation. The consumer must copy data if needed beyond that.
-typedef struct {
-  const char* data;
-  size_t len;
-} ghostty_action_tmux_paste_buffer_deleted_s;
-
-// apprt.action.TmuxPaneModeChanged
-typedef struct {
-  uint32_t pane_id;
-} ghostty_action_tmux_pane_mode_changed_s;
 
 // apprt.action.TmuxSessionRenamed
 // Pointer lifetime: data is valid only for the duration of the action
@@ -933,13 +906,6 @@ typedef struct {
   uint32_t pane_id;
 } ghostty_action_tmux_focused_pane_changed_s;
 
-// apprt.action.TmuxSubscriptionChanged
-// Pointer lifetime: name and value are valid only for the duration of the
-// action callback invocation. The consumer must copy if needed beyond that.
-typedef struct {
-  const char* name;
-  const char* value;
-} ghostty_action_tmux_subscription_changed_s;
 
 // terminal.Scrollbar
 typedef struct {
@@ -1018,15 +984,9 @@ typedef enum {
   GHOSTTY_ACTION_TMUX_EXIT,
   GHOSTTY_ACTION_TMUX_READY,
   GHOSTTY_ACTION_TMUX_COMMAND_RESPONSE,
-  GHOSTTY_ACTION_TMUX_MESSAGE,
   GHOSTTY_ACTION_TMUX_ACTIVE_WINDOW_CHANGED,
-  GHOSTTY_ACTION_TMUX_PASTE_BUFFER_CHANGED,
-  GHOSTTY_ACTION_TMUX_PASTE_BUFFER_DELETED,
-  GHOSTTY_ACTION_TMUX_SESSIONS_CHANGED,
-  GHOSTTY_ACTION_TMUX_PANE_MODE_CHANGED,
   GHOSTTY_ACTION_TMUX_SESSION_RENAMED,
   GHOSTTY_ACTION_TMUX_FOCUSED_PANE_CHANGED,
-  GHOSTTY_ACTION_TMUX_SUBSCRIPTION_CHANGED,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1070,14 +1030,9 @@ typedef union {
   ghostty_action_tmux_state_changed_s tmux_state_changed;
   ghostty_action_tmux_command_response_s tmux_command_response;
   ghostty_action_tmux_exit_s tmux_exit;
-  ghostty_action_tmux_message_s tmux_message;
   ghostty_action_tmux_active_window_changed_s tmux_active_window_changed;
-  ghostty_action_tmux_paste_buffer_changed_s tmux_paste_buffer_changed;
-  ghostty_action_tmux_paste_buffer_deleted_s tmux_paste_buffer_deleted;
-  ghostty_action_tmux_pane_mode_changed_s tmux_pane_mode_changed;
   ghostty_action_tmux_session_renamed_s tmux_session_renamed;
   ghostty_action_tmux_focused_pane_changed_s tmux_focused_pane_changed;
-  ghostty_action_tmux_subscription_changed_s tmux_subscription_changed;
 } ghostty_action_u;
 
 typedef struct {

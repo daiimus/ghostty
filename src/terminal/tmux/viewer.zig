@@ -359,26 +359,6 @@ pub const Viewer = struct {
         /// writes this directly to the backend. Includes trailing newline.
         send_keys: []const u8,
 
-        /// A tmux `display-message` was received. The payload is the
-        /// message text. Surfaced to the apprt so the UI can show it
-        /// as a toast/banner.
-        message: []const u8,
-
-        /// A paste buffer was created or modified. The payload is the
-        /// buffer name.
-        paste_buffer_changed: []const u8,
-
-        /// A paste buffer was deleted. The payload is the buffer name.
-        paste_buffer_deleted: []const u8,
-
-        /// A tmux session was created or destroyed. No payload — the
-        /// app should query `list-sessions` to get the updated list.
-        sessions_changed: void,
-
-        /// A pane's mode changed (entered or exited copy-mode, choose-mode,
-        /// etc.). The payload is the pane ID.
-        pane_mode_changed: usize,
-
         /// A session was renamed. The payload is the new session name.
         session_renamed: []const u8,
 
@@ -387,15 +367,6 @@ pub const Viewer = struct {
         focused_pane_changed: struct {
             window_id: usize,
             pane_id: usize,
-        },
-
-        /// A format subscription value changed. Emitted when tmux sends
-        /// `%subscription-changed` after a `refresh-client -B` registration.
-        /// The name identifies the subscription and the value is the new
-        /// format expansion.
-        subscription_changed: struct {
-            name: []const u8,
-            value: []const u8,
         },
 
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
@@ -875,16 +846,8 @@ pub const Viewer = struct {
                 };
             },
 
-            // A session was created or destroyed. Emit an action so
-            // the apprt can refresh its session list if it has one.
-            .sessions_changed => {
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                actions.append(arena.allocator(), .{ .sessions_changed = {} }) catch {
-                    log.warn("failed to emit sessions changed action", .{});
-                    return self.defunct();
-                };
-            },
+            // Sessions changed — forwarded by stream_handler directly.
+            .sessions_changed => {},
 
             // Window was renamed. Update our stored name and notify the apprt.
             .window_renamed => |info| {
@@ -931,16 +894,8 @@ pub const Viewer = struct {
             .client_session_changed,
             => {},
 
-            // Pane mode changes (copy mode, choose mode, etc.). Emit
-            // an action so the apprt can show a UI indicator.
-            .pane_mode_changed => |info| {
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                actions.append(arena.allocator(), .{ .pane_mode_changed = info.pane_id }) catch {
-                    log.warn("failed to emit pane mode changed action", .{});
-                    return self.defunct();
-                };
-            },
+            // Pane mode changes — forwarded by stream_handler directly.
+            .pane_mode_changed => {},
 
             // Session renamed. Update our stored session name and emit
             // an action so the apprt can update its display.
@@ -1040,49 +995,17 @@ pub const Viewer = struct {
                 };
             },
 
-            // Format subscription: a subscribed format value changed.
-            .subscription_changed => |sc| {
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                actions.append(arena.allocator(), .{ .subscription_changed = .{
-                    .name = sc.name,
-                    .value = sc.value,
-                } }) catch {
-                    log.warn("failed to emit subscription changed action", .{});
-                    return self.defunct();
-                };
-            },
+            // Format subscription changed — forwarded by stream_handler directly.
+            .subscription_changed => {},
 
-            // display-message: surface the message text to the apprt.
-            .message => |text| {
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                actions.append(arena.allocator(), .{ .message = text }) catch {
-                    log.warn("failed to append message action", .{});
-                    return self.defunct();
-                };
-            },
+            // Display message — forwarded by stream_handler directly.
+            .message => {},
 
-            // Paste buffer created or modified. Surface to the apprt so
-            // it can auto-sync clipboard if desired.
-            .paste_buffer_changed => |name| {
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                actions.append(arena.allocator(), .{ .paste_buffer_changed = name }) catch {
-                    log.warn("failed to append paste buffer changed action", .{});
-                    return self.defunct();
-                };
-            },
+            // Paste buffer changed — forwarded by stream_handler directly.
+            .paste_buffer_changed => {},
 
-            // Paste buffer deleted. Surface to the apprt.
-            .paste_buffer_deleted => |name| {
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                actions.append(arena.allocator(), .{ .paste_buffer_deleted = name }) catch {
-                    log.warn("failed to append paste buffer deleted action", .{});
-                    return self.defunct();
-                };
-            },
+            // Paste buffer deleted — forwarded by stream_handler directly.
+            .paste_buffer_deleted => {},
 
             // Configuration file error. Log as a warning — this is
             // informational and not critical enough to surface to the

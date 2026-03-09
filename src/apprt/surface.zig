@@ -126,28 +126,9 @@ pub const Message = union(enum) {
     /// `%begin`/`%end` (or `%error`). Must be freed by the receiver.
     tmux_command_response: TmuxCommandResponse,
 
-    /// tmux display-message notification. The payload is the message
-    /// text, copied via WriteReq.
-    tmux_message: WriteReq,
-
     /// tmux control mode: the active window changed.
     /// Sent when the user switches windows via tmux (e.g., prefix+n).
     tmux_active_window_changed: usize,
-
-    /// tmux paste buffer was created or modified. Payload is the buffer
-    /// name, copied via WriteReq.
-    tmux_paste_buffer_changed: WriteReq,
-
-    /// tmux paste buffer was deleted. Payload is the buffer name,
-    /// copied via WriteReq.
-    tmux_paste_buffer_deleted: WriteReq,
-
-    /// tmux session(s) created or destroyed. No payload.
-    tmux_sessions_changed: void,
-
-    /// A pane's mode changed (entered/exited copy-mode, etc.).
-    /// Payload is the pane ID.
-    tmux_pane_mode_changed: usize,
 
     /// tmux session was renamed. Payload is the new session name,
     /// copied via WriteReq.
@@ -158,16 +139,6 @@ pub const Message = union(enum) {
     tmux_focused_pane_changed: struct {
         window_id: usize,
         pane_id: usize,
-    },
-
-    /// tmux format subscription value changed. Payload carries
-    /// the subscription name and the new expanded value as
-    /// inline fixed-size sentinel-terminated buffers.
-    tmux_subscription_changed: struct {
-        /// Subscription name (e.g., "pane_title"). Max 63 bytes.
-        name: [63:0]u8,
-        /// Expanded format value. Max 255 bytes.
-        value: [255:0]u8,
     },
 
     pub const ReportTitleStyle = enum {

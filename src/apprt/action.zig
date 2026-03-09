@@ -352,32 +352,14 @@ pub const Action = union(Key) {
     /// tmux control mode: response to a user command
     tmux_command_response: TmuxCommandResponse,
 
-    /// tmux control mode: display-message notification
-    tmux_message: TmuxMessage,
-
     /// tmux control mode: active window changed
     tmux_active_window_changed: TmuxActiveWindowChanged,
-
-    /// tmux control mode: paste buffer content changed
-    tmux_paste_buffer_changed: TmuxPasteBufferChanged,
-
-    /// tmux control mode: paste buffer deleted
-    tmux_paste_buffer_deleted: TmuxPasteBufferDeleted,
-
-    /// tmux control mode: session list changed
-    tmux_sessions_changed: void,
-
-    /// tmux control mode: pane entered/exited a special mode (copy, etc.)
-    tmux_pane_mode_changed: TmuxPaneModeChanged,
 
     /// tmux control mode: current session was renamed
     tmux_session_renamed: TmuxSessionRenamed,
 
     /// tmux control mode: focused pane changed within a window
     tmux_focused_pane_changed: TmuxFocusedPaneChanged,
-
-    /// tmux control mode: format subscription value changed
-    tmux_subscription_changed: TmuxSubscriptionChanged,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -449,15 +431,9 @@ pub const Action = union(Key) {
         tmux_exit,
         tmux_ready,
         tmux_command_response,
-        tmux_message,
         tmux_active_window_changed,
-        tmux_paste_buffer_changed,
-        tmux_paste_buffer_deleted,
-        tmux_sessions_changed,
-        tmux_pane_mode_changed,
         tmux_session_renamed,
         tmux_focused_pane_changed,
-        tmux_subscription_changed,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -727,26 +703,6 @@ pub const TmuxCommandResponse = struct {
 
 /// tmux control mode `%message` notification.
 /// Carries the message text sent by tmux's `display-message` command.
-pub const TmuxMessage = struct {
-    /// Pointer to the message text.
-    data: [*]const u8,
-    /// Length of the message text.
-    len: usize,
-
-    // Sync with: ghostty_action_tmux_message_s
-    pub const C = extern struct {
-        data: [*]const u8,
-        len: usize,
-    };
-
-    pub fn cval(self: TmuxMessage) C {
-        return .{
-            .data = self.data,
-            .len = self.len,
-        };
-    }
-};
-
 /// tmux control mode exit notification with reason
 pub const TmuxExit = struct {
     /// Human-readable reason for the exit (e.g., "detached",
@@ -802,68 +758,6 @@ pub const TmuxActiveWindowChanged = struct {
     }
 };
 
-/// tmux control mode `%paste-buffer-changed` notification.
-/// Carries the buffer name that was created or modified.
-pub const TmuxPasteBufferChanged = struct {
-    /// Pointer to the buffer name.
-    data: [*]const u8,
-    /// Length of the buffer name.
-    len: usize,
-
-    // Sync with: ghostty_action_tmux_paste_buffer_changed_s
-    pub const C = extern struct {
-        data: [*]const u8,
-        len: usize,
-    };
-
-    pub fn cval(self: TmuxPasteBufferChanged) C {
-        return .{
-            .data = self.data,
-            .len = self.len,
-        };
-    }
-};
-
-/// tmux control mode `%paste-buffer-deleted` notification.
-/// Carries the buffer name that was deleted.
-pub const TmuxPasteBufferDeleted = struct {
-    /// Pointer to the buffer name.
-    data: [*]const u8,
-    /// Length of the buffer name.
-    len: usize,
-
-    // Sync with: ghostty_action_tmux_paste_buffer_deleted_s
-    pub const C = extern struct {
-        data: [*]const u8,
-        len: usize,
-    };
-
-    pub fn cval(self: TmuxPasteBufferDeleted) C {
-        return .{
-            .data = self.data,
-            .len = self.len,
-        };
-    }
-};
-
-/// tmux control mode `%pane-mode-changed` notification.
-/// Carries the pane ID whose mode changed.
-pub const TmuxPaneModeChanged = struct {
-    /// The numeric pane ID (from `%<id>`).
-    pane_id: usize,
-
-    // Sync with: ghostty_action_tmux_pane_mode_changed_s
-    pub const C = extern struct {
-        pane_id: u32,
-    };
-
-    pub fn cval(self: TmuxPaneModeChanged) C {
-        return .{
-            .pane_id = @intCast(self.pane_id),
-        };
-    }
-};
-
 /// tmux control mode `%session-renamed` notification.
 /// Carries the new session name.
 pub const TmuxSessionRenamed = struct {
@@ -904,29 +798,6 @@ pub const TmuxFocusedPaneChanged = struct {
         return .{
             .window_id = @intCast(self.window_id),
             .pane_id = @intCast(self.pane_id),
-        };
-    }
-};
-
-/// tmux control mode `%subscription-changed` notification.
-/// Fired when a format subscription registered via `refresh-client -B`
-/// detects that the expanded format value has changed.
-pub const TmuxSubscriptionChanged = struct {
-    /// The subscription name (as registered).
-    name: [:0]const u8,
-    /// The expanded format value.
-    value: [:0]const u8,
-
-    // Sync with: ghostty_action_tmux_subscription_changed_s
-    pub const C = extern struct {
-        name: [*:0]const u8,
-        value: [*:0]const u8,
-    };
-
-    pub fn cval(self: TmuxSubscriptionChanged) C {
-        return .{
-            .name = self.name.ptr,
-            .value = self.value.ptr,
         };
     }
 };

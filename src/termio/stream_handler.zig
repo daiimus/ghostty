@@ -760,51 +760,9 @@ pub const StreamHandler = struct {
                             });
                         },
 
-                        .message => |text| {
-                            const data = try apprt.surface.Message.WriteReq.init(
-                                self.alloc,
-                                text,
-                            );
-                            self.surfaceMessageWriter(.{
-                                .tmux_message = data,
-                            });
-                        },
-
                         .active_window_changed => |window_id| {
                             self.surfaceMessageWriter(.{
                                 .tmux_active_window_changed = window_id,
-                            });
-                        },
-
-                        .paste_buffer_changed => |name| {
-                            const data = try apprt.surface.Message.WriteReq.init(
-                                self.alloc,
-                                name,
-                            );
-                            self.surfaceMessageWriter(.{
-                                .tmux_paste_buffer_changed = data,
-                            });
-                        },
-
-                        .paste_buffer_deleted => |name| {
-                            const data = try apprt.surface.Message.WriteReq.init(
-                                self.alloc,
-                                name,
-                            );
-                            self.surfaceMessageWriter(.{
-                                .tmux_paste_buffer_deleted = data,
-                            });
-                        },
-
-                        .sessions_changed => {
-                            self.surfaceMessageWriter(.{
-                                .tmux_sessions_changed = {},
-                            });
-                        },
-
-                        .pane_mode_changed => |pane_id| {
-                            self.surfaceMessageWriter(.{
-                                .tmux_pane_mode_changed = pane_id,
                             });
                         },
 
@@ -825,33 +783,6 @@ pub const StreamHandler = struct {
                                     .pane_id = info.pane_id,
                                 },
                             });
-                        },
-
-                        .subscription_changed => |info| {
-                            var msg = apprt.surface.Message{
-                                .tmux_subscription_changed = undefined,
-                            };
-                            const name_len = @min(
-                                info.name.len,
-                                msg.tmux_subscription_changed.name.len,
-                            );
-                            @memcpy(
-                                msg.tmux_subscription_changed.name[0..name_len],
-                                info.name[0..name_len],
-                            );
-                            msg.tmux_subscription_changed.name[name_len] = 0;
-
-                            const value_len = @min(
-                                info.value.len,
-                                msg.tmux_subscription_changed.value.len,
-                            );
-                            @memcpy(
-                                msg.tmux_subscription_changed.value[0..value_len],
-                                info.value[0..value_len],
-                            );
-                            msg.tmux_subscription_changed.value[value_len] = 0;
-
-                            self.surfaceMessageWriter(msg);
                         },
                     }
                 }

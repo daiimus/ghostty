@@ -1283,22 +1283,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             resp.deinit();
         },
 
-        .tmux_message => |tmux_msg| {
-            const text = tmux_msg.slice();
-            log.info("tmux message: {s}", .{text});
-            _ = self.rt_app.performAction(
-                .{ .surface = self },
-                .tmux_message,
-                .{
-                    .data = text.ptr,
-                    .len = text.len,
-                },
-            ) catch |err| {
-                log.warn("apprt failed to notify tmux message err={}", .{err});
-            };
-            tmux_msg.deinit();
-        },
-
         .tmux_active_window_changed => |window_id| {
             log.info("tmux active window changed to @{}", .{window_id});
             _ = self.rt_app.performAction(
@@ -1307,54 +1291,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{ .window_id = window_id },
             ) catch |err| {
                 log.warn("apprt failed to notify tmux active window change err={}", .{err});
-            };
-        },
-
-        .tmux_paste_buffer_changed => |req| {
-            const name = req.slice();
-            log.info("tmux paste buffer changed: {s}", .{name});
-            _ = self.rt_app.performAction(
-                .{ .surface = self },
-                .tmux_paste_buffer_changed,
-                .{ .data = name.ptr, .len = name.len },
-            ) catch |err| {
-                log.warn("apprt failed to notify tmux paste buffer changed err={}", .{err});
-            };
-            req.deinit();
-        },
-
-        .tmux_paste_buffer_deleted => |req| {
-            const name = req.slice();
-            log.info("tmux paste buffer deleted: {s}", .{name});
-            _ = self.rt_app.performAction(
-                .{ .surface = self },
-                .tmux_paste_buffer_deleted,
-                .{ .data = name.ptr, .len = name.len },
-            ) catch |err| {
-                log.warn("apprt failed to notify tmux paste buffer deleted err={}", .{err});
-            };
-            req.deinit();
-        },
-
-        .tmux_sessions_changed => {
-            log.info("tmux sessions changed", .{});
-            _ = self.rt_app.performAction(
-                .{ .surface = self },
-                .tmux_sessions_changed,
-                {},
-            ) catch |err| {
-                log.warn("apprt failed to notify tmux sessions changed err={}", .{err});
-            };
-        },
-
-        .tmux_pane_mode_changed => |pane_id| {
-            log.info("tmux pane mode changed: %{}", .{pane_id});
-            _ = self.rt_app.performAction(
-                .{ .surface = self },
-                .tmux_pane_mode_changed,
-                .{ .pane_id = pane_id },
-            ) catch |err| {
-                log.warn("apprt failed to notify tmux pane mode changed err={}", .{err});
             };
         },
 
@@ -1382,22 +1318,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 },
             ) catch |err| {
                 log.warn("apprt failed to notify tmux focused pane changed err={}", .{err});
-            };
-        },
-
-        .tmux_subscription_changed => |sub| {
-            const name = std.mem.sliceTo(&sub.name, 0);
-            const value = std.mem.sliceTo(&sub.value, 0);
-            log.info("tmux subscription changed: {s}={s}", .{ name, value });
-            _ = self.rt_app.performAction(
-                .{ .surface = self },
-                .tmux_subscription_changed,
-                .{
-                    .name = name,
-                    .value = value,
-                },
-            ) catch |err| {
-                log.warn("apprt failed to notify tmux subscription changed err={}", .{err});
             };
         },
     }
