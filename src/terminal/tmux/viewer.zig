@@ -453,6 +453,10 @@ pub const Viewer = struct {
         focused_pane_id: ?usize = null,
 
         pub fn deinit(self: *Window, alloc: Allocator) void {
+            // name and raw_layout use empty string "" as a sentinel for
+            // "no name" / "no layout". Empty string literals are static
+            // (not heap-allocated), so we must not free them. Non-empty
+            // values are heap-duped by the viewer.
             if (self.name.len > 0) alloc.free(self.name);
             if (self.raw_layout.len > 0) alloc.free(self.raw_layout);
             self.layout_arena.promote(alloc).deinit();
@@ -532,6 +536,8 @@ pub const Viewer = struct {
             .windows = .empty,
             .panes = .empty,
             .action_arena = .{},
+            // Safety: action_single is only accessed via singleAction(),
+            // which writes the element before returning a slice over it.
             .action_single = undefined,
             .initial_ready_sent = false,
             .active_pane_id = null,
@@ -558,6 +564,9 @@ pub const Viewer = struct {
         }
         if (self.tmux_version.len > 0) {
             self.alloc.free(self.tmux_version);
+        }
+        if (self.session_name) |name| {
+            self.alloc.free(name);
         }
         self.observers.deinit(self.alloc);
         self.action_arena.promote(self.alloc).deinit();
@@ -602,7 +611,10 @@ pub const Viewer = struct {
         defer self.action_arena = arena.state;
         const arena_alloc = arena.allocator();
 
-        // Calculate the pane ID digit count.
+        // Calculate the pane ID digit count manually to size the buffer once.
+        // This is a hot path (every keystroke in tmux mode), so we compute
+        // the decimal width inline instead of using a formatting helper like
+        // std.fmt.allocPrint that would perform an extra pass and allocation.
         var id_digits: usize = 1;
         {
             var n = pane_id;
@@ -1078,7 +1090,15 @@ pub const Viewer = struct {
             // an action so the apprt can update its display.
             .session_renamed => |info| {
                 if (info.id == self.session_id) {
-                    self.session_name = info.name;
+                    // Dupe the name into self.alloc since info.name is
+                    // a view into the parser buffer, invalidated on the next
+                    // call to next().
+                    const duped = self.alloc.dupe(u8, info.name) catch {
+                        log.warn("failed to dupe session name", .{});
+                        return self.defunct();
+                    };
+                    if (self.session_name) |old| self.alloc.free(old);
+                    self.session_name = duped;
                 }
 
                 var arena = self.action_arena.promote(self.alloc);
@@ -1119,6 +1139,11 @@ pub const Viewer = struct {
                         log.warn("failed to format continue command for pane {}", .{info.pane_id});
                         return self.defunct();
                     };
+                    // Use .send_keys (fire-and-forget to tmux stdin)
+                    // rather than .command (which goes through the
+                    // %begin/%end command queue). The continue command
+                    // must be sent immediately, not serialized behind
+                    // pending commands.
                     actions.append(arena_alloc, .{ .send_keys = continue_cmd }) catch
                         return self.defunct();
                     self.trackFireAndForget();
@@ -1445,7 +1470,11 @@ pub const Viewer = struct {
 
         // Get our list of added panes and setup our command queue
         // to populate them.
-        // TODO: errdefer cleanup
+        //
+        // No errdefer cleanup needed for the queued commands: the command
+        // variants are value types (union enum) that don't own heap memory,
+        // and any queued commands are reclaimed when the viewer is eventually
+        // deinitialized by its owner.
         {
             var panes_it = panes.iterator();
             var added: bool = false;
@@ -1679,11 +1708,20 @@ pub const Viewer = struct {
         content: []const u8,
     ) !void {
         // If there is an error, reset our actions to what it was before.
-        errdefer actions.shrinkRetainingCapacity(actions.items.len);
+        // Capture the length now — at errdefer-run time, actions.items.len
+        // would already reflect the appended items, making shrink a no-op.
+        const actions_start = actions.items.len;
+        errdefer actions.shrinkRetainingCapacity(actions_start);
 
         // This stores our new window state from this list-windows output.
         var windows: std.ArrayList(Window) = .empty;
-        defer windows.deinit(self.alloc);
+        errdefer {
+            // On error, each partially-built window may own a layout_arena
+            // and heap-duped name/raw_layout strings. We must deinit them
+            // individually before freeing the ArrayList backing store.
+            for (windows.items) |*w| w.deinit(self.alloc);
+            windows.deinit(self.alloc);
+        }
 
         // Parse all our windows
         var it = std.mem.splitScalar(u8, content, '\n');
@@ -1714,30 +1752,42 @@ pub const Viewer = struct {
                 return err;
             };
 
+            // Build the window value before appending so that errdefer
+            // can clean up partial allocations if a later step fails.
+            const name: []const u8 = if (data.window_name.len > 0)
+                try self.alloc.dupe(u8, data.window_name)
+            else
+                "";
+            errdefer if (name.len > 0) self.alloc.free(name);
+
+            const raw_layout = try self.alloc.dupe(u8, data.window_layout);
+            errdefer self.alloc.free(raw_layout);
+
             try windows.append(self.alloc, .{
                 .id = data.window_id,
                 .width = data.window_width,
                 .height = data.window_height,
                 .layout_arena = arena.state,
                 .layout = layout,
-                .name = if (data.window_name.len > 0)
-                    try self.alloc.dupe(u8, data.window_name)
-                else
-                    "",
-                .raw_layout = try self.alloc.dupe(u8, data.window_layout),
+                .name = name,
+                .raw_layout = raw_layout,
             });
         }
 
         // Setup our windows action so the caller can process GUI
         // window changes. We must dupe into the arena because `windows`
-        // is a local ArrayList whose backing memory is freed by defer
-        // when this function returns. Without the dupe, the action
-        // would hold a dangling pointer (use-after-free).
+        // is a local ArrayList whose backing memory is freed when this
+        // function returns. Without the dupe, the action would hold a
+        // dangling pointer (use-after-free).
         const arena_windows = try arena_alloc.dupe(Window, windows.items);
         try actions.append(arena_alloc, .{ .windows = arena_windows });
 
         // Sync up our layouts. This will populate unknown panes, prune, etc.
+        // On success, syncLayouts takes ownership of the window internals
+        // (layout_arena, name, raw_layout) by shallow-copying into self.windows.
+        // We only need to free the ArrayList backing store afterward.
         try self.syncLayouts(windows.items);
+        windows.deinit(self.alloc);
     }
 
     fn receivedPaneState(
@@ -2044,10 +2094,9 @@ pub const Viewer = struct {
             stream.parser = .init();
             stream.deinit();
         }
-        stream.nextSlice(data) catch |err| {
-            log.info("failed to process output for pane id={}: {}", .{ id, err });
-            return err;
-        };
+        // Use try — callers catch and log with their own context
+        // (pane ID, whether it's extended output, etc.).
+        try stream.nextSlice(data);
 
         // Wake all observer renderers bound to this pane so they
         // re-render the new content. On iOS there is no display link,
@@ -7178,4 +7227,42 @@ test "flow control: wait-exit in enable_flow_control command" {
             }).check,
         },
     });
+}
+
+test "session_renamed persists name across subsequent next() calls" {
+    // Verify that session_name is heap-duped and survives parser buffer
+    // reuse from subsequent next() calls. We use a mutable buffer to
+    // simulate the real failure mode: info.name points into a parser
+    // buffer that gets overwritten on the next parse.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    // Bootstrap the viewer into connected state.
+    _ = viewer.next(.{ .tmux = .{ .block_end = "" } });
+    _ = viewer.next(.{ .tmux = .{ .session_changed = .{
+        .id = 1,
+        .name = "initial",
+    } } });
+
+    // Create a mutable buffer simulating a parser buffer.
+    var buf: [32]u8 = undefined;
+    const original_name = "renamed-session";
+    @memcpy(buf[0..original_name.len], original_name);
+    const name_slice: []const u8 = buf[0..original_name.len];
+
+    // Feed session_renamed with a pointer into our mutable buffer.
+    _ = viewer.next(.{ .tmux = .{ .session_renamed = .{
+        .id = 1,
+        .name = name_slice,
+    } } });
+
+    // session_name should be duped and match the original.
+    try testing.expectEqualStrings(original_name, viewer.session_name.?);
+
+    // Overwrite the mutable buffer (simulating parser buffer reuse).
+    @memset(buf[0..original_name.len], 'X');
+
+    // If session_name was an unowned pointer, it would now read "XXXXXXXXXXXXXXX".
+    // Because it was duped, it should still be "renamed-session".
+    try testing.expectEqualStrings(original_name, viewer.session_name.?);
 }
