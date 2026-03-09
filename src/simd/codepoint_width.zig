@@ -34,12 +34,16 @@ test "codepointWidth basic" {
 //     const min = 0xFF + 1; // start outside ascii
 //     const max = std.math.maxInt(u21) + 1;
 //     for (min..max) |cp| {
+//         // Skip surrogates — not valid Unicode scalar values.
+//         if (cp >= 0xD800 and cp <= 0xDFFF) continue;
+//
 //         const simd = codepointWidth(@intCast(cp));
 //         const uu = if (cp > uucode.config.max_code_point)
 //             1
 //         else
 //             uucode.get(.width, @intCast(cp));
 //         if (simd != uu) mismatch: {
+//             // 0x2E3B is technically width 3 but we treat it as width 2.
 //             if (cp == 0x2E3B) {
 //                 try testing.expectEqual(@as(i8, 2), simd);
 //                 break :mismatch;
