@@ -21,7 +21,7 @@ pub fn parseFormatStruct(
     // Parse all our fields
     const fields = @typeInfo(T).@"struct".fields;
     var it = std.mem.splitScalar(u8, str, delimiter);
-    var result: T = undefined;
+    var result: T = std.mem.zeroes(T);
     inline for (fields) |field| {
         const part = it.next() orelse return error.MissingEntry;
         @field(result, field.name) = Variable.parse(
@@ -199,6 +199,8 @@ pub const Variable = enum {
             .cursor_y,
             .scroll_region_lower,
             .scroll_region_upper,
+            .window_width,
+            .window_height,
             => try std.fmt.parseInt(usize, value, 10),
             .session_id => if (value.len >= 2 and value[0] == '$')
                 try std.fmt.parseInt(usize, value[1..], 10)
@@ -212,8 +214,6 @@ pub const Variable = enum {
                 try std.fmt.parseInt(usize, value[1..], 10)
             else
                 return error.FormatError,
-            .window_width => try std.fmt.parseInt(usize, value, 10),
-            .window_height => try std.fmt.parseInt(usize, value, 10),
             .cursor_colour,
             .cursor_shape,
             .pane_tabs,
