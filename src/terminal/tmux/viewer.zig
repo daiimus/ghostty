@@ -1715,7 +1715,13 @@ pub const Viewer = struct {
 
         // This stores our new window state from this list-windows output.
         var windows: std.ArrayList(Window) = .empty;
-        defer windows.deinit(self.alloc);
+        errdefer {
+            // On error, each partially-built window may own a layout_arena
+            // and heap-duped name/raw_layout strings. We must deinit them
+            // individually before freeing the ArrayList backing store.
+            for (windows.items) |*w| w.deinit(self.alloc);
+            windows.deinit(self.alloc);
+        }
 
         // Parse all our windows
         var it = std.mem.splitScalar(u8, content, '\n');
@@ -1762,14 +1768,18 @@ pub const Viewer = struct {
 
         // Setup our windows action so the caller can process GUI
         // window changes. We must dupe into the arena because `windows`
-        // is a local ArrayList whose backing memory is freed by defer
-        // when this function returns. Without the dupe, the action
-        // would hold a dangling pointer (use-after-free).
+        // is a local ArrayList whose backing memory is freed when this
+        // function returns. Without the dupe, the action would hold a
+        // dangling pointer (use-after-free).
         const arena_windows = try arena_alloc.dupe(Window, windows.items);
         try actions.append(arena_alloc, .{ .windows = arena_windows });
 
         // Sync up our layouts. This will populate unknown panes, prune, etc.
+        // On success, syncLayouts takes ownership of the window internals
+        // (layout_arena, name, raw_layout) by shallow-copying into self.windows.
+        // We only need to free the ArrayList backing store afterward.
         try self.syncLayouts(windows.items);
+        windows.deinit(self.alloc);
     }
 
     fn receivedPaneState(
