@@ -194,10 +194,12 @@ pub const Layout = struct {
                     }
 
                     // We expect a closing bracket now.
+                    // opening is captured from '{' or '[' above;
+                    // other values are unreachable.
                     switch (opening) {
                         '{' => if (str[offset.*] != '}') return error.SyntaxError,
                         '[' => if (str[offset.*] != ']') return error.SyntaxError,
-                        else => return error.SyntaxError,
+                        else => unreachable,
                     }
 
                     // Successfully parsed all children.

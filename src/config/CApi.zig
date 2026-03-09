@@ -155,6 +155,8 @@ fn config_trigger_(
 }
 
 export fn ghostty_config_diagnostics_count(self: *Config) u32 {
+    // Safe to @intCast: diagnostic counts are bounded by the number of
+    // config keys, which is far below u32 max.
     return @intCast(self._diagnostics.items().len);
 }
 

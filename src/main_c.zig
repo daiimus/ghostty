@@ -184,8 +184,9 @@ pub export fn ghostty_init(argc: usize, argv: [*][*:0]u8) c_int {
     return 0;
 }
 
-/// Runs an action if it is specified. If there is no action this returns
-/// false. If there is an action then this doesn't return.
+/// Runs an action if it is specified. If there is no action this
+/// returns immediately. If there is an action this calls exit and
+/// does not return.
 pub export fn ghostty_cli_try_action() void {
     const action = state.action orelse return;
     std.log.info("executing CLI action={}", .{action});
@@ -193,8 +194,6 @@ pub export fn ghostty_cli_try_action() void {
         std.log.err("CLI action failed error={}", .{err});
         posix.exit(1);
     });
-
-    posix.exit(0);
 }
 
 /// Return metadata about Ghostty, such as version, build mode, etc.
