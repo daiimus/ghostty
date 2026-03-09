@@ -15,38 +15,44 @@ test "codepointWidth basic" {
     const testing = std.testing;
     try testing.expectEqual(@as(i8, 1), codepointWidth('a'));
     try testing.expectEqual(@as(i8, 1), codepointWidth(0x100)); // Ā
+    try testing.expectEqual(@as(i8, 2), codepointWidth(0x3000)); // U+3000 IDEOGRAPHIC SPACE (EAW=F)
     try testing.expectEqual(@as(i8, 2), codepointWidth(0x3400)); // 㐀
     try testing.expectEqual(@as(i8, 2), codepointWidth(0x2E3A)); // ⸺
     try testing.expectEqual(@as(i8, 2), codepointWidth(0x1F1E6)); // 🇦
     try testing.expectEqual(@as(i8, 2), codepointWidth(0x4E00)); // 一
-    try testing.expectEqual(@as(i8, 2), codepointWidth(0xF900)); // 豈
+    try testing.expectEqual(@as(i8, 2), codepointWidth(0xF900)); // 豈
     try testing.expectEqual(@as(i8, 2), codepointWidth(0x20000)); // 𠀀
-    try testing.expectEqual(@as(i8, 2), codepointWidth(0x30000)); // 𠀀
+    try testing.expectEqual(@as(i8, 2), codepointWidth(0x30000)); // U+30000 (CJK Ext-H)
     // try testing.expectEqual(@as(i8, 1), @import("uucode").get(.width, 0x100));
 }
 
-// This is not very fast in debug modes, so its commented by default.
-// IMPORTANT: UNCOMMENT THIS WHENEVER MAKING CODEPOINTWIDTH CHANGES.
-// test "codepointWidth matches uucode" {
-//     const testing = std.testing;
-//     const uucode = @import("uucode");
-//
-//     const min = 0xFF + 1; // start outside ascii
-//     const max = std.math.maxInt(u21) + 1;
-//     for (min..max) |cp| {
-//         const simd = codepointWidth(@intCast(cp));
-//         const uu = if (cp > uucode.config.max_code_point)
-//             1
-//         else
-//             uucode.get(.width, @intCast(cp));
-//         if (simd != uu) mismatch: {
-//             if (cp == 0x2E3B) {
-//                 try testing.expectEqual(@as(i8, 2), simd);
-//                 break :mismatch;
-//             }
-//
-//             std.log.warn("mismatch cp=U+{x} simd={} uucode={}", .{ cp, simd, uu });
-//             try testing.expect(false);
-//         }
-//     }
-// }
+// Exhaustive verification of SIMD tables against uucode reference data.
+// Skipped in debug builds (~30s) to keep CI fast; runs in release (~1s).
+// Run explicitly with: zig build test -Doptimize=ReleaseSafe -Dtest-filter="codepointWidth matches uucode"
+test "codepointWidth matches uucode" {
+    const builtin = @import("builtin");
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const uucode = @import("uucode");
+
+    const min = 0xFF + 1; // start outside ascii
+    const max = uucode.config.max_code_point + 1;
+    for (min..max) |cp| {
+        // Skip surrogates — not valid Unicode scalar values.
+        if (cp >= 0xD800 and cp <= 0xDFFF) continue;
+
+        const simd = codepointWidth(@intCast(cp));
+        const uu = uucode.get(.width, @intCast(cp));
+        if (simd != uu) mismatch: {
+            // 0x2E3B is technically width 3 but we treat it as width 2.
+            if (cp == 0x2E3B) {
+                try testing.expectEqual(@as(i8, 2), simd);
+                break :mismatch;
+            }
+
+            std.log.warn("mismatch cp=U+{x} simd={} uucode={}", .{ cp, simd, uu });
+            try testing.expect(false);
+        }
+    }
+}
