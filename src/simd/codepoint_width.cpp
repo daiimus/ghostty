@@ -6,6 +6,16 @@
 #include <hwy/print-inl.h>
 
 #include <cassert>
+#include <cstddef>
+
+// Compile-time helper: find the last non-zero element in a zero-padded array.
+template <typename T, size_t N>
+constexpr T lastNonZero(const T (&arr)[N]) {
+  for (size_t i = N; i > 0; --i) {
+    if (arr[i - 1] != 0) return arr[i - 1];
+  }
+  return 0;
+}
 
 HWY_BEFORE_NAMESPACE();
 namespace ghostty {
@@ -209,6 +219,18 @@ static_assert(std::size(zero_gte32) == std::size(zero_lte32));
 static_assert(std::size(zero_gte16) == std::size(zero_lte16));
 static_assert(std::size(nsm_gte32) == std::size(nsm_lte32));
 static_assert(std::size(nsm_gte16) == std::size(nsm_lte16));
+
+// Precheck bounds must match the table data. If tables are regenerated
+// without updating the hardcoded constants in CodepointWidth16/32, these
+// assertions will fire at compile time.
+static_assert(eaw_gte16[0] == 0x1100, "eaw_gte16 min drifted from precheck");
+static_assert(lastNonZero(eaw_lte16) == 0xffe6, "eaw_lte16 max drifted from precheck");
+static_assert(zero_gte16[0] == 0x300, "zero_gte16 min drifted from precheck");
+static_assert(lastNonZero(zero_lte16) == 0xfff8, "zero_lte16 max drifted from precheck");
+static_assert(eaw_gte32[0] == 0x16fe0, "eaw_gte32 min drifted from precheck");
+static_assert(lastNonZero(eaw_lte32) == 0x3fffd, "eaw_lte32 max drifted from precheck");
+static_assert(zero_gte32[0] == 0x101fd, "zero_gte32 min drifted from precheck");
+static_assert(lastNonZero(zero_lte32) == 0xe0fff, "zero_lte32 max drifted from precheck");
 
 /// Handles 16-bit codepoints.
 template <class D, typename T = uint16_t>
