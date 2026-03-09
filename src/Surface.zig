@@ -3042,11 +3042,17 @@ pub fn keyCallback(
                 break :mouse_mods;
             };
         } else if (mouse_ev != .none and !self.mouse.mods.shift) {
-            // If we have mouse reports on and we don't have shift pressed, we reset state
+            // If we have mouse reports on and we don't have shift pressed, we reset state.
+            // Read mouse_shape from the active terminal (which may be a tmux pane).
+            const mouse_shape = mouse_shape: {
+                self.renderer_state.mutex.lock();
+                defer self.renderer_state.mutex.unlock();
+                break :mouse_shape self.renderer_state.terminal.mouse_shape;
+            };
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
-                self.io.terminal.mouse_shape,
+                mouse_shape,
             );
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -3058,17 +3064,20 @@ pub fn keyCallback(
     }
 
     // Process the cursor state logic. This will update the cursor shape if
-    // needed, depending on the key state. We read mouse_event from the
-    // active terminal so tmux pane state is respected.
-    const key_mouse_ev = key_mouse_ev: {
+    // needed, depending on the key state. We read mouse_event and mouse_shape
+    // from the active terminal so tmux pane state is respected.
+    const key_mouse_state = key_mouse_state: {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-        break :key_mouse_ev self.renderer_state.terminal.flags.mouse_event;
+        break :key_mouse_state .{
+            .mouse_event = self.renderer_state.terminal.flags.mouse_event,
+            .mouse_shape = self.renderer_state.terminal.mouse_shape,
+        };
     };
     if ((SurfaceMouse{
         .physical_key = event.key,
-        .mouse_event = key_mouse_ev,
-        .mouse_shape = self.io.terminal.mouse_shape,
+        .mouse_event = key_mouse_state.mouse_event,
+        .mouse_shape = key_mouse_state.mouse_shape,
         .mods = self.mouse.mods,
         .over_link = self.mouse.over_link,
         .hidden = self.mouse.hidden,
@@ -4967,10 +4976,16 @@ pub fn cursorPosCallback(
         self.mouse.link_point = null;
         if (self.mouse.over_link) {
             self.mouse.over_link = false;
+            // Read mouse_shape from the active terminal (which may be a tmux pane).
+            const mouse_shape = mouse_shape: {
+                self.renderer_state.mutex.lock();
+                defer self.renderer_state.mutex.unlock();
+                break :mouse_shape self.renderer_state.terminal.mouse_shape;
+            };
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
-                self.io.terminal.mouse_shape,
+                mouse_shape,
             );
             _ = try self.rt_app.performAction(
                 .{ .surface = self },

@@ -870,6 +870,8 @@ typedef struct {
 } ghostty_action_tmux_state_changed_s;
 
 // apprt.action.TmuxCommandResponse
+// Pointer lifetime: data is valid only for the duration of the action
+// callback invocation. The consumer must copy data if needed beyond that.
 typedef struct {
   const char* data;
   size_t len;
@@ -877,12 +879,15 @@ typedef struct {
 } ghostty_action_tmux_command_response_s;
 
 // apprt.action.TmuxExit
+// reason is inline (not a pointer), so no lifetime concerns.
 typedef struct {
   char reason[15];
   uint8_t reason_len;
 } ghostty_action_tmux_exit_s;
 
 // apprt.action.TmuxMessage
+// Pointer lifetime: data is valid only for the duration of the action
+// callback invocation. The consumer must copy data if needed beyond that.
 typedef struct {
   const char* data;
   size_t len;
@@ -894,12 +899,16 @@ typedef struct {
 } ghostty_action_tmux_active_window_changed_s;
 
 // apprt.action.TmuxPasteBufferChanged
+// Pointer lifetime: data is valid only for the duration of the action
+// callback invocation. The consumer must copy data if needed beyond that.
 typedef struct {
   const char* data;
   size_t len;
 } ghostty_action_tmux_paste_buffer_changed_s;
 
 // apprt.action.TmuxPasteBufferDeleted
+// Pointer lifetime: data is valid only for the duration of the action
+// callback invocation. The consumer must copy data if needed beyond that.
 typedef struct {
   const char* data;
   size_t len;
@@ -911,6 +920,8 @@ typedef struct {
 } ghostty_action_tmux_pane_mode_changed_s;
 
 // apprt.action.TmuxSessionRenamed
+// Pointer lifetime: data is valid only for the duration of the action
+// callback invocation. The consumer must copy data if needed beyond that.
 typedef struct {
   const char* data;
   size_t len;
@@ -923,6 +934,8 @@ typedef struct {
 } ghostty_action_tmux_focused_pane_changed_s;
 
 // apprt.action.TmuxSubscriptionChanged
+// Pointer lifetime: name and value are valid only for the duration of the
+// action callback invocation. The consumer must copy if needed beyond that.
 typedef struct {
   const char* name;
   const char* value;
@@ -1264,7 +1277,8 @@ typedef struct {
     intptr_t selected; // Selected match index (-1 if none)
     bool success;      // True if operation succeeded
     intptr_t screen_type;   // 0 = primary screen, 1 = alternate screen
-    bool has_scrollback;    // True if current screen has scrollback content
+    intptr_t total_rows;    // Total rows in screen (scrollback + visible)
+    intptr_t visible_rows;  // Number of visible rows
 } ghostty_search_result_s;
 
 ghostty_search_result_s ghostty_surface_search_start(ghostty_surface_t,
