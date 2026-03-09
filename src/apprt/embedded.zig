@@ -2020,7 +2020,7 @@ pub const CAPI = struct {
 
     /// Set the active tmux pane for rendering AND input routing.
     /// Also registers the surface as an observer for the pane so that
-    /// fixupObservers() keeps the renderer pointer valid across
+    /// fixupTmuxObservers() keeps the renderer pointer valid across
     /// syncLayouts() rebuilds (which invalidate all pane terminal pointers).
     ///
     /// In multi-pane mode (iOS), the "active pane" for input routing
@@ -2028,7 +2028,7 @@ pub const CAPI = struct {
     /// renders. Without observer registration, a syncLayouts() would
     /// re-point the primary's renderer at active_pane_id (via the
     /// .windows action handler in stream_handler), causing renderer
-    /// bleed. The observer ensures fixupObservers() overrides that
+    /// bleed. The observer ensures fixupTmuxObservers() overrides that
     /// with the correct rendering pane.
     ///
     /// Returns true if successful, false if pane_id not found or not in tmux mode.
@@ -2064,49 +2064,29 @@ pub const CAPI = struct {
         // Swap the terminal pointer for rendering.
         surface.core_surface.renderer_state.terminal = &pane.terminal;
 
-        // Register (or re-register) as an observer so fixupObservers()
+        // Register (or re-register) as an observer so fixupTmuxObservers()
         // keeps our renderer_state.terminal pointed at the correct pane
         // terminal after syncLayouts() rebuilds the pane map.
         //
-        // We register the new observer BEFORE unregistering the old one
-        // to avoid a window where the surface has no observer at all.
-        // registerObserver rejects duplicates by (pane_id, terminal_ptr)
-        // pair, so having both old and new registrations momentarily is
-        // fine as long as pane_id differs (which it does when switching).
-        const registered = viewer.registerObserver(
+        // Unregister any previous observer for this surface first
+        // (identified by terminal_ptr — each surface has exactly one
+        // renderer_state.terminal field at a unique address).
+        handler.unregisterTmuxObserverByPtr(&surface.core_surface.renderer_state.terminal);
+        const registered = handler.registerTmuxObserver(
             pane_id,
             &surface.core_surface.renderer_state.terminal,
             observerWakeup,
             @ptrCast(&surface.core_surface.renderer_thread.wakeup),
         );
 
-        if (registered) {
-            // Success — now safe to remove the old observer.
-            // Use unregisterObserver with prev_pane_id (not ByPtr) to
-            // avoid accidentally removing the registration we just added.
-            // Guard: only unregister if the previous pane differs from the
-            // new one. When prev_pane_id == pane_id (e.g. first observer
-            // registration after set_active_pane_input_only), unregistering
-            // with the same terminal_ptr would remove the observer we just
-            // registered, leaving the surface without fixup coverage.
-            if (prev_pane_id) |pid| {
-                if (pid != pane_id) {
-                    viewer.unregisterObserver(pid, &surface.core_surface.renderer_state.terminal);
-                }
-            }
-        } else if (prev_pane_id != null and prev_pane_id.? == pane_id) {
-            // Re-registration to the same pane — observer already exists,
-            // nothing to do (terminal pointer is already correct).
-        } else {
+        if (!registered) {
             // Registration failed (OOM or pane gone). Roll back to
             // prevent the surface from rendering a pane terminal that
-            // the viewer won't fix up after layout changes.
+            // won't be fixed up after layout changes.
             surface.core_surface.renderer_state.terminal = prev_terminal;
 
-            // Restore the previous active pane if it still exists in the
-            // viewer's pane map; otherwise clear it to avoid leaving
-            // active_pane_id pointing at the new pane when we've reverted
-            // the renderer terminal.
+            // Restore the previous active pane if it still exists;
+            // otherwise clear it.
             if (prev_pane_id) |pid| {
                 if (viewer.panes.getPtr(pid) != null) {
                     viewer.setActivePaneId(prev_pane_id);
@@ -2155,7 +2135,7 @@ pub const CAPI = struct {
 
     /// Reset to render the main terminal (not a tmux pane).
     /// Unregisters any observer for this surface's renderer_state.terminal
-    /// so fixupObservers() no longer writes to it.
+    /// so fixupTmuxObservers() no longer writes to it.
     ///
     /// Acquires renderer_state.mutex for the entire operation.
     export fn ghostty_surface_tmux_reset_active_pane(surface: *Surface) void {
@@ -2169,8 +2149,8 @@ pub const CAPI = struct {
         if (comptime @TypeOf(handler.*).tmux_enabled) {
             if (handler.tmux_viewer) |viewer| {
                 viewer.setActivePaneId(null);
-                viewer.unregisterObserverByPtr(&surface.core_surface.renderer_state.terminal);
             }
+            handler.unregisterTmuxObserverByPtr(&surface.core_surface.renderer_state.terminal);
         }
 
         // Reset to the main termio terminal
@@ -2320,7 +2300,7 @@ pub const CAPI = struct {
     // tmux Multi-Pane Binding API
     // =========================================================================
 
-    /// Callback passed to the tmux viewer's observer system so it can
+    /// Callback passed to the tmux observer system so it can
     /// wake an observer surface's renderer thread when new %output
     /// arrives. The userdata is a pointer to the renderer thread's
     /// `xev.Async` wakeup handle.
@@ -2382,11 +2362,11 @@ pub const CAPI = struct {
         target.core_surface.renderer_state.terminal = &pane.terminal;
         target.core_surface.tmux_pane_binding = binding;
 
-        // Register as an observer so fixupObservers updates our pointer
+        // Register as an observer so fixupTmuxObservers updates our pointer
         // when syncLayouts rebuilds the pane map. Pass a wakeup callback
-        // so the viewer can wake the observer's renderer when new %output
+        // so the stream handler can wake the observer's renderer when new %output
         // arrives for this pane (critical on iOS where there is no display link).
-        if (!viewer.registerObserver(
+        if (!handler.registerTmuxObserver(
             pane_id,
             &target.core_surface.renderer_state.terminal,
             observerWakeup,
@@ -2422,12 +2402,10 @@ pub const CAPI = struct {
         // (target.core_surface.renderer_state.mutex == source's mutex here)
         target.core_surface.renderer_state.mutex.lock();
 
-        // Unregister from the source viewer's observer list.
+        // Unregister from the source's observer list.
         const handler = &binding.source.io.terminal_stream.handler;
         if (comptime @TypeOf(handler.*).tmux_enabled) {
-            if (handler.tmux_viewer) |viewer| {
-                viewer.unregisterObserver(binding.pane_id, &target.core_surface.renderer_state.terminal);
-            }
+            handler.unregisterTmuxObserver(binding.pane_id, &target.core_surface.renderer_state.terminal);
         }
 
         // Restore original terminal before restoring the mutex, while

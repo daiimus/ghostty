@@ -853,16 +853,14 @@ pub fn deinit(self: *Surface) void {
 
     // If this surface was a tmux pane observer, restore the original
     // mutex and terminal pointer before cleanup. We must also unregister
-    // from the source viewer so it doesn't try to fix up a dangling
+    // from the source's observer list so it doesn't try to fix up a dangling
     // pointer to our renderer_state. The renderer thread is already
     // stopped at this point so we don't need mutex protection.
     if (self.tmux_pane_binding) |binding| {
-        // Unregister from the viewer's observer list (best-effort).
+        // Unregister from the stream handler's observer list (best-effort).
         const handler = &binding.source.io.terminal_stream.handler;
         if (comptime @TypeOf(handler.*).tmux_enabled) {
-            if (handler.tmux_viewer) |viewer| {
-                viewer.unregisterObserver(binding.pane_id, &self.renderer_state.terminal);
-            }
+            handler.unregisterTmuxObserver(binding.pane_id, &self.renderer_state.terminal);
         }
 
         // Restore the original state so deinit below frees the

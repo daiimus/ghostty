@@ -73,6 +73,14 @@ pub const StreamHandler = struct {
     /// The tmux control mode viewer state.
     tmux_viewer: if (tmux_enabled) ?*terminal.tmux.Viewer else void = if (tmux_enabled) null else {},
 
+    /// Observer surfaces whose renderer_state.terminal pointers must be
+    /// kept in sync when the viewer's pane map is rebuilt. Each observer
+    /// is bound to a specific pane_id. Management lives here (not in the
+    /// viewer) because observers are a fork-specific concept for iOS
+    /// multi-pane rendering — keeping them out of the viewer lets the
+    /// viewer stay aligned with upstream.
+    tmux_observers: if (tmux_enabled) ObserverList else void = if (tmux_enabled) .empty else {},
+
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
     /// to wake up the termio thread.
@@ -87,15 +95,161 @@ pub const StreamHandler = struct {
     /// True if we have tmux control mode built in.
     pub const tmux_enabled = terminal.options.tmux_control_mode;
 
+    /// An observer is a renderer_state.terminal pointer that must be kept
+    /// in sync with a specific pane's terminal. When the viewer's
+    /// syncLayouts rebuilds the pane map (invalidating all pane pointers),
+    /// fixupObservers iterates the observer list and updates each
+    /// terminal_ptr to point at the new pane terminal in the rebuilt map.
+    ///
+    /// This is used by the multi-pane architecture: each per-pane surface
+    /// registers an observer so its renderer_state.terminal stays valid
+    /// when the viewer's pane map is reallocated. On iOS (where there is
+    /// no display link), the notify_cb allows explicit wakeup of the
+    /// observer's renderer thread after new output arrives.
+    pub const Observer = struct {
+        pane_id: usize,
+        terminal_ptr: **terminal.Terminal,
+        notify_cb: ?NotifyCallback = null,
+        notify_ud: ?*anyopaque = null,
+
+        pub const NotifyCallback = *const fn (ud: ?*anyopaque) void;
+    };
+
+    pub const ObserverList = std.ArrayListUnmanaged(Observer);
+
     pub fn deinit(self: *StreamHandler) void {
         self.apc.deinit();
         self.dcs.deinit();
         if (comptime tmux_enabled) tmux: {
+            self.tmux_observers.deinit(self.alloc);
             const viewer = self.tmux_viewer orelse break :tmux;
             viewer.deinit();
             self.alloc.destroy(viewer);
             self.tmux_viewer = null;
         }
+    }
+
+    // ── Tmux observer management ─────────────────────────────────────
+    //
+    // These functions manage observer surfaces for tmux multi-pane
+    // rendering. Observers are registered by the apprt (embedded.zig)
+    // when a surface is bound to a tmux pane, and unregistered on
+    // unbind or surface destruction.
+
+    /// Register an observer for the given pane. The pane must exist in
+    /// the viewer's panes map. Returns true on success, false if the
+    /// pane doesn't exist, the observer is a duplicate, or allocation
+    /// fails.
+    pub fn registerTmuxObserver(
+        self: *StreamHandler,
+        pane_id: usize,
+        terminal_ptr: **terminal.Terminal,
+        notify_cb: ?Observer.NotifyCallback,
+        notify_ud: ?*anyopaque,
+    ) bool {
+        if (comptime !tmux_enabled) return false;
+        const viewer = self.tmux_viewer orelse return false;
+
+        // Verify the pane exists.
+        if (!viewer.panes.contains(pane_id)) return false;
+
+        // Check for duplicate registration.
+        for (self.tmux_observers.items) |obs| {
+            if (obs.pane_id == pane_id and obs.terminal_ptr == terminal_ptr) {
+                return false;
+            }
+        }
+
+        self.tmux_observers.append(self.alloc, .{
+            .pane_id = pane_id,
+            .terminal_ptr = terminal_ptr,
+            .notify_cb = notify_cb,
+            .notify_ud = notify_ud,
+        }) catch return false;
+
+        return true;
+    }
+
+    /// Unregister an observer matching both pane_id and terminal_ptr.
+    /// No-op if the observer is not found.
+    pub fn unregisterTmuxObserver(
+        self: *StreamHandler,
+        pane_id: usize,
+        terminal_ptr: **terminal.Terminal,
+    ) void {
+        if (comptime !tmux_enabled) return;
+        var i: usize = 0;
+        while (i < self.tmux_observers.items.len) {
+            const obs = self.tmux_observers.items[i];
+            if (obs.pane_id == pane_id and obs.terminal_ptr == terminal_ptr) {
+                _ = self.tmux_observers.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Unregister all observers matching a given terminal_ptr, regardless
+    /// of pane_id. Used when re-registering a surface for a different pane.
+    pub fn unregisterTmuxObserverByPtr(
+        self: *StreamHandler,
+        terminal_ptr: **terminal.Terminal,
+    ) void {
+        if (comptime !tmux_enabled) return;
+        var i: usize = 0;
+        while (i < self.tmux_observers.items.len) {
+            const obs = self.tmux_observers.items[i];
+            if (obs.terminal_ptr == terminal_ptr) {
+                _ = self.tmux_observers.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Fix up all observer terminal pointers after the viewer's pane map
+    /// has been rebuilt. For each observer, if the pane still exists,
+    /// update the terminal_ptr to the new pane's terminal. Otherwise
+    /// point it at `fallback` (the main termio terminal).
+    pub fn fixupTmuxObservers(self: *StreamHandler, fallback: *terminal.Terminal) void {
+        if (comptime !tmux_enabled) return;
+        const viewer = self.tmux_viewer orelse return;
+        for (self.tmux_observers.items) |obs| {
+            if (viewer.panes.getPtr(obs.pane_id)) |pane| {
+                obs.terminal_ptr.* = &pane.terminal;
+            } else {
+                obs.terminal_ptr.* = fallback;
+            }
+        }
+    }
+
+    /// Unconditionally reset ALL observer terminal pointers to the given
+    /// fallback terminal. Used during tmux exit where all pane terminals
+    /// are about to be freed.
+    pub fn resetAllTmuxObservers(self: *StreamHandler, fallback: *terminal.Terminal) void {
+        if (comptime !tmux_enabled) return;
+        for (self.tmux_observers.items) |obs| {
+            obs.terminal_ptr.* = fallback;
+        }
+    }
+
+    /// Wake all observer renderers bound to the given pane. Called after
+    /// the viewer processes %output so observer surfaces re-render.
+    pub fn wakeTmuxObservers(self: *StreamHandler, pane_id: usize) void {
+        if (comptime !tmux_enabled) return;
+        for (self.tmux_observers.items) |obs| {
+            if (obs.pane_id == pane_id) {
+                if (obs.notify_cb) |cb| cb(obs.notify_ud);
+            }
+        }
+    }
+
+    /// Callback passed to the viewer's output_cb so it can notify
+    /// observer renderers after processing %output without knowing
+    /// about the observer system itself.
+    fn viewerOutputCallback(ud: ?*anyopaque, pane_id: usize) void {
+        const self: *StreamHandler = @ptrCast(@alignCast(ud.?));
+        self.wakeTmuxObservers(pane_id);
     }
 
     /// This queues a render operation with the renderer thread. The render
@@ -390,6 +544,8 @@ pub const StreamHandler = struct {
                         errdefer self.alloc.destroy(viewer);
                         viewer.* = try .init(self.alloc);
                         errdefer viewer.deinit();
+                        viewer.output_cb = viewerOutputCallback;
+                        viewer.output_ud = @ptrCast(self);
                         self.tmux_viewer = viewer;
                         break :tmux;
                     },
@@ -434,7 +590,7 @@ pub const StreamHandler = struct {
                             // observers at the pane terminals (which are about
                             // to be freed), causing use-after-free on the
                             // renderer threads.
-                            viewer.resetAllObservers(self.terminal);
+                            self.resetAllTmuxObservers(self.terminal);
 
                             viewer.deinit();
                             self.alloc.destroy(viewer);
@@ -542,7 +698,7 @@ pub const StreamHandler = struct {
                             // be re-pointed to the pane terminal in the
                             // new map, or to the main terminal if the pane
                             // was removed.
-                            viewer.fixupObservers(self.terminal);
+                            self.fixupTmuxObservers(self.terminal);
 
                             // Build tmux state snapshot to send to surface
                             var state: apprt.surface.Message.TmuxState = .{
