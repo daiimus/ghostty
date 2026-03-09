@@ -552,7 +552,9 @@ pub const StreamHandler = struct {
                                 .pane_ids_len = 0,
                             };
 
-                            // Count panes and collect IDs
+                            // Count panes and collect IDs (capped at
+                            // state.pane_ids.len due to fixed-size C API;
+                            // pane_count reflects the true total).
                             var panes_it = viewer.panes.iterator();
                             while (panes_it.next()) |kv| {
                                 state.pane_count += 1;

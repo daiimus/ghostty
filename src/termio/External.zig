@@ -37,12 +37,20 @@ pub const Config = struct {
     /// Callback for when terminal wants to write data (user input).
     /// The embedder should send this data to the external source (e.g., SSH).
     /// If null, input is silently discarded.
+    ///
+    /// Thread safety: invoked on the IO thread. If the embedder needs
+    /// to dispatch to a different thread (e.g., main thread for UIKit),
+    /// it must handle that internally.
     write_callback: ?*const fn (data: []const u8, userdata: ?*anyopaque) void = null,
     write_userdata: ?*anyopaque = null,
 
     /// Callback for when the terminal is resized. The embedder should use
     /// this to resize the external source (e.g., SSH PTY window change).
     /// If null, resizes are not reported to the embedder.
+    ///
+    /// Thread safety: invoked on the IO thread. If the embedder needs
+    /// to dispatch to a different thread (e.g., main thread for UIKit),
+    /// it must handle that internally.
     resize_callback: ?*const fn (cols: u16, rows: u16, width_px: u32, height_px: u32, userdata: ?*anyopaque) void = null,
     resize_userdata: ?*anyopaque = null,
 };
@@ -170,6 +178,16 @@ pub fn resize(
 
 /// Queue a write to the external source.
 /// This is called when the terminal wants to send data (user input).
+///
+/// When `linefeed` is true (LNM mode 20), each carriage return (`\r`)
+/// in the data is expanded to `\r\n`, matching the Exec backend
+/// behavior. This is necessary because in linefeed mode, the Enter
+/// key should produce CR+LF rather than just CR.
+///
+/// Thread safety: this function is called from the IO thread. The
+/// write callback is invoked synchronously on the same thread. If
+/// the embedder needs to dispatch to a different thread (e.g., main
+/// thread for UIKit), it must handle that internally.
 pub fn queueWrite(
     self: *External,
     alloc: Allocator,
@@ -182,11 +200,29 @@ pub fn queueWrite(
 
     // If we have a write callback, call it
     if (self.write_callback) |cb| {
-        cb(data, self.write_userdata);
+        if (!linefeed) {
+            // Fast path: no linefeed expansion needed.
+            cb(data, self.write_userdata);
+            return;
+        }
 
-        // If linefeed requested, also send CR
-        if (linefeed) {
-            cb(&[_]u8{'\r'}, self.write_userdata);
+        // Slow path: expand \r to \r\n (LNM mode). We need to scan
+        // for CR characters and send them as CRLF pairs.
+        var start: usize = 0;
+        for (data, 0..) |ch, i| {
+            if (ch == '\r') {
+                // Send everything up to and including the CR
+                if (i >= start) {
+                    cb(data[start .. i + 1], self.write_userdata);
+                }
+                // Send the LF
+                cb(&[_]u8{'\n'}, self.write_userdata);
+                start = i + 1;
+            }
+        }
+        // Send any remaining data after the last CR
+        if (start < data.len) {
+            cb(data[start..], self.write_userdata);
         }
     } else {
         log.debug("external write discarded (no callback): {} bytes", .{data.len});
@@ -375,4 +411,43 @@ test "External: write callback still works with resize callback" {
     // Test resize
     try ext.resize(.{ .columns = 160, .rows = 48 }, .{ .width = 1600, .height = 900 });
     try testing.expectEqual(@as(u16, 160), S.resize_cols);
+}
+
+test "External: linefeed mode expands CR to CRLF" {
+    const S = struct {
+        var write_data: [256]u8 = undefined;
+        var write_len: usize = 0;
+
+        fn writeCallback(data: []const u8, userdata: ?*anyopaque) void {
+            _ = userdata;
+            @memcpy(write_data[write_len..][0..data.len], data);
+            write_len += data.len;
+        }
+    };
+
+    S.write_len = 0;
+
+    var ext = try External.init(testing.allocator, .{
+        .write_callback = S.writeCallback,
+    });
+    defer ext.deinit();
+
+    // Without linefeed, CR should pass through unchanged
+    try ext.queueWrite(testing.allocator, undefined, "a\rb", false);
+    try testing.expectEqualStrings("a\rb", S.write_data[0..S.write_len]);
+
+    // With linefeed, CR should be expanded to CRLF
+    S.write_len = 0;
+    try ext.queueWrite(testing.allocator, undefined, "a\rb", true);
+    try testing.expectEqualStrings("a\r\nb", S.write_data[0..S.write_len]);
+
+    // Multiple CRs
+    S.write_len = 0;
+    try ext.queueWrite(testing.allocator, undefined, "\r\r", true);
+    try testing.expectEqualStrings("\r\n\r\n", S.write_data[0..S.write_len]);
+
+    // No CRs — should pass through unchanged even in linefeed mode
+    S.write_len = 0;
+    try ext.queueWrite(testing.allocator, undefined, "hello", true);
+    try testing.expectEqualStrings("hello", S.write_data[0..S.write_len]);
 }
