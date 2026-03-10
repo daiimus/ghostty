@@ -251,14 +251,6 @@ pub const StreamHandler = struct {
         }
     }
 
-    /// Callback passed to the viewer's output_cb so it can notify
-    /// observer renderers after processing %output without knowing
-    /// about the observer system itself.
-    fn viewerOutputCallback(ud: ?*anyopaque, pane_id: usize) void {
-        const self: *StreamHandler = @ptrCast(@alignCast(ud.?));
-        self.wakeTmuxObservers(pane_id);
-    }
-
     /// This queues a render operation with the renderer thread. The render
     /// isn't guaranteed to happen immediately but it will happen as soon as
     /// practical.
@@ -551,8 +543,6 @@ pub const StreamHandler = struct {
                         errdefer self.alloc.destroy(viewer);
                         viewer.* = try .init(self.alloc);
                         errdefer viewer.deinit();
-                        viewer.output_cb = viewerOutputCallback;
-                        viewer.output_ud = @ptrCast(self);
                         self.tmux_viewer = viewer;
                         break :tmux;
                     },
@@ -640,13 +630,13 @@ pub const StreamHandler = struct {
                 for (viewer.next(.{ .tmux = tmux })) |action| {
                     log.info("tmux viewer action={f}", .{action});
                     switch (action) {
-                        .exit => {
-                            // Notify the surface that tmux control mode has exited.
-                            // This path is for viewer-internal exits (e.g., OOM
-                            // causing defunct()), not for %exit from tmux.
-                            // The exit reason (if any) is on the viewer field.
+                        .exit => |reason| {
+                            // Notify the surface that tmux control mode has
+                            // exited. The reason string comes directly from
+                            // the Action payload (e.g., "detached",
+                            // "server-exited", or "" for internal errors).
                             self.surfaceMessageWriter(.{
-                                .tmux_exit = apprt.surface.Message.TmuxExitReason.init(viewer.exit_reason),
+                                .tmux_exit = apprt.surface.Message.TmuxExitReason.init(reason),
                             });
                         },
 
@@ -728,72 +718,53 @@ pub const StreamHandler = struct {
 
                             self.surfaceMessageWriter(.{ .tmux_state_changed = state });
                         },
-                    }
-                }
 
-                // Handle fork-specific signals set by the viewer as fields
-                // rather than Action variants. These replace the former
-                // .ready, .command_response, and .send_keys actions.
+                        .ready => {
+                            // Viewer startup complete — user input is safe
+                            // to send.
+                            self.surfaceMessageWriter(.tmux_ready);
 
-                if (viewer.ready_just_fired) {
-                    viewer.ready_just_fired = false;
-
-                    // Viewer startup complete — user input is safe to send
-                    self.surfaceMessageWriter(.tmux_ready);
-
-                    // Send the current client size to tmux. All resize
-                    // events during startup fired before the viewer
-                    // existed, so tmux still has the stale 24x80 from
-                    // the previous session. We send a catch-up
-                    // refresh-client now that the viewer is ready.
-                    const grid = self.size.grid();
-                    var buf: [64]u8 = undefined;
-                    const refresh_cmd = std.fmt.bufPrint(&buf, "refresh-client -C {d}x{d}\n", .{
-                        grid.columns,
-                        grid.rows,
-                    }) catch unreachable;
-                    self.messageWriter(try termio.Message.writeReqDirect(
-                        self.alloc,
-                        refresh_cmd,
-                    ));
-                }
-
-                if (viewer.last_command_response) |resp| {
-                    viewer.last_command_response = null;
-
-                    // User command response — copy content through
-                    // the surface mailbox using WriteReq (handles
-                    // small inline or heap allocation).
-                    const data = try apprt.surface.Message.WriteReq.init(
-                        self.alloc,
-                        resp.content,
-                    );
-                    self.surfaceMessageWriter(.{
-                        .tmux_command_response = .{
-                            .data = data,
-                            .is_error = resp.is_error,
+                            // Send the current client size to tmux. All
+                            // resize events during startup fired before
+                            // the viewer existed, so tmux still has the
+                            // stale 24x80 from the previous session. We
+                            // send a catch-up refresh-client now that the
+                            // viewer is ready.
+                            const grid = self.size.grid();
+                            var buf: [64]u8 = undefined;
+                            const refresh_cmd = std.fmt.bufPrint(&buf, "refresh-client -C {d}x{d}\n", .{
+                                grid.columns,
+                                grid.rows,
+                            }) catch unreachable;
+                            self.messageWriter(try termio.Message.writeReqDirect(
+                                self.alloc,
+                                refresh_cmd,
+                            ));
                         },
-                    });
-                }
 
-                if (viewer.pause_continue_pane_id) |pane_id| {
-                    viewer.pause_continue_pane_id = null;
+                        .command_response => |resp| {
+                            // User command response — copy content through
+                            // the surface mailbox using WriteReq (handles
+                            // small inline or heap allocation).
+                            const data = try apprt.surface.Message.WriteReq.init(
+                                self.alloc,
+                                resp.content,
+                            );
+                            self.surfaceMessageWriter(.{
+                                .tmux_command_response = .{
+                                    .data = data,
+                                    .is_error = resp.is_error,
+                                },
+                            });
+                        },
 
-                    // Flow control: send `refresh-client -A '%N:continue'`
-                    // to resume the paused pane. This is fire-and-forget:
-                    // the %begin/%end response is consumed by the viewer's
-                    // pending_fire_and_forget counter.
-                    var buf: [64]u8 = undefined;
-                    const continue_cmd = std.fmt.bufPrint(
-                        &buf,
-                        "refresh-client -A '%{d}:continue'\n",
-                        .{pane_id},
-                    ) catch unreachable;
-                    self.messageWriter(try termio.Message.writeReqDirect(
-                        self.alloc,
-                        continue_cmd,
-                    ));
-                    viewer.trackFireAndForget();
+                        .output_processed => |pane_id| {
+                            // Output was processed for a pane — wake any
+                            // observer renderers bound to this pane so
+                            // they re-render.
+                            self.wakeTmuxObservers(pane_id);
+                        },
+                    }
                 }
 
                 // Handle fork-specific surface notifications directly from

@@ -209,39 +209,10 @@ pub const Viewer = struct {
     /// when the queue drains again (e.g., after layout changes).
     initial_ready_sent: bool,
 
-    /// Set to true by nextCommand() when the initial ready signal fires.
-    /// The caller (stream_handler) checks this after next() returns,
-    /// handles the notification, and clears it. This replaces the former
-    /// `.ready` Action variant.
-    ready_just_fired: bool = false,
-
-    /// Set by receivedCommandOutput() when a user command response arrives.
-    /// The caller (stream_handler) checks this after next() returns,
-    /// handles the notification, and clears it. This replaces the former
-    /// `.command_response` Action variant. The content slice points into
-    /// the parser's buffer and is valid until the next call to `next()`.
-    last_command_response: ?CommandResponse = null,
-
-    /// Set by the `.pause` notification handler when a pane needs a
-    /// `refresh-client -A continue` command sent. The caller
-    /// (stream_handler) checks this after next() returns, formats and
-    /// sends the continue command, calls trackFireAndForget(), and
-    /// clears this field. This replaces the former `.send_keys` emission
-    /// from the pause handler.
-    pause_continue_pane_id: ?usize = null,
-
-    /// Set by the `.exit` notification handlers when tmux provides a
-    /// human-readable reason string (e.g., "detached", "server-exited").
-    /// The caller (stream_handler) checks this after next() returns an
-    /// `.exit` action. Points into the control parser's buffer and is
-    /// valid until the next call to `next()`. Empty string if no reason
-    /// was provided or exit was due to internal error (defunct).
-    exit_reason: []const u8 = "",
-
     /// The currently active pane ID for user input routing. This is set
-    /// by the apprt (e.g., when a user focuses a pane in the GUI) and
-    /// is used by `sendKeys` to target `send-keys` commands. When null,
-    /// no pane is active and `sendKeys` will return null.
+    /// via `Input.set_active_pane` and is used by `Input.send_keys` to
+    /// target `send-keys` commands. When null, no pane is active and
+    /// `send_keys` will return no actions.
     active_pane_id: ?usize,
 
     /// Count of fire-and-forget commands (e.g., send-keys, flow control
@@ -250,15 +221,6 @@ pub const Viewer = struct {
     /// is decremented to absorb the expected response instead of logging
     /// "unexpected block output."
     pending_fire_and_forget: usize,
-
-    /// Optional callback invoked after receivedOutput() processes %output
-    /// data for a pane. The callback receives the pane ID that was updated.
-    /// This allows the caller (e.g., stream_handler) to wake observer
-    /// renderers without the viewer needing to know about observers.
-    output_cb: ?OutputCallback = null,
-    output_ud: ?*anyopaque = null,
-
-    pub const OutputCallback = *const fn (ud: ?*anyopaque, pane_id: usize) void;
 
     pub const CommandQueue = CircBuf(Command, undefined);
     pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, Pane);
@@ -343,8 +305,10 @@ pub const Viewer = struct {
 
     pub const Action = union(enum) {
         /// Tmux has closed the control mode connection, we should end
-        /// our viewer session in some way.
-        exit,
+        /// our viewer session in some way. The payload is a human-readable
+        /// reason string (e.g., "detached", "server-exited"), or empty
+        /// if no reason was provided or exit was due to internal error.
+        exit: []const u8,
 
         /// Send a command to tmux, e.g. `list-windows`. The caller
         /// should not worry about parsing this or reading what command
@@ -358,6 +322,19 @@ pub const Viewer = struct {
         /// are guaranteed to be stable. Additionally, tmux (as of Dec 2025)
         /// never reuses window IDs within a server process lifetime.
         windows: []const Window,
+
+        /// The viewer has completed startup and is ready for user input.
+        /// Sent once when the command queue first drains after entering
+        /// the `command_queue` state.
+        ready,
+
+        /// Response from a user-initiated tmux command.
+        command_response: CommandResponse,
+
+        /// Output was processed for a pane. The payload is the pane ID
+        /// that was updated. The caller should wake any observer
+        /// renderers bound to this pane.
+        output_processed: usize,
 
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
@@ -396,6 +373,14 @@ pub const Viewer = struct {
     pub const Input = union(enum) {
         /// Data from tmux was received that needs to be processed.
         tmux: control.Notification,
+
+        /// Set the active pane for user input routing. The pane must
+        /// exist in the panes map, or be null to clear the active pane.
+        set_active_pane: ?usize,
+
+        /// Send user keystrokes to the active pane. The viewer formats
+        /// the `send-keys -H` command and returns it as an Action.command.
+        send_keys: []const u8,
     };
 
     pub const Window = struct {
@@ -522,88 +507,9 @@ pub const Viewer = struct {
         try actions.append(arena.allocator(), action);
     }
 
-    /// Set the active pane for user input routing. The pane_id must
-    /// refer to a pane that exists in our panes map, or be null to
-    /// clear the active pane. If the pane_id is not null and does not
-    /// exist, this is a no-op (the active pane remains unchanged).
-    pub fn setActivePaneId(self: *Viewer, pane_id: ?usize) void {
-        if (pane_id) |id| {
-            if (!self.panes.contains(id)) {
-                log.warn("setActivePaneId: pane %{} not found, ignoring", .{id});
-                return;
-            }
-        }
-        self.active_pane_id = pane_id;
-    }
-
-    /// Format a `send-keys -H` command for the given data bytes,
-    /// targeting the active pane. Returns a `send_keys` action whose
-    /// payload is the formatted command with trailing newline, or null
-    /// if there is no active pane or the data is empty.
-    ///
-    /// The returned slice is arena-allocated and valid until the next
-    /// call to `next()` (which resets the action arena).
-    pub fn sendKeys(self: *Viewer, data: []const u8) ?[]const u8 {
-        if (data.len == 0) return null;
-
-        const pane_id = self.active_pane_id orelse return null;
-
-        // Verify the pane still exists (it may have been removed).
-        if (!self.panes.contains(pane_id)) {
-            self.active_pane_id = null;
-            return null;
-        }
-
-        // Format: "send-keys -H -t %{id} {hex}...\n"
-        // Each byte becomes "XX " (3 chars), last byte "XX\n" (3 chars).
-        // Prefix: "send-keys -H -t %" + digits + " " = ~25 + digits chars.
-        var arena = self.action_arena.promote(self.alloc);
-        defer self.action_arena = arena.state;
-        const arena_alloc = arena.allocator();
-
-        // Calculate the pane ID digit count manually to size the buffer once.
-        // This is a hot path (every keystroke in tmux mode), so we compute
-        // the decimal width inline instead of using a formatting helper like
-        // std.fmt.allocPrint that would perform an extra pass and allocation.
-        var id_digits: usize = 1;
-        {
-            var n = pane_id;
-            while (n >= 10) : (n /= 10) {
-                id_digits += 1;
-            }
-        }
-
-        const prefix_len = "send-keys -H -t %".len + id_digits + " ".len;
-        const hex_len = data.len * 3; // "XX " per byte (last space becomes \n)
-        const total_len = prefix_len + hex_len;
-
-        const buf = arena_alloc.alloc(u8, total_len) catch {
-            log.warn("sendKeys: failed to allocate {} bytes for pane {}", .{ total_len, pane_id });
-            return null;
-        };
-
-        // Write prefix.
-        var pos: usize = 0;
-        const prefix = std.fmt.bufPrint(buf[0..prefix_len], "send-keys -H -t %{d} ", .{pane_id}) catch {
-            log.warn("sendKeys: failed to format prefix for pane {}", .{pane_id});
-            return null;
-        };
-        pos = prefix.len;
-
-        // Write hex bytes.
-        const hex_upper = "0123456789ABCDEF";
-        for (data, 0..) |byte, i| {
-            buf[pos] = hex_upper[byte >> 4];
-            buf[pos + 1] = hex_upper[byte & 0x0F];
-            if (i < data.len - 1) {
-                buf[pos + 2] = ' ';
-            } else {
-                buf[pos + 2] = '\n';
-            }
-            pos += 3;
-        }
-
-        return buf[0..pos];
+    /// Get the active pane ID for user input routing. Read-only accessor.
+    pub fn getActivePaneId(self: *const Viewer) ?usize {
+        return self.active_pane_id;
     }
 
     /// Queue a user command to be sent through the tmux command queue.
@@ -646,13 +552,6 @@ pub const Viewer = struct {
         return null;
     }
 
-    /// Increment the fire-and-forget counter. Call this after dispatching
-    /// a fire-and-forget action (send_keys, flow control continue) that
-    /// will produce a %begin/%end response outside the command queue.
-    pub fn trackFireAndForget(self: *Viewer) void {
-        self.pending_fire_and_forget +|= 1;
-    }
-
     /// Send in an input event (such as a tmux protocol notification,
     /// keyboard input for a pane, etc.) and process it. The returned
     /// list is a set of actions to take as a result of the input prior
@@ -662,8 +561,91 @@ pub const Viewer = struct {
         // an error occurs we must go into a defunct state or some other
         // state to gracefully handle it.
         return switch (input) {
-            .tmux => self.nextTmux(input.tmux),
+            .tmux => |n| self.nextTmux(n),
+            .set_active_pane => |pane_id| self.nextSetActivePane(pane_id),
+            .send_keys => |data| self.nextSendKeys(data),
         };
+    }
+
+    /// Handle set_active_pane Input: validate and set the active pane.
+    /// This is an imperative operation — no arena reset, no command processing.
+    fn nextSetActivePane(self: *Viewer, pane_id: ?usize) []const Action {
+        if (pane_id) |id| {
+            if (!self.panes.contains(id)) {
+                log.warn("set_active_pane: pane %{} not found, ignoring", .{id});
+                return &.{};
+            }
+        }
+        self.active_pane_id = pane_id;
+        return &.{};
+    }
+
+    /// Handle send_keys Input: format a `send-keys -H` command targeting
+    /// the active pane and return it as an Action.command. This is an
+    /// imperative operation — no arena reset, no command queue interaction.
+    /// The formatted command is fire-and-forget (increments pending_fire_and_forget).
+    fn nextSendKeys(self: *Viewer, data: []const u8) []const Action {
+        if (data.len == 0) return &.{};
+
+        const pane_id = self.active_pane_id orelse return &.{};
+
+        // Verify the pane still exists (it may have been removed).
+        if (!self.panes.contains(pane_id)) {
+            self.active_pane_id = null;
+            return &.{};
+        }
+
+        // Format: "send-keys -H -t %{id} {hex}...\n"
+        // Each byte becomes "XX " (3 chars), last byte "XX\n" (3 chars).
+        // Prefix: "send-keys -H -t %" + digits + " " = ~25 + digits chars.
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        const arena_alloc = arena.allocator();
+
+        // Calculate the pane ID digit count manually to size the buffer once.
+        // This is a hot path (every keystroke in tmux mode), so we compute
+        // the decimal width inline instead of using a formatting helper like
+        // std.fmt.allocPrint that would perform an extra pass and allocation.
+        var id_digits: usize = 1;
+        {
+            var n = pane_id;
+            while (n >= 10) : (n /= 10) {
+                id_digits += 1;
+            }
+        }
+
+        const prefix_len = "send-keys -H -t %".len + id_digits + " ".len;
+        const hex_len = data.len * 3; // "XX " per byte (last space becomes \n)
+        const total_len = prefix_len + hex_len;
+
+        const buf = arena_alloc.alloc(u8, total_len) catch {
+            log.warn("send_keys: failed to allocate {} bytes for pane {}", .{ total_len, pane_id });
+            return &.{};
+        };
+
+        // Write prefix.
+        var pos: usize = 0;
+        const prefix = std.fmt.bufPrint(buf[0..prefix_len], "send-keys -H -t %{d} ", .{pane_id}) catch {
+            log.warn("send_keys: failed to format prefix for pane {}", .{pane_id});
+            return &.{};
+        };
+        pos = prefix.len;
+
+        // Write hex bytes.
+        const hex_upper = "0123456789ABCDEF";
+        for (data, 0..) |byte, i| {
+            buf[pos] = hex_upper[byte >> 4];
+            buf[pos + 1] = hex_upper[byte & 0x0F];
+            if (i < data.len - 1) {
+                buf[pos + 2] = ' ';
+            } else {
+                buf[pos + 2] = '\n';
+            }
+            pos += 3;
+        }
+
+        self.pending_fire_and_forget +|= 1;
+        return self.singleAction(.{ .command = buf[0..pos] });
     }
 
     fn nextTmux(
@@ -697,8 +679,7 @@ pub const Viewer = struct {
             // tmux source code), but if we see an exit we can semantically
             // handle this without issue.
             .exit => |info| {
-                self.exit_reason = info.reason;
-                return self.defunct();
+                return self.defunct(info.reason);
             },
 
             // Any begin and end (even error) is fine! Now we wait for
@@ -728,8 +709,7 @@ pub const Viewer = struct {
             .enter => unreachable,
 
             .exit => |info| {
-                self.exit_reason = info.reason;
-                return self.defunct();
+                return self.defunct(info.reason);
             },
 
             .session_changed => |info| {
@@ -744,7 +724,7 @@ pub const Viewer = struct {
                     &.{ .tmux_version, .enable_flow_control, .register_subscriptions, .list_windows },
                 ) catch {
                     log.warn("failed to queue command, becoming defunct", .{});
-                    return self.defunct();
+                    return self.defunct("");
                 };
             },
 
@@ -780,8 +760,7 @@ pub const Viewer = struct {
         switch (n) {
             .enter => unreachable,
             .exit => |info| {
-                self.exit_reason = info.reason;
-                return self.defunct();
+                return self.defunct(info.reason);
             },
 
             inline .block_end,
@@ -793,7 +772,7 @@ pub const Viewer = struct {
                     tag == .block_err,
                 ) catch {
                     log.warn("failed to process command output, becoming defunct", .{});
-                    return self.defunct();
+                    return self.defunct("");
                 };
 
                 // Command is consumed since a block end/err is the output
@@ -801,14 +780,20 @@ pub const Viewer = struct {
                 command_consumed = true;
             },
 
-            .output => |out| self.receivedOutput(
-                out.pane_id,
-                out.data,
-            ) catch |err| {
-                log.warn(
-                    "failed to process output for pane id={}: {}",
-                    .{ out.pane_id, err },
-                );
+            .output => |out| {
+                if (self.receivedOutput(
+                    out.pane_id,
+                    out.data,
+                )) |maybe_pane_id| {
+                    if (maybe_pane_id) |pane_id| {
+                        self.appendAction(&actions, .{ .output_processed = pane_id }) catch {};
+                    }
+                } else |err| {
+                    log.warn(
+                        "failed to process output for pane id={}: {}",
+                        .{ out.pane_id, err },
+                    );
+                }
             },
 
             // Session changed means we switched to a different tmux session.
@@ -820,7 +805,7 @@ pub const Viewer = struct {
                     info.id,
                 ) catch {
                     log.warn("failed to handle session change, becoming defunct", .{});
-                    return self.defunct();
+                    return self.defunct("");
                 };
 
                 // Command is consumed because sessionChanged resets
@@ -838,13 +823,13 @@ pub const Viewer = struct {
                 // here with a fallback to remove this one window, list
                 // windows again, and try again.
                 log.warn("failed to handle layout change, becoming defunct", .{});
-                return self.defunct();
+                return self.defunct("");
             },
 
             // A window was added to this session.
             .window_add => |info| self.windowAdd(info.id) catch {
                 log.warn("failed to handle window add, becoming defunct", .{});
-                return self.defunct();
+                return self.defunct("");
             },
 
             // The active pane changed. Track it in the metadata map
@@ -868,7 +853,7 @@ pub const Viewer = struct {
                     info.name,
                 ) catch {
                     log.warn("failed to handle window rename, becoming defunct", .{});
-                    return self.defunct();
+                    return self.defunct("");
                 };
             },
 
@@ -879,7 +864,7 @@ pub const Viewer = struct {
                     info.id,
                 ) catch {
                     log.warn("failed to handle window close, becoming defunct", .{});
-                    return self.defunct();
+                    return self.defunct("");
                 };
             },
 
@@ -919,11 +904,28 @@ pub const Viewer = struct {
                     entry.value_ptr.paused = true;
                     log.info("pane {} paused by tmux flow control, sending continue", .{info.pane_id});
 
-                    // Signal the caller (stream_handler) to send a
-                    // `refresh-client -A '%N:continue'` command for this
-                    // pane. The caller formats and sends it directly,
-                    // then calls trackFireAndForget().
-                    self.pause_continue_pane_id = info.pane_id;
+                    // Format the continue command and emit it as an
+                    // Action.command. This is fire-and-forget.
+                    var arena = self.action_arena.promote(self.alloc);
+                    defer self.action_arena = arena.state;
+                    const arena_alloc = arena.allocator();
+
+                    var builder: std.Io.Writer.Allocating = .init(arena_alloc);
+                    builder.writer.print(
+                        "refresh-client -A '%{d}:continue'\n",
+                        .{info.pane_id},
+                    ) catch {
+                        log.warn("failed to format pause continue command", .{});
+                        return self.defunct("");
+                    };
+                    actions.append(
+                        arena_alloc,
+                        .{ .command = builder.writer.buffered() },
+                    ) catch {
+                        log.warn("failed to append pause continue command", .{});
+                        return self.defunct("");
+                    };
+                    self.pending_fire_and_forget +|= 1;
                 } else {
                     log.warn("received %pause for unknown pane {}", .{info.pane_id});
                 }
@@ -950,15 +952,19 @@ pub const Viewer = struct {
                         .{ out.pane_id, out.age_ms },
                     );
                 }
-                self.receivedOutput(
+                if (self.receivedOutput(
                     out.pane_id,
                     out.data,
-                ) catch |err| {
+                )) |maybe_pane_id| {
+                    if (maybe_pane_id) |pane_id| {
+                        self.appendAction(&actions, .{ .output_processed = pane_id }) catch {};
+                    }
+                } else |err| {
                     log.warn(
                         "failed to process extended output for pane id={}: {}",
                         .{ out.pane_id, err },
                     );
-                };
+                }
             },
 
             // Format subscription changed — forwarded by stream_handler directly.
@@ -1014,18 +1020,24 @@ pub const Viewer = struct {
 
                 var builder: std.Io.Writer.Allocating = .init(arena_alloc);
                 next_command.formatCommand(&builder.writer) catch
-                    return self.defunct();
+                    return self.defunct("");
                 actions.append(
                     arena_alloc,
                     .{ .command = builder.writer.buffered() },
-                ) catch return self.defunct();
+                ) catch return self.defunct("");
             } else if (!self.initial_ready_sent) {
                 // The command queue has drained for the first time after
                 // startup. Signal that the viewer is ready — user input
                 // is now safe to send without interleaving with viewer
                 // commands.
                 self.initial_ready_sent = true;
-                self.ready_just_fired = true;
+
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(
+                    arena.allocator(),
+                    .ready,
+                ) catch return self.defunct("");
             }
         }
 
@@ -1374,10 +1386,12 @@ pub const Viewer = struct {
 
         switch (command) {
             .user => {
-                self.last_command_response = .{
-                    .content = content,
-                    .is_error = is_err,
-                };
+                try actions.append(arena_alloc, .{
+                    .command_response = .{
+                        .content = content,
+                        .is_error = is_err,
+                    },
+                });
             },
 
             .pane_state => try self.receivedPaneState(content),
@@ -1783,10 +1797,10 @@ pub const Viewer = struct {
         self: *Viewer,
         id: usize,
         raw_data: []const u8,
-    ) !void {
+    ) !?usize {
         const entry = self.panes.getEntry(id) orelse {
             log.info("received output for untracked pane id={}", .{id});
-            return;
+            return null;
         };
         const pane: *Pane = entry.value_ptr;
         const t: *Terminal = &pane.terminal;
@@ -1863,10 +1877,7 @@ pub const Viewer = struct {
         // (pane ID, whether it's extended output, etc.).
         try stream.nextSlice(data);
 
-        // Notify the caller (e.g., stream_handler) that output was
-        // processed for this pane, so it can wake observer renderers
-        // or perform other post-output actions.
-        if (self.output_cb) |cb| cb(self.output_ud, id);
+        return id;
     }
 
     fn initLayout(
@@ -1999,9 +2010,9 @@ pub const Viewer = struct {
         return &self.action_single;
     }
 
-    fn defunct(self: *Viewer) []const Action {
+    fn defunct(self: *Viewer, reason: []const u8) []const Action {
         self.state = .defunct;
-        return self.singleAction(.exit);
+        return self.singleAction(.{ .exit = reason });
     }
 
     /// Request a graceful detach from the tmux session. This sends
@@ -2271,11 +2282,6 @@ const TestStep = struct {
     input: Viewer.Input,
     contains_tags: []const std.meta.Tag(Viewer.Action) = &.{},
     contains_command: []const u8 = "",
-    /// Expect the viewer's ready_just_fired flag to be set after this step.
-    expect_ready: bool = false,
-    /// Expect the viewer's pause_continue_pane_id to be set to this pane
-    /// after this step.
-    expect_pause_continue_pane: ?usize = null,
     check: ?*const fn (viewer: *Viewer, []const Viewer.Action) anyerror!void = null,
     check_command: ?*const fn (viewer: *Viewer, []const u8) anyerror!void = null,
 
@@ -2311,17 +2317,6 @@ const TestStep = struct {
                 }
             }
             try testing.expect(found);
-        }
-
-        // Check field-based signals (replacements for former Action variants).
-        if (self.expect_ready) {
-            try testing.expect(viewer.ready_just_fired);
-            viewer.ready_just_fired = false;
-        }
-
-        if (self.expect_pause_continue_pane) |expected_pane| {
-            try testing.expectEqual(expected_pane, viewer.pause_continue_pane_id.?);
-            viewer.pause_continue_pane_id = null;
         }
 
         if (self.check) |check_fn| {
@@ -2387,8 +2382,14 @@ test "exit propagates reason" {
             .input = .{ .tmux = .{ .exit = .{ .reason = "detached" } } },
             .contains_tags = &.{.exit},
             .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqualStrings("detached", v.exit_reason);
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| {
+                        if (action == .exit) {
+                            try testing.expectEqualStrings("detached", action.exit);
+                            return;
+                        }
+                    }
+                    return error.TestUnexpectedResult;
                 }
             }).check,
         },
@@ -2404,8 +2405,14 @@ test "exit with server-exited reason" {
             .input = .{ .tmux = .{ .exit = .{ .reason = "server-exited" } } },
             .contains_tags = &.{.exit},
             .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqualStrings("server-exited", v.exit_reason);
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| {
+                        if (action == .exit) {
+                            try testing.expectEqualStrings("server-exited", action.exit);
+                            return;
+                        }
+                    }
+                    return error.TestUnexpectedResult;
                 }
             }).check,
         },
@@ -3265,7 +3272,7 @@ test "two pane flow with pane state" {
     });
 }
 
-test "setActivePaneId valid pane" {
+test "set_active_pane valid pane" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
 
@@ -3275,11 +3282,11 @@ test "setActivePaneId valid pane" {
     try viewer.panes.put(testing.allocator, 5, .{ .terminal = t });
 
     try testing.expectEqual(null, viewer.active_pane_id);
-    viewer.setActivePaneId(5);
+    _ = viewer.next(.{ .set_active_pane = 5 });
     try testing.expectEqual(5, viewer.active_pane_id);
 }
 
-test "setActivePaneId invalid pane is no-op" {
+test "set_active_pane invalid pane is no-op" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
 
@@ -3288,15 +3295,15 @@ test "setActivePaneId invalid pane is no-op" {
     errdefer t.deinit(testing.allocator);
     try viewer.panes.put(testing.allocator, 5, .{ .terminal = t });
 
-    viewer.setActivePaneId(5);
+    _ = viewer.next(.{ .set_active_pane = 5 });
     try testing.expectEqual(5, viewer.active_pane_id);
 
     // Setting to an invalid pane should not change active_pane_id.
-    viewer.setActivePaneId(99);
+    _ = viewer.next(.{ .set_active_pane = 99 });
     try testing.expectEqual(5, viewer.active_pane_id);
 }
 
-test "setActivePaneId null clears" {
+test "set_active_pane null clears" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
 
@@ -3304,14 +3311,22 @@ test "setActivePaneId null clears" {
     errdefer t.deinit(testing.allocator);
     try viewer.panes.put(testing.allocator, 5, .{ .terminal = t });
 
-    viewer.setActivePaneId(5);
+    _ = viewer.next(.{ .set_active_pane = 5 });
     try testing.expectEqual(5, viewer.active_pane_id);
 
-    viewer.setActivePaneId(null);
+    _ = viewer.next(.{ .set_active_pane = null });
     try testing.expectEqual(null, viewer.active_pane_id);
 }
 
-test "sendKeys basic formatting" {
+/// Extract the first .command payload from an actions slice, or null if none.
+fn testExtractCommand(actions: []const Viewer.Action) ?[]const u8 {
+    for (actions) |action| {
+        if (action == .command) return action.command;
+    }
+    return null;
+}
+
+test "send_keys basic formatting" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
 
@@ -3319,57 +3334,57 @@ test "sendKeys basic formatting" {
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
     try viewer.panes.put(testing.allocator, 2, .{ .terminal = t });
-    viewer.setActivePaneId(2);
+    _ = viewer.next(.{ .set_active_pane = 2 });
 
     // "ls\r" = 0x6C 0x73 0x0D
-    const result = viewer.sendKeys("ls\r");
+    const result = testExtractCommand(viewer.next(.{ .send_keys = "ls\r" }));
     try testing.expect(result != null);
     try testing.expectEqualStrings("send-keys -H -t %2 6C 73 0D\n", result.?);
 }
 
-test "sendKeys single byte" {
+test "send_keys single byte" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
 
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
     try viewer.panes.put(testing.allocator, 0, .{ .terminal = t });
-    viewer.setActivePaneId(0);
+    _ = viewer.next(.{ .set_active_pane = 0 });
 
     // Single byte: 'a' = 0x61
-    const result = viewer.sendKeys("a");
+    const result = testExtractCommand(viewer.next(.{ .send_keys = "a" }));
     try testing.expect(result != null);
     try testing.expectEqualStrings("send-keys -H -t %0 61\n", result.?);
 }
 
-test "sendKeys escape sequence" {
+test "send_keys escape sequence" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
 
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
     try viewer.panes.put(testing.allocator, 10, .{ .terminal = t });
-    viewer.setActivePaneId(10);
+    _ = viewer.next(.{ .set_active_pane = 10 });
 
     // ESC [ A (cursor up) = 0x1B 0x5B 0x41
-    const result = viewer.sendKeys("\x1B[A");
+    const result = testExtractCommand(viewer.next(.{ .send_keys = "\x1B[A" }));
     try testing.expect(result != null);
     try testing.expectEqualStrings("send-keys -H -t %10 1B 5B 41\n", result.?);
 }
 
-test "sendKeys empty data returns null" {
+test "send_keys empty data returns no actions" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
 
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
     try viewer.panes.put(testing.allocator, 0, .{ .terminal = t });
-    viewer.setActivePaneId(0);
+    _ = viewer.next(.{ .set_active_pane = 0 });
 
-    try testing.expectEqual(null, viewer.sendKeys(""));
+    try testing.expectEqual(@as(usize, 0), viewer.next(.{ .send_keys = "" }).len);
 }
 
-test "sendKeys no active pane returns null" {
+test "send_keys no active pane returns no actions" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
 
@@ -3378,17 +3393,17 @@ test "sendKeys no active pane returns null" {
     try viewer.panes.put(testing.allocator, 0, .{ .terminal = t });
 
     // active_pane_id is null by default.
-    try testing.expectEqual(null, viewer.sendKeys("hello"));
+    try testing.expectEqual(@as(usize, 0), viewer.next(.{ .send_keys = "hello" }).len);
 }
 
-test "sendKeys stale pane clears active and returns null" {
+test "send_keys stale pane clears active and returns no actions" {
     var viewer = try Viewer.init(testing.allocator);
     defer viewer.deinit();
 
     var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
     errdefer t.deinit(testing.allocator);
     try viewer.panes.put(testing.allocator, 3, .{ .terminal = t });
-    viewer.setActivePaneId(3);
+    _ = viewer.next(.{ .set_active_pane = 3 });
 
     // Remove the pane (simulating tmux pane removal).
     if (viewer.panes.fetchSwapRemove(3)) |entry_const| {
@@ -3396,16 +3411,16 @@ test "sendKeys stale pane clears active and returns null" {
         entry.value.deinit(testing.allocator);
     }
 
-    // sendKeys should detect the stale pane, clear active_pane_id, return null.
-    try testing.expectEqual(null, viewer.sendKeys("x"));
+    // send_keys should detect the stale pane, clear active_pane_id, return no actions.
+    try testing.expectEqual(@as(usize, 0), viewer.next(.{ .send_keys = "x" }).len);
     try testing.expectEqual(null, viewer.active_pane_id);
 }
 
-test "sendKeys after setActivePaneId round-trip" {
+test "send_keys after set_active_pane round-trip" {
     // Verify the exact sequence that the C API performs:
     // 1. Create viewer with panes (via processOutput/startup)
-    // 2. setActivePaneId (via ghostty_surface_tmux_set_active_pane)
-    // 3. sendKeys (via queueWrite on IO thread)
+    // 2. next(.set_active_pane) (via ghostty_surface_tmux_set_active_pane)
+    // 3. next(.send_keys) (via queueWrite on IO thread)
     // Both 2 and 3 should be protected by renderer_state.mutex
     // in production; this test verifies the logical correctness.
     var viewer = try Viewer.init(testing.allocator);
@@ -3420,29 +3435,29 @@ test "sendKeys after setActivePaneId round-trip" {
     errdefer t2.deinit(testing.allocator);
     try viewer.panes.put(testing.allocator, 5, .{ .terminal = t2 });
 
-    // Before activation, sendKeys returns null.
-    try testing.expectEqual(null, viewer.sendKeys("a"));
+    // Before activation, send_keys returns no actions.
+    try testing.expectEqual(@as(usize, 0), viewer.next(.{ .send_keys = "a" }).len);
 
     // Activate pane %5.
-    viewer.setActivePaneId(5);
+    _ = viewer.next(.{ .set_active_pane = 5 });
     try testing.expectEqual(@as(?usize, 5), viewer.active_pane_id);
 
-    // sendKeys should now format for pane %5.
-    const result = viewer.sendKeys("a");
+    // send_keys should now format for pane %5.
+    const result = testExtractCommand(viewer.next(.{ .send_keys = "a" }));
     try testing.expect(result != null);
     try testing.expectEqualStrings("send-keys -H -t %5 61\n", result.?);
 
     // Switch to pane %2.
-    viewer.setActivePaneId(2);
+    _ = viewer.next(.{ .set_active_pane = 2 });
     try testing.expectEqual(@as(?usize, 2), viewer.active_pane_id);
 
-    const result2 = viewer.sendKeys("b");
+    const result2 = testExtractCommand(viewer.next(.{ .send_keys = "b" }));
     try testing.expect(result2 != null);
     try testing.expectEqualStrings("send-keys -H -t %2 62\n", result2.?);
 
     // Set active to a non-existent pane — should be ignored.
-    viewer.setActivePaneId(99);
-    // active_pane_id should remain %2 (the setActivePaneId no-ops).
+    _ = viewer.next(.{ .set_active_pane = 99 });
+    // active_pane_id should remain %2 (the set_active_pane no-ops).
     try testing.expectEqual(@as(?usize, 2), viewer.active_pane_id);
 }
 
@@ -3496,7 +3511,7 @@ test "pane terminal pointer invalidated after layout change" {
     });
 
     // Set active pane to %0 and capture the terminal pointer.
-    viewer.setActivePaneId(0);
+    _ = viewer.next(.{ .set_active_pane = 0 });
     const old_pane_ptr = viewer.panes.getPtr(0).?;
     const old_terminal_ptr: *const Terminal = &old_pane_ptr.terminal;
 
@@ -5426,13 +5441,13 @@ test "flow control: pause sets pane paused and sends continue" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
         },
         // Now send %pause for pane 5
         .{
             .input = .{ .tmux = .{ .pause = .{ .pane_id = 5 } } },
-            // Should set pause_continue_pane_id for the caller to handle
-            .expect_pause_continue_pane = 5,
+            // Should emit a command to continue the paused pane
+            .contains_command = "refresh-client -A '%5:continue'",
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane = v.panes.getEntry(5).?.value_ptr;
@@ -5487,12 +5502,12 @@ test "flow control: continue clears pane paused state" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
         },
         // Pause pane 5
         .{
             .input = .{ .tmux = .{ .pause = .{ .pane_id = 5 } } },
-            .expect_pause_continue_pane = 5,
+            .contains_command = "refresh-client -A '%5:continue'",
         },
         // Continue pane 5
         .{
@@ -5551,7 +5566,7 @@ test "flow control: extended output feeds terminal" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
         },
         // Send extended output to pane 5
         .{
@@ -5622,16 +5637,18 @@ test "flow control: pause unknown pane is no-op" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
         },
         // Pause for non-existent pane 999 — should not crash
         .{
             .input = .{ .tmux = .{ .pause = .{ .pane_id = 999 } } },
             .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    // pause_continue_pane_id should NOT be set for unknown pane
-                    if (v.pause_continue_pane_id != null) {
-                        return error.UnexpectedPauseContinue;
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // No command should be emitted for an unknown pane
+                    for (actions) |action| {
+                        if (action == .command) {
+                            return error.UnexpectedPauseContinue;
+                        }
                     }
                 }
             }).check,
@@ -5695,7 +5712,7 @@ test "pane state: mouse_all_flag sets flags.mouse_event to any" {
                 \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;1;0;0;0;0;1;0;0;0;43;8,16,24,32,40,48,56,64,72,80
                 ,
             } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
@@ -5762,7 +5779,7 @@ test "pane state: mouse_button_flag sets flags.mouse_event to button" {
                 \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;1;0;0;1;0;0;0;0;43;8,16,24,32,40,48,56,64,72,80
                 ,
             } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
@@ -5823,7 +5840,7 @@ test "pane state: mouse_standard_flag sets flags.mouse_event to x10" {
                 \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;1;0;0;0;0;0;43;8,16,24,32,40,48,56,64,72,80
                 ,
             } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
@@ -5883,7 +5900,7 @@ test "pane state: no mouse flags leaves flags.mouse_event as none" {
                 \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;43;8,16,24,32,40,48,56,64,72,80
                 ,
             } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
@@ -5942,7 +5959,7 @@ test "pane state: mouse_all_flag takes precedence over lower mouse modes" {
                 \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;1;1;1;1;1;1;0;0;0;43;8,16,24,32,40,48,56,64,72,80
                 ,
             } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     const pane: *Viewer.Pane = v.panes.getEntry(5).?.value_ptr;
@@ -6002,7 +6019,7 @@ test "queueUserCommand returns command when queue is empty" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expect(v.command_queue.empty());
@@ -6134,7 +6151,7 @@ test "command_response emitted on user command block_end" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expect(v.command_queue.empty());
@@ -6148,13 +6165,17 @@ test "command_response emitted on user command block_end" {
         // Now simulate the response arriving as a block_end with content
         .{
             .input = .{ .tmux = .{ .block_end = "buffer content here" } },
+            .contains_tags = &.{.command_response},
             .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const resp = v.last_command_response orelse
-                        return error.MissingCommandResponse;
-                    try testing.expectEqualStrings("buffer content here", resp.content);
-                    try testing.expect(!resp.is_error);
-                    v.last_command_response = null;
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| {
+                        if (action == .command_response) {
+                            try testing.expectEqualStrings("buffer content here", action.command_response.content);
+                            try testing.expect(!action.command_response.is_error);
+                            return;
+                        }
+                    }
+                    return error.MissingCommandResponse;
                 }
             }).check,
         },
@@ -6209,7 +6230,7 @@ test "command_response with is_error on block_err" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expect(v.command_queue.empty());
@@ -6223,13 +6244,17 @@ test "command_response with is_error on block_err" {
         // Simulate error response from tmux
         .{
             .input = .{ .tmux = .{ .block_err = "no buffer nonexistent" } },
+            .contains_tags = &.{.command_response},
             .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const resp = v.last_command_response orelse
-                        return error.MissingCommandResponse;
-                    try testing.expectEqualStrings("no buffer nonexistent", resp.content);
-                    try testing.expect(resp.is_error);
-                    v.last_command_response = null;
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| {
+                        if (action == .command_response) {
+                            try testing.expectEqualStrings("no buffer nonexistent", action.command_response.content);
+                            try testing.expect(action.command_response.is_error);
+                            return;
+                        }
+                    }
+                    return error.MissingCommandResponse;
                 }
             }).check,
         },
@@ -6287,16 +6312,18 @@ test "fire-and-forget counter tracks send-keys responses" {
                 \\%5;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;43;8,16,24,32,40,48,56,64,72,80
                 ,
             } },
-            .expect_ready = true,
+            .contains_tags = &.{.ready},
         },
     });
 
     // Counter should start at 0.
     try testing.expectEqual(0, viewer.pending_fire_and_forget);
 
-    // Simulate two fire-and-forget actions being dispatched.
-    viewer.trackFireAndForget();
-    viewer.trackFireAndForget();
+    // Simulate two fire-and-forget actions by sending keys twice.
+    // nextSendKeys increments pending_fire_and_forget internally.
+    _ = viewer.next(.{ .set_active_pane = 5 });
+    _ = viewer.next(.{ .send_keys = "a" });
+    _ = viewer.next(.{ .send_keys = "b" });
     try testing.expectEqual(2, viewer.pending_fire_and_forget);
 
     // Now feed two block_end responses with empty queue. These should

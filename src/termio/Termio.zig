@@ -434,12 +434,12 @@ pub inline fn queueWrite(
     // commands, not forwarded to the pane's shell.
     //
     // The renderer_state mutex must be held while reading tmux_viewer,
-    // calling sendKeys, AND writing the result to the backend. The
-    // viewer is created/destroyed by processOutput on a different
+    // calling next(.send_keys), AND writing the result to the backend.
+    // The viewer is created/destroyed by processOutput on a different
     // thread (main thread for the External backend, read thread for
     // Exec). Without the lock, the IO thread could see a stale null
     // pointer or dereference a freed viewer (use-after-free). The
-    // lock must extend through backend.queueWrite because sendKeys
+    // lock must extend through backend.queueWrite because next()
     // returns a slice from the viewer's action_arena, which
     // processOutput can reset via viewer.next() on the other thread.
     if (comptime StreamHandler.tmux_enabled) {
@@ -448,29 +448,33 @@ pub inline fn queueWrite(
         if (viewer) |v| {
             defer self.renderer_state.mutex.unlock();
 
-            if (v.sendKeys(data)) |send_keys_cmd| {
-                try self.backend.queueWrite(
-                    self.alloc,
-                    td,
-                    send_keys_cmd,
-                    false,
-                );
-                // Increment after successful write so the counter
-                // stays consistent if queueWrite errors.
-                v.trackFireAndForget();
-            } else {
-                log.warn("tmux send-keys returned null for {} byte(s), input dropped", .{data.len});
+            for (v.next(.{ .send_keys = data })) |action| {
+                switch (action) {
+                    .command => |cmd| {
+                        try self.backend.queueWrite(
+                            self.alloc,
+                            td,
+                            cmd,
+                            false,
+                        );
+                    },
+                    else => {},
+                }
             }
             // Handle linefeed as a separate send-keys for CR.
             if (linefeed) {
-                if (v.sendKeys(&[_]u8{'\r'})) |send_keys_cmd| {
-                    try self.backend.queueWrite(
-                        self.alloc,
-                        td,
-                        send_keys_cmd,
-                        false,
-                    );
-                    v.trackFireAndForget();
+                for (v.next(.{ .send_keys = &[_]u8{'\r'} })) |action| {
+                    switch (action) {
+                        .command => |cmd| {
+                            try self.backend.queueWrite(
+                                self.alloc,
+                                td,
+                                cmd,
+                                false,
+                            );
+                        },
+                        else => {},
+                    }
                 }
             }
             return;

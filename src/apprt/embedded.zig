@@ -2060,7 +2060,7 @@ pub const CAPI = struct {
         const prev_terminal = surface.core_surface.renderer_state.terminal;
 
         // Set the active pane for user input routing (send-keys).
-        viewer.setActivePaneId(pane_id);
+        _ = viewer.next(.{ .set_active_pane = pane_id });
 
         // Swap the terminal pointer for rendering.
         surface.core_surface.renderer_state.terminal = &pane.terminal;
@@ -2090,12 +2090,12 @@ pub const CAPI = struct {
             // otherwise clear it.
             if (prev_pane_id) |pid| {
                 if (viewer.panes.getPtr(pid) != null) {
-                    viewer.setActivePaneId(prev_pane_id);
+                    _ = viewer.next(.{ .set_active_pane = prev_pane_id });
                 } else {
-                    viewer.setActivePaneId(null);
+                    _ = viewer.next(.{ .set_active_pane = null });
                 }
             } else {
-                viewer.setActivePaneId(null);
+                _ = viewer.next(.{ .set_active_pane = null });
             }
             log.warn("tmux observer registration failed for pane {}", .{pane_id});
             return false;
@@ -2130,7 +2130,7 @@ pub const CAPI = struct {
         if (!viewer.panes.contains(pane_id)) return false;
 
         // Only set the active pane for input routing — do NOT touch the renderer.
-        viewer.setActivePaneId(pane_id);
+        _ = viewer.next(.{ .set_active_pane = pane_id });
         return true;
     }
 
@@ -2149,7 +2149,7 @@ pub const CAPI = struct {
         // any observer for this surface's renderer pointer.
         if (comptime @TypeOf(handler.*).tmux_enabled) {
             if (handler.tmux_viewer) |viewer| {
-                viewer.setActivePaneId(null);
+                _ = viewer.next(.{ .set_active_pane = null });
             }
             handler.unregisterTmuxObserverByPtr(&surface.core_surface.renderer_state.terminal);
         }
