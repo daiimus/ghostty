@@ -229,6 +229,23 @@ pub fn queueWrite(
     }
 }
 
+/// Handle abnormal child exit. No-op for External backend since there is
+/// no child process.
+pub fn childExitedAbnormally(
+    self: *External,
+    gpa: Allocator,
+    t: *terminal.Terminal,
+    exit_code: u32,
+    runtime_ms: u64,
+) !void {
+    _ = self;
+    _ = gpa;
+    _ = t;
+    _ = exit_code;
+    _ = runtime_ms;
+    // External backend has no child process, so this is a no-op.
+}
+
 /// Thread data specific to the External backend.
 pub const ThreadData = struct {
     // External backend doesn't need thread-specific state currently,
