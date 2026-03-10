@@ -308,6 +308,12 @@ pub const Viewer = struct {
         /// our viewer session in some way. The payload is a human-readable
         /// reason string (e.g., "detached", "server-exited"), or empty
         /// if no reason was provided or exit was due to internal error.
+        ///
+        /// Upstream has `.exit` as void, but the tmux `%exit` notification
+        /// has always carried an optional reason string (see tmux(1),
+        /// "CONTROL MODE" section). Preserving the reason is protocol
+        /// correctness, not platform-specific — any client benefits from
+        /// knowing *why* tmux disconnected.
         exit: []const u8,
 
         /// Send a command to tmux, e.g. `list-windows`. The caller
@@ -395,15 +401,17 @@ pub const Viewer = struct {
         }
     };
 
-    /// Fork-only metadata for tmux windows that does not belong on the
-    /// Window struct (which should match upstream). Keyed by window ID.
+    /// Extended metadata for tmux windows (not yet upstream). Keyed by
+    /// window ID. These fields are useful for any tmux control mode client
+    /// that needs window names or focused-pane tracking — they are
+    /// platform-agnostic, not iOS-specific.
     pub const WindowMetadata = struct {
         /// The window name (e.g., "bash", "vim"). Owned by the Viewer's
         /// allocator (duped from tmux output). Empty string if unknown.
         name: []const u8 = "",
         /// The raw tmux layout string (e.g., "b7dd,83x44,0,0,0"). Owned by
-        /// the Viewer's allocator. This crosses the C API boundary so Swift
-        /// can parse it with its own layout parser. Empty string if unknown.
+        /// the Viewer's allocator. Useful for embedders that need to parse
+        /// tmux layouts independently. Empty string if unknown.
         raw_layout: []const u8 = "",
         /// The pane that tmux considers focused in this window.
         /// Set by `%window-pane-changed` notifications. `null` means
@@ -1165,7 +1173,7 @@ pub const Viewer = struct {
             return;
         }
 
-        // Clean up fork-only metadata for this window.
+        // Clean up extended metadata for this window.
         if (self.window_metadata.fetchRemove(window_id)) |kv| {
             var md = kv.value;
             md.deinit(self.alloc);
@@ -1512,7 +1520,7 @@ pub const Viewer = struct {
                 .layout = layout,
             });
 
-            // Store fork-only metadata separately, keyed by window ID.
+            // Store extended metadata separately, keyed by window ID.
             // If there's already an entry (from a prior list-windows),
             // update it rather than replacing (to preserve focused_pane_id).
             const md_result = try self.window_metadata.getOrPut(self.alloc, data.window_id);
@@ -3600,7 +3608,7 @@ test "window name and raw layout from list-windows" {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(1, v.windows.items.len);
                     const window = v.windows.items[0];
-                    _ = window; // Window struct no longer has fork-only fields
+                    _ = window; // Window struct no longer has extended metadata fields
                     const md = v.window_metadata.get(v.windows.items[0].id).?;
                     try testing.expectEqualStrings("vim", md.name);
                     try testing.expectEqualStrings("b7dd,83x44,0,0,0", md.raw_layout);
