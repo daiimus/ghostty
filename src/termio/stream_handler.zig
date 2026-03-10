@@ -829,6 +829,19 @@ pub const StreamHandler = struct {
                         });
                     },
 
+                    .subscription_changed => |info| {
+                        const value_data = try apprt.surface.Message.WriteReq.init(
+                            self.alloc,
+                            info.value,
+                        );
+                        self.surfaceMessageWriter(.{
+                            .tmux_subscription_changed = apprt.surface.Message.TmuxSubscriptionChanged.init(
+                                info.name,
+                                value_data,
+                            ),
+                        });
+                    },
+
                     else => {},
                 }
             },

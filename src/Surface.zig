@@ -1320,6 +1320,20 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 log.warn("apprt failed to notify tmux focused pane changed err={}", .{err});
             };
         },
+
+        .tmux_subscription_changed => |sub| {
+            const name = std.mem.sliceTo(&sub.name, 0);
+            const value = sub.value.slice();
+            log.info("tmux subscription changed: {s} len={}", .{ name, value.len });
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_subscription_changed,
+                .{ .name = name, .value = value },
+            ) catch |err| {
+                log.warn("apprt failed to notify tmux subscription changed err={}", .{err});
+            };
+            sub.deinit();
+        },
     }
 }
 

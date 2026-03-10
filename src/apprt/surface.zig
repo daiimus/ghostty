@@ -141,6 +141,11 @@ pub const Message = union(enum) {
         pane_id: usize,
     },
 
+    /// tmux control mode: a format subscription value changed.
+    /// Sent when a subscription registered via `refresh-client -B`
+    /// detects that the expanded format value has changed.
+    tmux_subscription_changed: TmuxSubscriptionChanged,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
@@ -187,6 +192,35 @@ pub const Message = union(enum) {
 
         pub fn reasonSlice(self: *const TmuxExitReason) []const u8 {
             return self.reason[0..self.reason_len];
+        }
+    };
+
+    /// tmux subscription change notification.
+    /// Carries the subscription name (fixed inline buffer) and value (WriteReq).
+    pub const TmuxSubscriptionChanged = struct {
+        /// The subscription name (e.g., "status_left", "status_right").
+        /// Inline buffer — subscription names are short identifiers.
+        name: [63:0]u8 = .{0} ** 63,
+        name_len: u8 = 0,
+
+        /// The new format expansion value. Copied via WriteReq for
+        /// mailbox safety.
+        value: WriteReq,
+
+        pub fn init(name_str: []const u8, value_data: WriteReq) TmuxSubscriptionChanged {
+            var result: TmuxSubscriptionChanged = .{ .value = value_data };
+            const len: u8 = @intCast(@min(name_str.len, result.name.len));
+            @memcpy(result.name[0..len], name_str[0..len]);
+            result.name_len = len;
+            return result;
+        }
+
+        pub fn nameSlice(self: *const TmuxSubscriptionChanged) []const u8 {
+            return self.name[0..self.name_len];
+        }
+
+        pub fn deinit(self: TmuxSubscriptionChanged) void {
+            self.value.deinit();
         }
     };
 

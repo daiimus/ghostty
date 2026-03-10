@@ -906,6 +906,15 @@ typedef struct {
   uint32_t pane_id;
 } ghostty_action_tmux_focused_pane_changed_s;
 
+// apprt.action.TmuxSubscriptionChanged
+// Pointer lifetime: name and value are valid only for the duration of the
+// action callback invocation. The consumer must copy if needed.
+typedef struct {
+  const char* name;
+  const char* value;
+  size_t value_len;
+} ghostty_action_tmux_subscription_changed_s;
+
 
 // terminal.Scrollbar
 typedef struct {
@@ -987,6 +996,7 @@ typedef enum {
   GHOSTTY_ACTION_TMUX_ACTIVE_WINDOW_CHANGED,
   GHOSTTY_ACTION_TMUX_SESSION_RENAMED,
   GHOSTTY_ACTION_TMUX_FOCUSED_PANE_CHANGED,
+  GHOSTTY_ACTION_TMUX_SUBSCRIPTION_CHANGED,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1033,6 +1043,7 @@ typedef union {
   ghostty_action_tmux_active_window_changed_s tmux_active_window_changed;
   ghostty_action_tmux_session_renamed_s tmux_session_renamed;
   ghostty_action_tmux_focused_pane_changed_s tmux_focused_pane_changed;
+  ghostty_action_tmux_subscription_changed_s tmux_subscription_changed;
 } ghostty_action_u;
 
 typedef struct {
