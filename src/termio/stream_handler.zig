@@ -443,8 +443,28 @@ pub const StreamHandler = struct {
                             ));
                         },
 
-                        .windows => {
-                            // TODO
+                        .windows => |windows| {
+                            // Log the window topology received from the viewer.
+                            // Slice 3 will use this to create/destroy apprt
+                            // surfaces for each pane. For now we store the
+                            // topology on the viewer (which already tracks
+                            // windows internally) and log it so the wiring
+                            // is exercised end-to-end.
+                            //
+                            // Upstream anchor: PR #9860 (viewer reconciliation
+                            // loop) emits .windows actions when list-windows
+                            // output is parsed. The viewer already maintains
+                            // the authoritative window list in viewer.windows;
+                            // this handler is where Ghostty would diff the
+                            // prior state and create/destroy surfaces.
+                            for (windows) |window| {
+                                log.debug("tmux window id={} size={}x{}", .{
+                                    window.id,
+                                    window.width,
+                                    window.height,
+                                });
+                                logPaneIds(window.layout);
+                            }
                         },
                     }
                 }
@@ -1547,5 +1567,114 @@ pub const StreamHandler = struct {
     /// Display a GUI progress report.
     fn progressReport(self: *StreamHandler, report: terminal.osc.Command.ProgressReport) void {
         self.surfaceMessageWriter(.{ .progress_report = report });
+    }
+
+    /// Log pane IDs from a tmux layout tree. Walks the tree recursively
+    /// to find all leaf panes so we can observe the topology in logs.
+    fn logPaneIds(layout: terminal.tmux.Layout) void {
+        switch (layout.content) {
+            .pane => |pane_id| {
+                log.debug("tmux pane id={} pos={}x{}+{}+{}", .{
+                    pane_id,
+                    layout.width,
+                    layout.height,
+                    layout.x,
+                    layout.y,
+                });
+            },
+            .horizontal => |children| {
+                for (children) |child| logPaneIds(child);
+            },
+            .vertical => |children| {
+                for (children) |child| logPaneIds(child);
+            },
+        }
+    }
+
+    test "logPaneIds walks single leaf pane" {
+        // Base case: a single pane with no children. Verifies
+        // the function handles leaf nodes without crashing.
+        const layout: terminal.tmux.Layout = .{
+            .width = 80,
+            .height = 24,
+            .x = 0,
+            .y = 0,
+            .content = .{ .pane = 1 },
+        };
+        logPaneIds(layout);
+    }
+
+    test "logPaneIds walks horizontal split" {
+        // Two panes in a horizontal split. Verifies recursion
+        // into .horizontal children.
+        const children = [_]terminal.tmux.Layout{
+            .{
+                .width = 40,
+                .height = 24,
+                .x = 0,
+                .y = 0,
+                .content = .{ .pane = 1 },
+            },
+            .{
+                .width = 40,
+                .height = 24,
+                .x = 40,
+                .y = 0,
+                .content = .{ .pane = 2 },
+            },
+        };
+        const layout: terminal.tmux.Layout = .{
+            .width = 80,
+            .height = 24,
+            .x = 0,
+            .y = 0,
+            .content = .{ .horizontal = &children },
+        };
+        logPaneIds(layout);
+    }
+
+    test "logPaneIds walks nested layout tree" {
+        // A horizontal split where the right child is a vertical
+        // split of two panes. Exercises deeper recursion.
+        const right_children = [_]terminal.tmux.Layout{
+            .{
+                .width = 40,
+                .height = 12,
+                .x = 40,
+                .y = 0,
+                .content = .{ .pane = 2 },
+            },
+            .{
+                .width = 40,
+                .height = 12,
+                .x = 40,
+                .y = 12,
+                .content = .{ .pane = 3 },
+            },
+        };
+        const children = [_]terminal.tmux.Layout{
+            .{
+                .width = 40,
+                .height = 24,
+                .x = 0,
+                .y = 0,
+                .content = .{ .pane = 1 },
+            },
+            .{
+                .width = 40,
+                .height = 24,
+                .x = 40,
+                .y = 0,
+                .content = .{ .vertical = &right_children },
+            },
+        };
+        const layout: terminal.tmux.Layout = .{
+            .width = 80,
+            .height = 24,
+            .x = 0,
+            .y = 0,
+            .content = .{ .horizontal = &children },
+        };
+        logPaneIds(layout);
     }
 };
