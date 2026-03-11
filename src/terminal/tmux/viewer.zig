@@ -178,6 +178,12 @@ pub const Viewer = struct {
     /// The windows in the current session.
     windows: std.ArrayList(Window),
 
+    /// Arena that owns all window and layout data. Layout trees (allocated
+    /// by `Layout.parseWithChecksum`) and the window structs' layout
+    /// pointers all live here. Reset-and-rebuild on every topology change
+    /// (`receivedListWindows`, `layoutChanged`, `sessionChanged`).
+    windows_arena: ArenaAllocator.State,
+
     /// The panes in the current session, mapped by pane ID.
     panes: PanesMap,
 
@@ -245,12 +251,7 @@ pub const Viewer = struct {
         id: usize,
         width: usize,
         height: usize,
-        layout_arena: ArenaAllocator.State,
         layout: Layout,
-
-        pub fn deinit(self: *Window, alloc: Allocator) void {
-            self.layout_arena.promote(alloc).deinit();
-        }
     };
 
     pub const Pane = struct {
@@ -280,6 +281,7 @@ pub const Viewer = struct {
             .tmux_version = "",
             .command_queue = command_queue,
             .windows = .empty,
+            .windows_arena = .{},
             .panes = .empty,
             .action_arena = .{},
             .action_single = undefined,
@@ -288,8 +290,8 @@ pub const Viewer = struct {
 
     pub fn deinit(self: *Viewer) void {
         {
-            for (self.windows.items) |*window| window.deinit(self.alloc);
             self.windows.deinit(self.alloc);
+            self.windows_arena.promote(self.alloc).deinit();
         }
         {
             var it = self.command_queue.iterator(.forward);
@@ -578,24 +580,43 @@ pub const Viewer = struct {
             return;
         };
 
-        // Clear our prior window arena and setup our layout
-        window.layout = layout: {
-            var arena = window.layout_arena.promote(self.alloc);
-            defer window.layout_arena = arena.state;
-            _ = arena.reset(.retain_capacity);
-            break :layout Layout.parseWithChecksum(
-                arena.allocator(),
-                layout_str,
-            ) catch |err| {
-                log.info(
-                    "failed to parse window layout id={} layout={s}",
-                    .{ window_id, layout_str },
-                );
-                return err;
-            };
-        };
+        // Reset the shared windows arena and rebuild all layouts. We must
+        // rebuild all windows because their layout data shares the arena.
+        // Window count is small so this is cheap.
+        var win_arena = self.windows_arena.promote(self.alloc);
+        defer self.windows_arena = win_arena.state;
+        _ = win_arena.reset(.retain_capacity);
+        const win_alloc = win_arena.allocator();
 
-        // Reset our arena so we can build up actions.
+        // Re-parse the changed window's layout from the new layout string
+        const new_layout: Layout = Layout.parseWithChecksum(
+            win_alloc,
+            layout_str,
+        ) catch |err| {
+            log.info(
+                "failed to parse window layout id={} layout={s}",
+                .{ window_id, layout_str },
+            );
+            return err;
+        };
+        window.layout = new_layout;
+
+        // Re-parse all other windows' layouts from their existing data.
+        // Since we reset the arena, the old layout tree pointers are
+        // invalid. We must re-parse from the canonical layout string
+        // stored in each window.
+        //
+        // NOTE: We don't currently store the raw layout string on Window.
+        // Instead, the layout tree itself IS the canonical representation.
+        // Since the arena was reset, we need to deep-copy the layout trees
+        // of unchanged windows onto the new arena. We can do this by
+        // walking the layout tree and cloning it.
+        for (self.windows.items) |*w| {
+            if (w.id == window_id) continue;
+            w.layout = try w.layout.clone(win_alloc);
+        }
+
+        // Reset our action arena so we can build up actions.
         var arena = self.action_arena.promote(self.alloc);
         defer self.action_arena = arena.state;
         const arena_alloc = arena.allocator();
@@ -693,7 +714,6 @@ pub const Viewer = struct {
         // Replace our window list if it changed. We assume it didn't
         // change if our pointer is pointing to the same data.
         if (windows.ptr != self.windows.items.ptr) {
-            for (self.windows.items) |*window| window.deinit(self.alloc);
             self.windows.clearRetainingCapacity();
             self.windows.appendSliceAssumeCapacity(windows);
         }
@@ -851,6 +871,14 @@ pub const Viewer = struct {
         // If there is an error, reset our actions to what it was before.
         errdefer actions.shrinkRetainingCapacity(actions.items.len);
 
+        // Reset the shared windows arena so all layout allocations start
+        // fresh. This is safe because every Window's layout data lives on
+        // this arena and we are about to rebuild all of them.
+        var win_arena = self.windows_arena.promote(self.alloc);
+        errdefer self.windows_arena = win_arena.state;
+        _ = win_arena.reset(.free_all);
+        const win_alloc = win_arena.allocator();
+
         // This stores our new window state from this list-windows output.
         var windows: std.ArrayList(Window) = .empty;
         defer windows.deinit(self.alloc);
@@ -869,12 +897,9 @@ pub const Viewer = struct {
                 return err;
             };
 
-            // Parse the layout
-            var arena: ArenaAllocator = .init(self.alloc);
-            errdefer arena.deinit();
-            const window_alloc = arena.allocator();
+            // Parse the layout onto the shared windows arena
             const layout: Layout = Layout.parseWithChecksum(
-                window_alloc,
+                win_alloc,
                 data.window_layout,
             ) catch |err| {
                 log.info(
@@ -888,10 +913,12 @@ pub const Viewer = struct {
                 .id = data.window_id,
                 .width = data.window_width,
                 .height = data.window_height,
-                .layout_arena = arena.state,
                 .layout = layout,
             });
         }
+
+        // Save arena state before we hand off to syncLayouts/actions
+        self.windows_arena = win_arena.state;
 
         // Setup our windows action so the caller can process GUI
         // window changes.
@@ -2272,6 +2299,83 @@ test "two pane flow with pane state" {
                         try testing.expect(!t.modes.get(.keypad_keys));
                         try testing.expect(!t.modes.get(.cursor_keys));
                     }
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "layout change preserves other windows on shared arena" {
+    // Validates that the shared windows_arena correctly preserves
+    // layout data for unchanged windows when layoutChanged rebuilds.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Two windows: @0 with pane 0, @1 with pane 1
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 80 24 b25d,80x24,0,0,0
+                \\$0 @1 80 24 b25e,80x24,0,0,1
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(2, v.windows.items.len);
+                    try testing.expectEqual(0, v.windows.items[0].id);
+                    try testing.expectEqual(1, v.windows.items[1].id);
+                    try testing.expectEqual(2, v.panes.count());
+                }
+            }).check,
+        },
+        // Complete all capture-pane commands for pane 0 and pane 1
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Now send a layout_change for window @0 that splits it
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = "e07b,83x44,0,0[83x22,0,0,0,83x21,0,23,2]",
+                .visible_layout = "e07b,83x44,0,0[83x22,0,0,0,83x21,0,23,2]",
+                .raw_flags = "*",
+            } } },
+            .contains_tags = &.{.windows},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Should still have 2 windows
+                    try testing.expectEqual(2, v.windows.items.len);
+                    // Window @0 should now have a vertical split
+                    try testing.expect(v.windows.items[0].layout.content == .vertical);
+                    // Window @1 should still be a single pane with id 1
+                    try testing.expectEqual(1, v.windows.items[1].layout.content.pane);
+                    // Pane count should now be 3 (0, 1, 2)
+                    try testing.expectEqual(3, v.panes.count());
                 }
             }).check,
         },

@@ -222,6 +222,28 @@ pub const Layout = struct {
             .content = content,
         };
     }
+
+    /// Deep-copy a layout tree onto a new allocator. All child slices
+    /// are duplicated so the returned tree is fully independent of the
+    /// original's backing memory.
+    pub fn clone(self: Layout, alloc: Allocator) Allocator.Error!Layout {
+        return .{
+            .width = self.width,
+            .height = self.height,
+            .x = self.x,
+            .y = self.y,
+            .content = switch (self.content) {
+                .pane => |id| .{ .pane = id },
+                inline .horizontal, .vertical => |children, tag| content: {
+                    const cloned = try alloc.alloc(Layout, children.len);
+                    for (children, 0..) |child, i| {
+                        cloned[i] = try child.clone(alloc);
+                    }
+                    break :content @unionInit(Content, @tagName(tag), cloned);
+                },
+            },
+        };
+    }
 };
 
 pub const Checksum = enum(u16) {
@@ -635,4 +657,51 @@ test "checksum known tmux layout bb62" {
     // The checksum "bb62" corresponds to the layout "159x48,0,0{79x48,0,0,79x48,80,0}"
     const checksum = Checksum.calculate("159x48,0,0{79x48,0,0,79x48,80,0}");
     try testing.expectEqualStrings("bb62", &checksum.asString());
+}
+
+test "clone preserves leaf" {
+    var src_arena: ArenaAllocator = .init(testing.allocator);
+    defer src_arena.deinit();
+    const original: Layout = try .parse(src_arena.allocator(), "80x24,0,0,42");
+
+    var dst_arena: ArenaAllocator = .init(testing.allocator);
+    defer dst_arena.deinit();
+    const cloned = try original.clone(dst_arena.allocator());
+
+    try testing.expectEqual(original.width, cloned.width);
+    try testing.expectEqual(original.height, cloned.height);
+    try testing.expectEqual(original.x, cloned.x);
+    try testing.expectEqual(original.y, cloned.y);
+    try testing.expectEqual(original.content.pane, cloned.content.pane);
+}
+
+test "clone deep copies split tree" {
+    var src_arena: ArenaAllocator = .init(testing.allocator);
+    defer src_arena.deinit();
+
+    // Nested layout: vertical split containing a horizontal split
+    const original: Layout = try .parse(
+        src_arena.allocator(),
+        "80x24,0,0[80x12,0,0{40x12,0,0,1,40x12,40,0,2},80x12,0,12,3]",
+    );
+
+    var dst_arena: ArenaAllocator = .init(testing.allocator);
+    defer dst_arena.deinit();
+    const cloned = try original.clone(dst_arena.allocator());
+
+    // Verify structure
+    const children = cloned.content.vertical;
+    try testing.expectEqual(2, children.len);
+
+    // First child is a horizontal split
+    const horiz = children[0].content.horizontal;
+    try testing.expectEqual(2, horiz.len);
+    try testing.expectEqual(1, horiz[0].content.pane);
+    try testing.expectEqual(2, horiz[1].content.pane);
+
+    // Second child is a leaf
+    try testing.expectEqual(3, children[1].content.pane);
+
+    // Verify cloned children are on a different allocation (not aliased)
+    try testing.expect(cloned.content.vertical.ptr != original.content.vertical.ptr);
 }
