@@ -2891,8 +2891,25 @@ const Action = struct {
 
                 .set_layout => |sl| {
                     log.debug("tmux reconcile: set_layout window={}", .{sl.tmux_window_id});
-                    // TODO: Rebuild split tree to match tmux layout shape.
-                    _ = sl.layout;
+
+                    const tab = window_map.get(sl.tmux_window_id) orelse {
+                        log.warn("tmux reconcile: set_layout for unknown window {}", .{sl.tmux_window_id});
+                        continue;
+                    };
+
+                    const split_tree = tab.getSplitTree();
+
+                    // Build a Surface.Tree from the tmux layout shape using
+                    // pane surfaces that were created by ensure_pane.
+                    var tree = buildSurfaceTree(alloc, sl.layout.*, pane_map) catch |err| {
+                        log.warn("tmux reconcile: failed to build surface tree: {}", .{err});
+                        continue;
+                    };
+                    defer tree.deinit();
+
+                    // Apply the new tree. setTree clones it internally and
+                    // triggers a deferred GTK widget rebuild.
+                    split_tree.setTree(&tree);
                 },
 
                 .set_focus => |sf| {
@@ -2910,6 +2927,157 @@ const Action = struct {
                 },
             }
         }
+    }
+
+    /// Build a `Surface.Tree` (datastruct.SplitTree(Surface)) from a tmux
+    /// layout tree. Converts N-ary tmux splits into right-nested binary
+    /// splits with ratios derived from the tmux geometry.
+    ///
+    /// The returned tree holds refs on the surfaces; the caller must
+    /// call `deinit()` to release them.
+    ///
+    /// Upstream anchor: follows SplitTree construction pattern from
+    /// `src/datastruct/split_tree.zig:init` and `split`.
+    fn buildSurfaceTree(
+        gpa: Allocator,
+        layout: terminal.tmux.Layout,
+        pane_map: *const std.AutoHashMapUnmanaged(usize, Window.TmuxPaneEntry),
+    ) Allocator.Error!Surface.Tree {
+        const node_count = countTreeNodes(layout);
+        if (node_count == 0) return Surface.Tree.empty;
+
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+
+        const nodes = try alloc.alloc(Surface.Tree.Node, node_count);
+
+        // Fill nodes starting at index 0 (root). fillNodes returns
+        // the next free index; it must consume exactly node_count.
+        const next = fillLayoutNode(layout, nodes, 0, pane_map) orelse
+            return Surface.Tree.empty;
+        assert(next == node_count);
+
+        // Ref all leaf surfaces. SplitTree owns refs and will unref
+        // on deinit.
+        for (nodes) |*node| {
+            switch (node.*) {
+                .leaf => |surface| {
+                    _ = surface.ref();
+                },
+                .split => {},
+            }
+        }
+
+        return .{
+            .arena = arena,
+            .nodes = nodes,
+            .zoomed = null,
+        };
+    }
+
+    /// Count the total number of SplitTree nodes needed to represent
+    /// a tmux Layout as a binary tree. Each leaf pane = 1 node. Each
+    /// N-ary split = (N-1) split nodes + sum of child subtrees.
+    fn countTreeNodes(layout: terminal.tmux.Layout) usize {
+        return switch (layout.content) {
+            .pane => 1,
+            .horizontal, .vertical => |children| countChildrenNodes(children),
+        };
+    }
+
+    fn countChildrenNodes(children: []const terminal.tmux.Layout) usize {
+        if (children.len == 0) return 0;
+        if (children.len == 1) return countTreeNodes(children[0]);
+
+        // One split node for this level, plus nodes for left child
+        // and nodes for the right subtree (remaining children).
+        return 1 + countTreeNodes(children[0]) + countChildrenNodes(children[1..]);
+    }
+
+    /// Recursively fill nodes array for a tmux Layout. Returns the
+    /// next free index, or null if a required pane surface is missing.
+    fn fillLayoutNode(
+        layout: terminal.tmux.Layout,
+        nodes: []Surface.Tree.Node,
+        idx: usize,
+        pane_map: *const std.AutoHashMapUnmanaged(usize, Window.TmuxPaneEntry),
+    ) ?usize {
+        return switch (layout.content) {
+            .pane => |pane_id| {
+                const entry = pane_map.get(pane_id) orelse {
+                    log.warn("tmux reconcile: set_layout references unknown pane {}", .{pane_id});
+                    return null;
+                };
+                nodes[idx] = .{ .leaf = entry.surface };
+                return idx + 1;
+            },
+            .horizontal => |children| fillChildrenNodes(.horizontal, children, nodes, idx, pane_map),
+            .vertical => |children| fillChildrenNodes(.vertical, children, nodes, idx, pane_map),
+        };
+    }
+
+    /// Fill nodes for an N-ary split, converting to right-nested
+    /// binary splits. The split ratio at each level is computed from
+    /// the tmux geometry (width for horizontal, height for vertical).
+    fn fillChildrenNodes(
+        direction: Surface.Tree.Split.Layout,
+        children: []const terminal.tmux.Layout,
+        nodes: []Surface.Tree.Node,
+        idx: usize,
+        pane_map: *const std.AutoHashMapUnmanaged(usize, Window.TmuxPaneEntry),
+    ) ?usize {
+        if (children.len == 0) return idx;
+        if (children.len == 1) return fillLayoutNode(children[0], nodes, idx, pane_map);
+
+        // Binary split: left = children[0], right = rest.
+        // Place split node at idx, left subtree at idx+1, right
+        // subtree immediately after left.
+        const left_start = idx + 1;
+        const right_start = fillLayoutNode(children[0], nodes, left_start, pane_map) orelse
+            return null;
+        const next = fillChildrenNodes(direction, children[1..], nodes, right_start, pane_map) orelse
+            return null;
+
+        // Compute ratio from tmux geometry. For horizontal splits,
+        // use width; for vertical, use height.
+        const ratio: f16 = computeSplitRatio(direction, children);
+
+        nodes[idx] = .{ .split = .{
+            .layout = direction,
+            .ratio = ratio,
+            .left = @enumFromInt(left_start),
+            .right = @enumFromInt(right_start),
+        } };
+
+        return next;
+    }
+
+    /// Compute the ratio of the first child relative to the total
+    /// dimension of all children in the slice. Returns 0.5 as a
+    /// fallback if the total is zero.
+    fn computeSplitRatio(
+        direction: Surface.Tree.Split.Layout,
+        children: []const terminal.tmux.Layout,
+    ) f16 {
+        if (children.len < 2) return 0.5;
+
+        var total: usize = 0;
+        for (children) |child| {
+            total += switch (direction) {
+                .horizontal => child.width,
+                .vertical => child.height,
+            };
+        }
+
+        if (total == 0) return 0.5;
+
+        const first_dim: usize = switch (direction) {
+            .horizontal => children[0].width,
+            .vertical => children[0].height,
+        };
+
+        return @floatCast(@as(f64, @floatFromInt(first_dim)) / @as(f64, @floatFromInt(total)));
     }
 };
 
