@@ -14,6 +14,7 @@ const configpkg = @import("../../../config.zig");
 const TitlebarStyle = configpkg.Config.GtkTitlebarStyle;
 const input = @import("../../../input.zig");
 const CoreSurface = @import("../../../Surface.zig");
+const termio = @import("../../../termio.zig");
 const ext = @import("../ext.zig");
 const gtk_version = @import("../gtk_version.zig");
 const adw_version = @import("../adw_version.zig");
@@ -215,6 +216,15 @@ pub const Window = extern struct {
         };
     };
 
+    /// Entry in the tmux pane-to-surface map, holding the GTK surface
+    /// and the heap-allocated relay writer that provides the ControlWriter
+    /// for the tmux backend. The relay writer must outlive the surface
+    /// because the ControlWriter holds a pointer to it.
+    pub const TmuxPaneEntry = struct {
+        surface: *Surface,
+        relay_writer: *termio.Tmux.SurfaceRelayWriter,
+    };
+
     const Private = struct {
         /// Whether this window is a quick terminal. If it is then it
         /// behaves slightly differently under certain scenarios.
@@ -265,9 +275,9 @@ pub const Window = extern struct {
         tmux_window_to_tab: std.AutoHashMapUnmanaged(usize, *Tab) = .{},
 
         /// Tmux reconcile state: maps tmux pane IDs to the GTK surface
-        /// created for each pane. Populated by ensure_pane, pruned by
+        /// and its relay writer. Populated by ensure_pane, pruned by
         /// prune_absent. Keyed by tmux pane ID (usize).
-        tmux_pane_to_surface: std.AutoHashMapUnmanaged(usize, *Surface) = .{},
+        tmux_pane_to_surface: std.AutoHashMapUnmanaged(usize, TmuxPaneEntry) = .{},
 
         // Template bindings
         tab_overview: *adw.TabOverview,
@@ -438,7 +448,7 @@ pub const Window = extern struct {
     /// Returns a mutable pointer to the tmux pane-to-surface map for
     /// reconcile operations. Callers must use Application.default().allocator()
     /// for any map mutations.
-    pub fn tmuxPaneMap(self: *Self) *std.AutoHashMapUnmanaged(usize, *Surface) {
+    pub fn tmuxPaneMap(self: *Self) *std.AutoHashMapUnmanaged(usize, TmuxPaneEntry) {
         return &self.private().tmux_pane_to_surface;
     }
 
@@ -1283,6 +1293,13 @@ pub const Window = extern struct {
         priv.tab_bindings.unref();
 
         const alloc = Application.default().allocator();
+
+        // Destroy heap-allocated relay writers for tmux pane entries.
+        var pane_iter = priv.tmux_pane_to_surface.iterator();
+        while (pane_iter.next()) |entry| {
+            alloc.destroy(entry.value_ptr.relay_writer);
+        }
+
         priv.tmux_window_to_tab.deinit(alloc);
         priv.tmux_pane_to_surface.deinit(alloc);
         priv.winproto.deinit(alloc);
