@@ -23,6 +23,7 @@ const xev = @import("../../../global.zig").xev;
 const Binding = @import("../../../input.zig").Binding;
 const CoreConfig = configpkg.Config;
 const CoreSurface = @import("../../../Surface.zig");
+const termio = @import("../../../termio.zig");
 const lib = @import("../../../lib/main.zig");
 
 const ext = @import("../ext.zig");
@@ -2831,10 +2832,20 @@ const Action = struct {
             .surface => |core| core.rt_surface.surface,
         };
 
+        const parent_core: *CoreSurface = switch (target) {
+            .app => unreachable,
+            .surface => |core| core,
+        };
+
         const window = ext.getAncestor(Window, surface.as(gtk.Widget)) orelse {
             log.warn("tmux_reconcile: surface has no ancestor window", .{});
             return;
         };
+
+        const app = Application.default();
+        const alloc = app.allocator();
+        const window_map = window.tmuxWindowMap();
+        const pane_map = window.tmuxPaneMap();
 
         for (payload.ops) |op| {
             switch (op) {
@@ -2844,15 +2855,64 @@ const Action = struct {
 
                 .ensure_window => |ew| {
                     log.debug("tmux reconcile: ensure_window id={}", .{ew.tmux_window_id});
-                    // TODO: Track tmux window->tab mapping and create/retain tabs.
-                    // For now, log and continue. Full tab creation requires
-                    // associating tmux window IDs with GTK tab pages.
+
+                    // If we already have a tab for this window, keep it.
+                    if (window_map.get(ew.tmux_window_id) != null) continue;
+
+                    // Create a new tab. The first pane surface will be
+                    // created by ensure_pane and placed via set_layout.
+                    // For now, the tab gets a default exec surface that
+                    // will be replaced when set_layout applies the tree.
+                    const page = window.newTabForWindow(parent_core, .{});
+                    const child = page.getChild();
+                    const tab = gobject.ext.cast(Tab, child) orelse {
+                        log.warn("tmux reconcile: new tab is not a Tab", .{});
+                        continue;
+                    };
+
+                    window_map.put(alloc, ew.tmux_window_id, tab) catch |err| {
+                        log.warn("tmux reconcile: failed to store window mapping: {}", .{err});
+                        continue;
+                    };
                 },
 
                 .ensure_pane => |ep| {
                     log.debug("tmux reconcile: ensure_pane window={} pane={}", .{ ep.tmux_window_id, ep.pane_id });
-                    // TODO: Create surfaces with tmux backend for each pane.
-                    // Requires ControlWriter reference to be available.
+
+                    // If we already have a surface for this pane, keep it.
+                    if (pane_map.get(ep.pane_id) != null) continue;
+
+                    // Heap-allocate a SurfaceRelayWriter so the ControlWriter's
+                    // context pointer remains stable for the surface's lifetime.
+                    const relay_writer = alloc.create(termio.Tmux.SurfaceRelayWriter) catch |err| {
+                        log.warn("tmux reconcile: failed to allocate relay writer: {}", .{err});
+                        continue;
+                    };
+                    relay_writer.* = .{
+                        .parent_mailbox = .{
+                            .surface = parent_core,
+                            .app = .{ .rt_app = app.rt(), .mailbox = &app.core().mailbox },
+                        },
+                        .alloc = alloc,
+                    };
+
+                    // Create the pane surface with a tmux backend. It will
+                    // be placed into the correct split position by set_layout.
+                    const pane_surface: *Surface = .new(.{
+                        .backend = .{ .tmux = .{
+                            .pane_id = ep.pane_id,
+                            .control_writer = relay_writer.controlWriter(),
+                        } },
+                    });
+
+                    pane_map.put(alloc, ep.pane_id, .{
+                        .surface = pane_surface,
+                        .relay_writer = relay_writer,
+                    }) catch |err| {
+                        log.warn("tmux reconcile: failed to store pane mapping: {}", .{err});
+                        alloc.destroy(relay_writer);
+                        continue;
+                    };
                 },
 
                 .set_layout => |sl| {
@@ -2876,8 +2936,6 @@ const Action = struct {
                 },
             }
         }
-
-        _ = window;
     }
 };
 
