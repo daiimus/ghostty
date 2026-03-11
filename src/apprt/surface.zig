@@ -118,6 +118,19 @@ pub const Message = union(enum) {
     /// through the surface mailbox; the app thread consumes and frees it.
     tmux_topology_changed: *TmuxTopologySnapshot,
 
+    /// A tmux child pane is relaying a command to its parent surface's
+    /// pty. The child's IO thread constructs this message targeting the
+    /// parent surface's mailbox. The parent surface's `handleMessage`
+    /// forwards the command bytes to its own termio mailbox via `queueIo`.
+    ///
+    /// This preserves the SPSC invariant: the parent's IO thread remains
+    /// the single consumer of its termio mailbox. The child never writes
+    /// directly to the parent's mailbox.
+    ///
+    /// Upstream anchor: follows the `clipboard_write` pattern where
+    /// `WriteReq` carries command bytes with small/alloc ownership.
+    tmux_write_command: WriteReq,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
