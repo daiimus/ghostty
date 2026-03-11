@@ -708,6 +708,7 @@ pub const Surface = extern struct {
         overrides: struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
+            backend: CoreSurface.BackendConfig = .exec,
 
             pub const none: @This() = .{};
         } = .none,
@@ -719,6 +720,7 @@ pub const Surface = extern struct {
         command: ?configpkg.Command = null,
         working_directory: ?[:0]const u8 = null,
         title: ?[:0]const u8 = null,
+        backend: CoreSurface.BackendConfig = .exec,
 
         pub const none: @This() = .{};
     }) *Self {
@@ -730,6 +732,7 @@ pub const Surface = extern struct {
         priv.overrides = .{
             .command = if (overrides.command) |c| c.clone(alloc) catch null else null,
             .working_directory = if (overrides.working_directory) |wd| alloc.dupeZ(u8, wd) catch null else null,
+            .backend = overrides.backend,
         };
         return self;
     }
@@ -3397,12 +3400,13 @@ pub const Surface = extern struct {
         }
 
         // Initialize the surface
-        surface.init(
+        surface.initWithOptions(
             alloc,
             &config,
             app.core(),
             app.rt(),
             &priv.rt_surface,
+            .{ .backend = priv.overrides.backend },
         ) catch |err| {
             log.warn("failed to initialize surface err={}", .{err});
             return error.SurfaceError;
