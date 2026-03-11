@@ -108,6 +108,29 @@ pub const Message = union(enum) {
     /// Selected search index change
     search_selected: ?usize,
 
+    /// The tmux viewer's window topology has changed. The snapshot is a
+    /// deep copy of the viewer's windows and layouts, allocated on its own
+    /// arena. The receiver (app thread) owns the snapshot and must call
+    /// deinit when done.
+    ///
+    /// Upstream anchor: follows the `change_config: *const Config` pattern
+    /// where the IO thread heap-allocates a payload and sends a pointer
+    /// through the surface mailbox; the app thread consumes and frees it.
+    tmux_topology_changed: *TmuxTopologySnapshot,
+
+    /// A tmux child pane is relaying a command to its parent surface's
+    /// pty. The child's IO thread constructs this message targeting the
+    /// parent surface's mailbox. The parent surface's `handleMessage`
+    /// forwards the command bytes to its own termio mailbox via `queueIo`.
+    ///
+    /// This preserves the SPSC invariant: the parent's IO thread remains
+    /// the single consumer of its termio mailbox. The child never writes
+    /// directly to the parent's mailbox.
+    ///
+    /// Upstream anchor: follows the `clipboard_write` pattern where
+    /// `WriteReq` carries command bytes with small/alloc ownership.
+    tmux_write_command: WriteReq,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
@@ -128,6 +151,66 @@ pub const Message = union(enum) {
 
             .none => void,
         };
+    };
+
+    /// A deep-copy snapshot of the tmux viewer's window topology. Owns
+    /// all memory through a dedicated arena so it is safe to pass across
+    /// thread boundaries via the surface mailbox.
+    ///
+    /// Follows the `change_config: *const Config` pattern: the IO thread
+    /// allocates the snapshot, sends a pointer through the mailbox, and
+    /// the app thread calls `deinit` after consuming it.
+    pub const TmuxTopologySnapshot = struct {
+        /// Backing allocator used to allocate this struct itself.
+        alloc: Allocator,
+
+        /// Arena that owns all cloned window/layout data.
+        arena: std.heap.ArenaAllocator,
+
+        /// Deep-copied window list. Layout trees are fully independent
+        /// of the viewer's backing memory.
+        windows: []const terminal.tmux.Viewer.Window,
+
+        /// Create a snapshot by deep-copying `windows`. Each window's
+        /// layout tree is cloned into a dedicated arena so the snapshot
+        /// is independent of the source memory.
+        pub fn initFromWindows(
+            alloc: Allocator,
+            windows: []const terminal.tmux.Viewer.Window,
+        ) Allocator.Error!*TmuxTopologySnapshot {
+            var arena: std.heap.ArenaAllocator = .init(alloc);
+            errdefer arena.deinit();
+            const arena_alloc = arena.allocator();
+
+            const cloned_windows = try arena_alloc.alloc(
+                terminal.tmux.Viewer.Window,
+                windows.len,
+            );
+            for (windows, 0..) |window, i| {
+                cloned_windows[i] = .{
+                    .id = window.id,
+                    .width = window.width,
+                    .height = window.height,
+                    .layout = try window.layout.clone(arena_alloc),
+                };
+            }
+
+            const self = try alloc.create(TmuxTopologySnapshot);
+            self.* = .{
+                .alloc = alloc,
+                .arena = arena,
+                .windows = cloned_windows,
+            };
+            return self;
+        }
+
+        /// Free all owned memory: the arena (windows + layouts) and the
+        /// struct itself.
+        pub fn deinit(self: *TmuxTopologySnapshot) void {
+            const alloc = self.alloc;
+            self.arena.deinit();
+            alloc.destroy(self);
+        }
     };
 };
 
@@ -194,4 +277,85 @@ pub fn newConfig(
     }
 
     return copy;
+}
+
+test "TmuxTopologySnapshot initFromWindows deep copies layouts" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const Layout = terminal.tmux.Layout;
+    const Window = terminal.tmux.Viewer.Window;
+
+    // Build source windows on a temporary arena to prove the snapshot
+    // is independent.
+    var source_arena: std.heap.ArenaAllocator = .init(alloc);
+    const source_alloc = source_arena.allocator();
+
+    // Build a 2-pane horizontal split layout on the source arena.
+    const children = try source_alloc.alloc(Layout, 2);
+    children[0] = .{ .width = 40, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 0 } };
+    children[1] = .{ .width = 40, .height = 24, .x = 40, .y = 0, .content = .{ .pane = 1 } };
+
+    const source_windows: []const Window = &.{
+        .{
+            .id = 1,
+            .width = 80,
+            .height = 24,
+            .layout = .{
+                .width = 80,
+                .height = 24,
+                .x = 0,
+                .y = 0,
+                .content = .{ .horizontal = children },
+            },
+        },
+    };
+
+    // Create the snapshot.
+    const snapshot = try Message.TmuxTopologySnapshot.initFromWindows(alloc, source_windows);
+    defer snapshot.deinit();
+
+    // Free the source arena — if the snapshot referenced source memory,
+    // this would cause use-after-free under the testing allocator.
+    source_arena.deinit();
+
+    // Verify the snapshot is intact.
+    try testing.expectEqual(@as(usize, 1), snapshot.windows.len);
+    const win = snapshot.windows[0];
+    try testing.expectEqual(@as(usize, 1), win.id);
+    try testing.expectEqual(@as(usize, 80), win.width);
+    try testing.expectEqual(@as(usize, 24), win.height);
+    try testing.expectEqual(Layout.Content.horizontal, std.meta.activeTag(win.layout.content));
+
+    const snap_children = win.layout.content.horizontal;
+    try testing.expectEqual(@as(usize, 2), snap_children.len);
+    try testing.expectEqual(@as(usize, 0), snap_children[0].content.pane);
+    try testing.expectEqual(@as(usize, 1), snap_children[1].content.pane);
+}
+
+test "TmuxTopologySnapshot deinit frees owned arena" {
+    // std.testing.allocator is a leak-detecting allocator. If deinit
+    // fails to free all memory, the test will fail with a leak report.
+    const alloc = std.testing.allocator;
+    const Window = terminal.tmux.Viewer.Window;
+
+    const windows: []const Window = &.{
+        .{
+            .id = 0,
+            .width = 80,
+            .height = 24,
+            .layout = .{
+                .width = 80,
+                .height = 24,
+                .x = 0,
+                .y = 0,
+                .content = .{ .pane = 42 },
+            },
+        },
+    };
+
+    const snapshot = try Message.TmuxTopologySnapshot.initFromWindows(alloc, windows);
+    // Verify it was created successfully, then deinit immediately.
+    // If any memory leaks, the testing allocator will report it.
+    try std.testing.expectEqual(@as(usize, 1), snapshot.windows.len);
+    snapshot.deinit();
 }

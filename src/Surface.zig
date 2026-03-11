@@ -453,9 +453,249 @@ const DerivedConfig = struct {
     }
 };
 
-/// Create a new surface. This must be called from the main thread. The
-/// pointer to the memory for the surface must be provided and must be
-/// stable due to interfacing with various callbacks.
+/// Options for surface initialization beyond the standard parameters.
+/// Defaults produce the standard exec-backed surface.
+pub const InitOptions = struct {
+    /// The backend to use for terminal I/O.
+    backend: BackendConfig = .exec,
+};
+
+/// Selects which termio backend a surface uses.
+///
+/// `.exec` (the default) spawns a subprocess with a pty.
+/// `.tmux` routes I/O through a tmux control mode connection,
+/// identified by a pane ID and a ControlWriter to the parent
+/// terminal's pty.
+///
+/// Upstream anchor: `src/termio/backend.zig` defines `Kind` and
+/// `Backend` as the dispatch union. This type mirrors that for the
+/// surface creation seam so the decision is made once at init time,
+/// not scattered across handlers.
+pub const BackendConfig = union(enum) {
+    /// Standard exec backend — spawn a child process with a pty.
+    exec,
+
+    /// Tmux control mode backend — route I/O through a tmux
+    /// control connection owned by a parent surface.
+    tmux: termio.Tmux.Config,
+};
+
+/// Operations that the core reconcile planner emits for the apprt to
+/// apply when the tmux window topology changes. Each op is a
+/// self-contained structural mutation; the apprt iterates the list
+/// and applies them in order.
+///
+/// The reconcile planner (in `handleMessage(.tmux_topology_changed)`)
+/// converts a `TmuxTopologySnapshot` into an ordered list of these ops.
+/// The apprt receives them via the `tmux_reconcile` action and applies
+/// them using its own tab/split/surface primitives.
+///
+/// Upstream anchor: follows the tagged-union dispatch pattern from
+/// `src/termio/backend.zig` (`Kind`/`Backend`).
+pub const TmuxReconcileOp = union(enum) {
+    /// Begin an atomic reconcile transaction. The apprt may defer
+    /// visual updates until `sync_windows_end`.
+    sync_windows_begin,
+
+    /// Ensure a tab exists for the given tmux window ID. If it
+    /// already exists, retain it; otherwise create a new tab.
+    ensure_window: struct {
+        tmux_window_id: usize,
+        width: usize,
+        height: usize,
+    },
+
+    /// Ensure a pane leaf surface exists for the given pane ID
+    /// within the specified tmux window. The surface should use
+    /// the tmux backend with the given pane ID.
+    ensure_pane: struct {
+        tmux_window_id: usize,
+        pane_id: usize,
+    },
+
+    /// Update the split tree of the given tmux window to match
+    /// the provided layout shape. The layout is borrowed from
+    /// the snapshot and valid for the duration of the action.
+    set_layout: struct {
+        tmux_window_id: usize,
+        layout: *const terminal.tmux.Layout,
+    },
+
+    /// Move focus to the specified tmux window and pane.
+    set_focus: struct {
+        tmux_window_id: usize,
+        pane_id: usize,
+    },
+
+    /// Remove any tabs/panes whose tmux window/pane IDs are not
+    /// in the provided sets. `window_ids` and `pane_ids` are
+    /// sorted slices for binary search.
+    prune_absent: struct {
+        window_ids: []const usize,
+        pane_ids: []const usize,
+    },
+
+    /// End the atomic reconcile transaction. The apprt should
+    /// commit any deferred visual updates and restore stable focus.
+    sync_windows_end,
+};
+
+/// Payload for the `tmux_reconcile` action. Contains an ordered list
+/// of reconcile operations and an arena that owns all referenced data
+/// (layout trees, ID slices). The receiver must call `deinit` after
+/// processing.
+///
+/// Upstream anchor: follows the `change_config: *const Config` pattern
+/// in `src/apprt/surface.zig` — heap-allocated, pointer-passed, callee-freed.
+pub const TmuxReconcilePayload = struct {
+    /// Allocator used to create this struct itself.
+    alloc: Allocator,
+
+    /// Arena owning all op-referenced data (layout trees, ID slices).
+    arena: ArenaAllocator,
+
+    /// Ordered list of reconcile operations.
+    ops: []const TmuxReconcileOp,
+
+    pub fn deinit(self: *TmuxReconcilePayload) void {
+        const alloc = self.alloc;
+        self.arena.deinit();
+        alloc.destroy(self);
+    }
+};
+
+/// Build an ordered list of reconcile ops from a tmux topology snapshot.
+///
+/// The planner emits: sync_windows_begin, then for each window
+/// (ensure_window, ensure_pane for each leaf pane, set_layout),
+/// then prune_absent, sync_windows_end.
+///
+/// The returned payload is heap-allocated and owns all referenced data
+/// via its arena. The caller must call `deinit` after processing.
+///
+/// This is a pure function operating on snapshot data — no Surface
+/// instance needed — making it straightforward to unit test.
+pub fn planTmuxReconcile(
+    alloc: Allocator,
+    windows: []const terminal.tmux.Viewer.Window,
+) Allocator.Error!*TmuxReconcilePayload {
+    var arena: ArenaAllocator = .init(alloc);
+    errdefer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    // Pre-count ops: 1 begin + per-window(1 ensure_window + N panes + 1 set_layout) +
+    // 1 prune_absent + 1 end = 3 + sum(1 + pane_count + 1)
+    var total_panes: usize = 0;
+    for (windows) |window| {
+        total_panes += countPanesInLayout(window.layout);
+    }
+    const op_count = 3 + windows.len * 2 + total_panes;
+    const ops = try arena_alloc.alloc(TmuxReconcileOp, op_count);
+
+    // Collect all window and pane IDs for the prune set
+    const window_ids = try arena_alloc.alloc(usize, windows.len);
+    const pane_ids = try arena_alloc.alloc(usize, total_panes);
+
+    var op_idx: usize = 0;
+    var pane_idx: usize = 0;
+
+    // sync_windows_begin
+    ops[op_idx] = .sync_windows_begin;
+    op_idx += 1;
+
+    for (windows, 0..) |window, wi| {
+        window_ids[wi] = window.id;
+
+        // ensure_window
+        ops[op_idx] = .{ .ensure_window = .{
+            .tmux_window_id = window.id,
+            .width = window.width,
+            .height = window.height,
+        } };
+        op_idx += 1;
+
+        // ensure_pane for each leaf
+        const pane_start = pane_idx;
+        collectPaneIds(window.layout, pane_ids, &pane_idx);
+
+        for (pane_ids[pane_start..pane_idx]) |pid| {
+            ops[op_idx] = .{ .ensure_pane = .{
+                .tmux_window_id = window.id,
+                .pane_id = pid,
+            } };
+            op_idx += 1;
+        }
+
+        // set_layout — clone the layout into the arena so it outlives the snapshot
+        const layout_ptr = try arena_alloc.create(terminal.tmux.Layout);
+        layout_ptr.* = try window.layout.clone(arena_alloc);
+
+        ops[op_idx] = .{ .set_layout = .{
+            .tmux_window_id = window.id,
+            .layout = layout_ptr,
+        } };
+        op_idx += 1;
+    }
+
+    // Sort ID slices for binary search in prune_absent
+    std.mem.sort(usize, window_ids, {}, std.sort.asc(usize));
+    std.mem.sort(usize, pane_ids, {}, std.sort.asc(usize));
+
+    // prune_absent
+    ops[op_idx] = .{ .prune_absent = .{
+        .window_ids = window_ids,
+        .pane_ids = pane_ids,
+    } };
+    op_idx += 1;
+
+    // sync_windows_end
+    ops[op_idx] = .sync_windows_end;
+    op_idx += 1;
+
+    std.debug.assert(op_idx == op_count);
+
+    const payload = try alloc.create(TmuxReconcilePayload);
+    payload.* = .{
+        .alloc = alloc,
+        .arena = arena,
+        .ops = ops,
+    };
+    return payload;
+}
+
+/// Count the number of leaf panes in a layout tree.
+fn countPanesInLayout(layout: terminal.tmux.Layout) usize {
+    switch (layout.content) {
+        .pane => return 1,
+        .horizontal, .vertical => |children| {
+            var count: usize = 0;
+            for (children) |child| {
+                count += countPanesInLayout(child);
+            }
+            return count;
+        },
+    }
+}
+
+/// Collect all leaf pane IDs from a layout tree into a pre-allocated slice.
+fn collectPaneIds(layout: terminal.tmux.Layout, ids: []usize, idx: *usize) void {
+    switch (layout.content) {
+        .pane => |pane_id| {
+            ids[idx.*] = pane_id;
+            idx.* += 1;
+        },
+        .horizontal, .vertical => |children| {
+            for (children) |child| {
+                collectPaneIds(child, ids, idx);
+            }
+        },
+    }
+}
+
+/// Create a new surface with the default exec backend. This must be
+/// called from the main thread. The pointer to the memory for the
+/// surface must be provided and must be stable due to interfacing
+/// with various callbacks.
 pub fn init(
     self: *Surface,
     alloc: Allocator,
@@ -463,6 +703,30 @@ pub fn init(
     app: *App,
     rt_app: *apprt.runtime.App,
     rt_surface: *apprt.runtime.Surface,
+) !void {
+    return self.initWithOptions(alloc, config_original, app, rt_app, rt_surface, .{});
+}
+
+/// Create a new surface with explicit backend selection. This is the
+/// full initialization path; `init` is a convenience wrapper that
+/// defaults to `.exec`.
+///
+/// The `opts.backend` field selects which termio backend to use:
+/// - `.exec`: spawns a subprocess with a pty (default behavior)
+/// - `.tmux`: routes I/O through a tmux control mode connection
+///
+/// Upstream anchor: the backend decision happens here at the
+/// canonical construction seam (`Surface.init`), not scattered
+/// across runtime handlers. See `src/termio/backend.zig` for
+/// the backend dispatch union this feeds into.
+pub fn initWithOptions(
+    self: *Surface,
+    alloc: Allocator,
+    config_original: *const configpkg.Config,
+    app: *App,
+    rt_app: *apprt.runtime.App,
+    rt_surface: *apprt.runtime.Surface,
+    opts: InitOptions,
 ) !void {
     // Apply our conditional state. If we fail to apply the conditional state
     // then we log and attempt to move forward with the old config.
@@ -606,7 +870,8 @@ pub fn init(
         .config_conditional_state = app.config_conditional_state,
     };
 
-    // The command we're going to execute
+    // The command we're going to execute (used by exec backend and
+    // xdg-terminal-exec title below).
     const command: ?configpkg.Command = command: {
         if (app.first) {
             if (config.@"initial-command") |command| {
@@ -620,32 +885,43 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env internal_os.getEnvMap(alloc) catch
-                std.process.EnvMap.init(alloc);
+        // Select and initialize the termio backend based on opts.
+        const io_backend: termio.Backend = switch (opts.backend) {
+            .exec => exec: {
+                var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                    // If an error occurs, we don't want to block surface startup.
+                    log.warn("error getting env map for surface err={}", .{err});
+                    break :env internal_os.getEnvMap(alloc) catch
+                        std.process.EnvMap.init(alloc);
+                };
+                errdefer env.deinit();
+
+                // don't leak GHOSTTY_LOG to any subprocesses
+                env.remove("GHOSTTY_LOG");
+
+                // Initialize our IO backend
+                var io_exec = try termio.Exec.init(alloc, .{
+                    .command = command,
+                    .env = env,
+                    .env_override = config.env,
+                    .shell_integration = config.@"shell-integration",
+                    .shell_integration_features = config.@"shell-integration-features",
+                    .cursor_blink = config.@"cursor-style-blink",
+                    .working_directory = config.@"working-directory",
+                    .resources_dir = global_state.resources_dir.host(),
+                    .term = config.term,
+                    .rt_pre_exec_info = .init(config),
+                    .rt_post_fork_info = .init(config),
+                });
+                errdefer io_exec.deinit();
+
+                break :exec .{ .exec = io_exec };
+            },
+
+            .tmux => |tmux_config| .{ .tmux = termio.Tmux.init(tmux_config) },
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        env.remove("GHOSTTY_LOG");
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = config.@"working-directory",
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        var backend = io_backend;
+        errdefer backend.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -655,7 +931,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -1148,6 +1424,68 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .search_selected,
                 .{ .selected = v },
             );
+        },
+
+        .tmux_topology_changed => |snapshot| {
+            defer snapshot.deinit();
+            log.debug("tmux topology changed: {} windows", .{snapshot.windows.len});
+
+            // Plan reconcile ops from the snapshot. The payload is
+            // heap-allocated; ownership transfers to the action handler
+            // on success, otherwise we clean up here.
+            const payload = planTmuxReconcile(
+                self.alloc,
+                snapshot.windows,
+            ) catch |err| {
+                log.warn("tmux reconcile plan failed: {}", .{err});
+                return;
+            };
+            errdefer payload.deinit();
+
+            // Dispatch to the apprt. The handler owns the payload and
+            // is responsible for calling payload.deinit() after applying
+            // the ops. performAction only throws on dispatch failure, in
+            // which case errdefer above cleans up.
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_reconcile,
+                .{ .payload = payload },
+            );
+        },
+
+        .tmux_write_command => |w| {
+            // A tmux child pane relayed a command to this (parent) surface.
+            // Forward it into our termio mailbox so the parent IO thread
+            // writes it to the pty connected to `tmux -CC`.
+            //
+            // This is the SPSC-safe relay endpoint: the child IO thread
+            // posted this message through the app mailbox targeting our
+            // surface. We (the app thread) are the only thread calling
+            // queueIo, which calls mailbox.send — making the app thread
+            // the single producer for this surface's termio mailbox from
+            // outside the IO thread.
+            //
+            // Upstream anchor: same pattern as `report_title` handler
+            // which calls queueIo with write data.
+            // Surface WriteReq.Small holds up to 255 bytes but termio
+            // WriteReq.Small holds only 38. Use writeReq() to handle
+            // the size decision for the small case; stable and alloc
+            // map directly since their layouts are compatible.
+            const io_msg: termio.Message = switch (w) {
+                .small => |v| termio.Message.writeReq(
+                    self.alloc,
+                    v.data[0..v.len],
+                ) catch |err| {
+                    log.warn("tmux relay alloc failed: {}", .{err});
+                    return;
+                },
+                .stable => |v| .{ .write_stable = v },
+                .alloc => |v| .{ .write_alloc = .{
+                    .alloc = v.alloc,
+                    .data = v.data,
+                } },
+            };
+            self.queueIo(io_msg, .unlocked);
         },
     }
 }
@@ -6778,4 +7116,299 @@ test "Surface: rectangle selection logic" {
         9, 2, // expected end
         true, //rectangle selection
     );
+}
+
+test "Surface InitOptions default backend is exec" {
+    const opts: InitOptions = .{};
+    switch (opts.backend) {
+        .exec => {},
+        .tmux => return error.UnexpectedBackend,
+    }
+}
+
+test "Surface InitOptions allows tmux backend config" {
+    const tmux_cfg: termio.Tmux.Config = .{
+        .pane_id = 42,
+        .control_writer = .{
+            .context = undefined,
+            .writeFn = undefined,
+        },
+    };
+    const opts: InitOptions = .{ .backend = .{ .tmux = tmux_cfg } };
+    switch (opts.backend) {
+        .tmux => |cfg| {
+            try @import("std").testing.expectEqual(@as(usize, 42), cfg.pane_id);
+        },
+        .exec => return error.UnexpectedBackend,
+    }
+}
+
+test "Surface BackendConfig produces correct termio Backend variant" {
+    const tmux_cfg: termio.Tmux.Config = .{
+        .pane_id = 7,
+        .control_writer = .{
+            .context = undefined,
+            .writeFn = undefined,
+        },
+    };
+    const backend_cfg: BackendConfig = .{ .tmux = tmux_cfg };
+    const io_backend: termio.Backend = switch (backend_cfg) {
+        .exec => .{ .exec = undefined },
+        .tmux => |cfg| .{ .tmux = termio.Tmux.init(cfg) },
+    };
+    switch (io_backend) {
+        .tmux => |tmux| {
+            try @import("std").testing.expectEqual(@as(usize, 7), tmux.pane_id);
+        },
+        .exec => return error.UnexpectedBackend,
+    }
+}
+
+test "planTmuxReconcile single window single pane" {
+    const testing = @import("std").testing;
+    const alloc = testing.allocator;
+
+    // Single window @0 with a single pane (id=1), 80x24
+    const windows = [_]terminal.tmux.Viewer.Window{
+        .{
+            .id = 0,
+            .width = 80,
+            .height = 24,
+            .layout = .{
+                .width = 80,
+                .height = 24,
+                .x = 0,
+                .y = 0,
+                .content = .{ .pane = 1 },
+            },
+        },
+    };
+
+    const payload = try planTmuxReconcile(alloc, &windows);
+    defer payload.deinit();
+
+    // Expected: begin, ensure_window, ensure_pane, set_layout, prune, end = 6 ops
+    try testing.expectEqual(@as(usize, 6), payload.ops.len);
+
+    // Op 0: sync_windows_begin
+    try testing.expect(payload.ops[0] == .sync_windows_begin);
+
+    // Op 1: ensure_window(id=0, 80x24)
+    switch (payload.ops[1]) {
+        .ensure_window => |ew| {
+            try testing.expectEqual(@as(usize, 0), ew.tmux_window_id);
+            try testing.expectEqual(@as(usize, 80), ew.width);
+            try testing.expectEqual(@as(usize, 24), ew.height);
+        },
+        else => return error.UnexpectedOp,
+    }
+
+    // Op 2: ensure_pane(window=0, pane=1)
+    switch (payload.ops[2]) {
+        .ensure_pane => |ep| {
+            try testing.expectEqual(@as(usize, 0), ep.tmux_window_id);
+            try testing.expectEqual(@as(usize, 1), ep.pane_id);
+        },
+        else => return error.UnexpectedOp,
+    }
+
+    // Op 3: set_layout(window=0)
+    switch (payload.ops[3]) {
+        .set_layout => |sl| {
+            try testing.expectEqual(@as(usize, 0), sl.tmux_window_id);
+            // Layout should be a single pane with id=1
+            switch (sl.layout.content) {
+                .pane => |pid| try testing.expectEqual(@as(usize, 1), pid),
+                else => return error.UnexpectedLayout,
+            }
+        },
+        else => return error.UnexpectedOp,
+    }
+
+    // Op 4: prune_absent
+    switch (payload.ops[4]) {
+        .prune_absent => |pa| {
+            try testing.expectEqual(@as(usize, 1), pa.window_ids.len);
+            try testing.expectEqual(@as(usize, 0), pa.window_ids[0]);
+            try testing.expectEqual(@as(usize, 1), pa.pane_ids.len);
+            try testing.expectEqual(@as(usize, 1), pa.pane_ids[0]);
+        },
+        else => return error.UnexpectedOp,
+    }
+
+    // Op 5: sync_windows_end
+    try testing.expect(payload.ops[5] == .sync_windows_end);
+}
+
+test "planTmuxReconcile multi window multi pane stable ordering" {
+    const testing = @import("std").testing;
+    const alloc = testing.allocator;
+
+    // Window @1: vertical split with panes 2 and 3
+    // Window @0: single pane 1
+    // Note: windows are given in order [1, 0] to verify ordering is preserved
+    const windows = [_]terminal.tmux.Viewer.Window{
+        .{
+            .id = 1,
+            .width = 80,
+            .height = 24,
+            .layout = .{
+                .width = 80,
+                .height = 24,
+                .x = 0,
+                .y = 0,
+                .content = .{
+                    .vertical = &[_]terminal.tmux.Layout{
+                        .{
+                            .width = 80,
+                            .height = 12,
+                            .x = 0,
+                            .y = 0,
+                            .content = .{ .pane = 2 },
+                        },
+                        .{
+                            .width = 80,
+                            .height = 11,
+                            .x = 0,
+                            .y = 13,
+                            .content = .{ .pane = 3 },
+                        },
+                    },
+                },
+            },
+        },
+        .{
+            .id = 0,
+            .width = 80,
+            .height = 24,
+            .layout = .{
+                .width = 80,
+                .height = 24,
+                .x = 0,
+                .y = 0,
+                .content = .{ .pane = 1 },
+            },
+        },
+    };
+
+    const payload = try planTmuxReconcile(alloc, &windows);
+    defer payload.deinit();
+
+    // Expected: begin + (ensure_window + 2 ensure_pane + set_layout) +
+    //           (ensure_window + 1 ensure_pane + set_layout) + prune + end
+    // = 1 + 4 + 3 + 1 + 1 = 10
+    try testing.expectEqual(@as(usize, 10), payload.ops.len);
+
+    // Window order preserved: first window @1, then window @0
+    switch (payload.ops[1]) {
+        .ensure_window => |ew| try testing.expectEqual(@as(usize, 1), ew.tmux_window_id),
+        else => return error.UnexpectedOp,
+    }
+
+    // Pane 2 before pane 3 (depth-first left-to-right within window @1)
+    switch (payload.ops[2]) {
+        .ensure_pane => |ep| {
+            try testing.expectEqual(@as(usize, 1), ep.tmux_window_id);
+            try testing.expectEqual(@as(usize, 2), ep.pane_id);
+        },
+        else => return error.UnexpectedOp,
+    }
+    switch (payload.ops[3]) {
+        .ensure_pane => |ep| {
+            try testing.expectEqual(@as(usize, 1), ep.tmux_window_id);
+            try testing.expectEqual(@as(usize, 3), ep.pane_id);
+        },
+        else => return error.UnexpectedOp,
+    }
+
+    // set_layout for window @1
+    switch (payload.ops[4]) {
+        .set_layout => |sl| try testing.expectEqual(@as(usize, 1), sl.tmux_window_id),
+        else => return error.UnexpectedOp,
+    }
+
+    // Window @0 ops follow
+    switch (payload.ops[5]) {
+        .ensure_window => |ew| try testing.expectEqual(@as(usize, 0), ew.tmux_window_id),
+        else => return error.UnexpectedOp,
+    }
+
+    // prune_absent: sorted IDs
+    switch (payload.ops[8]) {
+        .prune_absent => |pa| {
+            // Window IDs sorted: [0, 1]
+            try testing.expectEqual(@as(usize, 0), pa.window_ids[0]);
+            try testing.expectEqual(@as(usize, 1), pa.window_ids[1]);
+            // Pane IDs sorted: [1, 2, 3]
+            try testing.expectEqual(@as(usize, 1), pa.pane_ids[0]);
+            try testing.expectEqual(@as(usize, 2), pa.pane_ids[1]);
+            try testing.expectEqual(@as(usize, 3), pa.pane_ids[2]);
+        },
+        else => return error.UnexpectedOp,
+    }
+}
+
+test "planTmuxReconcile repeated identical snapshot yields same ops" {
+    const testing = @import("std").testing;
+    const alloc = testing.allocator;
+
+    const windows = [_]terminal.tmux.Viewer.Window{
+        .{
+            .id = 0,
+            .width = 80,
+            .height = 24,
+            .layout = .{
+                .width = 80,
+                .height = 24,
+                .x = 0,
+                .y = 0,
+                .content = .{ .pane = 1 },
+            },
+        },
+    };
+
+    // Plan twice from same input
+    const payload1 = try planTmuxReconcile(alloc, &windows);
+    defer payload1.deinit();
+    const payload2 = try planTmuxReconcile(alloc, &windows);
+    defer payload2.deinit();
+
+    // Same number of ops
+    try testing.expectEqual(payload1.ops.len, payload2.ops.len);
+
+    // Each op has the same tag and values
+    for (payload1.ops, payload2.ops) |op1, op2| {
+        const tag1: std.meta.Tag(TmuxReconcileOp) = op1;
+        const tag2: std.meta.Tag(TmuxReconcileOp) = op2;
+        try testing.expectEqual(tag1, tag2);
+
+        switch (op1) {
+            .sync_windows_begin, .sync_windows_end => {},
+            .ensure_window => |ew1| {
+                const ew2 = op2.ensure_window;
+                try testing.expectEqual(ew1.tmux_window_id, ew2.tmux_window_id);
+                try testing.expectEqual(ew1.width, ew2.width);
+                try testing.expectEqual(ew1.height, ew2.height);
+            },
+            .ensure_pane => |ep1| {
+                const ep2 = op2.ensure_pane;
+                try testing.expectEqual(ep1.tmux_window_id, ep2.tmux_window_id);
+                try testing.expectEqual(ep1.pane_id, ep2.pane_id);
+            },
+            .set_layout => |sl1| {
+                const sl2 = op2.set_layout;
+                try testing.expectEqual(sl1.tmux_window_id, sl2.tmux_window_id);
+            },
+            .prune_absent => |pa1| {
+                const pa2 = op2.prune_absent;
+                try testing.expectEqual(pa1.window_ids.len, pa2.window_ids.len);
+                try testing.expectEqual(pa1.pane_ids.len, pa2.pane_ids.len);
+            },
+            .set_focus => |sf1| {
+                const sf2 = op2.set_focus;
+                try testing.expectEqual(sf1.tmux_window_id, sf2.tmux_window_id);
+                try testing.expectEqual(sf1.pane_id, sf2.pane_id);
+            },
+        }
+    }
 }
