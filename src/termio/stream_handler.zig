@@ -454,19 +454,17 @@ pub const StreamHandler = struct {
                         },
 
                         .windows => |windows| {
-                            // Log the window topology received from the viewer.
-                            // Slice 3 will use this to create/destroy apprt
-                            // surfaces for each pane. For now we store the
-                            // topology on the viewer (which already tracks
-                            // windows internally) and log it so the wiring
-                            // is exercised end-to-end.
+                            // Deep-copy the window topology and forward it to
+                            // the app thread via the surface mailbox. The app
+                            // thread will reconcile tmux windows/panes into
+                            // apprt surfaces (Slice 3 commit 4).
                             //
                             // Upstream anchor: PR #9860 (viewer reconciliation
                             // loop) emits .windows actions when list-windows
                             // output is parsed. The viewer already maintains
                             // the authoritative window list in viewer.windows;
-                            // this handler is where Ghostty would diff the
-                            // prior state and create/destroy surfaces.
+                            // this handler forwards the topology so the app
+                            // thread can diff and create/destroy surfaces.
                             for (windows) |window| {
                                 log.debug("tmux window id={} size={}x{}", .{
                                     window.id,
@@ -475,6 +473,15 @@ pub const StreamHandler = struct {
                                 });
                                 logPaneIds(window.layout);
                             }
+
+                            const snapshot = apprt.surface.Message.TmuxTopologySnapshot.initFromWindows(
+                                self.alloc,
+                                windows,
+                            ) catch |err| {
+                                log.warn("failed to snapshot tmux topology: {}", .{err});
+                                return;
+                            };
+                            self.surfaceMessageWriter(.{ .tmux_topology_changed = snapshot });
                         },
                     }
                 }
