@@ -1291,6 +1291,10 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+        // Tmux-backed surfaces have no subprocess, so there is no
+        // command to display. This path should not normally be reached
+        // since tmux surfaces don't have child processes that can exit.
+        .tmux => &.{"(tmux pane)"},
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
