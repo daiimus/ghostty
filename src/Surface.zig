@@ -453,9 +453,37 @@ const DerivedConfig = struct {
     }
 };
 
-/// Create a new surface. This must be called from the main thread. The
-/// pointer to the memory for the surface must be provided and must be
-/// stable due to interfacing with various callbacks.
+/// Options for surface initialization beyond the standard parameters.
+/// Defaults produce the standard exec-backed surface.
+pub const InitOptions = struct {
+    /// The backend to use for terminal I/O.
+    backend: BackendConfig = .exec,
+};
+
+/// Selects which termio backend a surface uses.
+///
+/// `.exec` (the default) spawns a subprocess with a pty.
+/// `.tmux` routes I/O through a tmux control mode connection,
+/// identified by a pane ID and a ControlWriter to the parent
+/// terminal's pty.
+///
+/// Upstream anchor: `src/termio/backend.zig` defines `Kind` and
+/// `Backend` as the dispatch union. This type mirrors that for the
+/// surface creation seam so the decision is made once at init time,
+/// not scattered across handlers.
+pub const BackendConfig = union(enum) {
+    /// Standard exec backend — spawn a child process with a pty.
+    exec,
+
+    /// Tmux control mode backend — route I/O through a tmux
+    /// control connection owned by a parent surface.
+    tmux: termio.Tmux.Config,
+};
+
+/// Create a new surface with the default exec backend. This must be
+/// called from the main thread. The pointer to the memory for the
+/// surface must be provided and must be stable due to interfacing
+/// with various callbacks.
 pub fn init(
     self: *Surface,
     alloc: Allocator,
@@ -463,6 +491,30 @@ pub fn init(
     app: *App,
     rt_app: *apprt.runtime.App,
     rt_surface: *apprt.runtime.Surface,
+) !void {
+    return self.initWithOptions(alloc, config_original, app, rt_app, rt_surface, .{});
+}
+
+/// Create a new surface with explicit backend selection. This is the
+/// full initialization path; `init` is a convenience wrapper that
+/// defaults to `.exec`.
+///
+/// The `opts.backend` field selects which termio backend to use:
+/// - `.exec`: spawns a subprocess with a pty (default behavior)
+/// - `.tmux`: routes I/O through a tmux control mode connection
+///
+/// Upstream anchor: the backend decision happens here at the
+/// canonical construction seam (`Surface.init`), not scattered
+/// across runtime handlers. See `src/termio/backend.zig` for
+/// the backend dispatch union this feeds into.
+pub fn initWithOptions(
+    self: *Surface,
+    alloc: Allocator,
+    config_original: *const configpkg.Config,
+    app: *App,
+    rt_app: *apprt.runtime.App,
+    rt_surface: *apprt.runtime.Surface,
+    opts: InitOptions,
 ) !void {
     // Apply our conditional state. If we fail to apply the conditional state
     // then we log and attempt to move forward with the old config.
@@ -606,7 +658,8 @@ pub fn init(
         .config_conditional_state = app.config_conditional_state,
     };
 
-    // The command we're going to execute
+    // The command we're going to execute (used by exec backend and
+    // xdg-terminal-exec title below).
     const command: ?configpkg.Command = command: {
         if (app.first) {
             if (config.@"initial-command") |command| {
@@ -620,32 +673,43 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env internal_os.getEnvMap(alloc) catch
-                std.process.EnvMap.init(alloc);
+        // Select and initialize the termio backend based on opts.
+        const io_backend: termio.Backend = switch (opts.backend) {
+            .exec => exec: {
+                var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                    // If an error occurs, we don't want to block surface startup.
+                    log.warn("error getting env map for surface err={}", .{err});
+                    break :env internal_os.getEnvMap(alloc) catch
+                        std.process.EnvMap.init(alloc);
+                };
+                errdefer env.deinit();
+
+                // don't leak GHOSTTY_LOG to any subprocesses
+                env.remove("GHOSTTY_LOG");
+
+                // Initialize our IO backend
+                var io_exec = try termio.Exec.init(alloc, .{
+                    .command = command,
+                    .env = env,
+                    .env_override = config.env,
+                    .shell_integration = config.@"shell-integration",
+                    .shell_integration_features = config.@"shell-integration-features",
+                    .cursor_blink = config.@"cursor-style-blink",
+                    .working_directory = config.@"working-directory",
+                    .resources_dir = global_state.resources_dir.host(),
+                    .term = config.term,
+                    .rt_pre_exec_info = .init(config),
+                    .rt_post_fork_info = .init(config),
+                });
+                errdefer io_exec.deinit();
+
+                break :exec .{ .exec = io_exec };
+            },
+
+            .tmux => |tmux_config| .{ .tmux = termio.Tmux.init(tmux_config) },
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        env.remove("GHOSTTY_LOG");
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = config.@"working-directory",
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        var backend = io_backend;
+        errdefer backend.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -655,7 +719,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -6783,4 +6847,50 @@ test "Surface: rectangle selection logic" {
         9, 2, // expected end
         true, //rectangle selection
     );
+}
+
+test "Surface InitOptions default backend is exec" {
+    const opts: InitOptions = .{};
+    switch (opts.backend) {
+        .exec => {},
+        .tmux => return error.UnexpectedBackend,
+    }
+}
+
+test "Surface InitOptions allows tmux backend config" {
+    const tmux_cfg: termio.Tmux.Config = .{
+        .pane_id = 42,
+        .control_writer = .{
+            .context = undefined,
+            .writeFn = undefined,
+        },
+    };
+    const opts: InitOptions = .{ .backend = .{ .tmux = tmux_cfg } };
+    switch (opts.backend) {
+        .tmux => |cfg| {
+            try @import("std").testing.expectEqual(@as(usize, 42), cfg.pane_id);
+        },
+        .exec => return error.UnexpectedBackend,
+    }
+}
+
+test "Surface BackendConfig produces correct termio Backend variant" {
+    const tmux_cfg: termio.Tmux.Config = .{
+        .pane_id = 7,
+        .control_writer = .{
+            .context = undefined,
+            .writeFn = undefined,
+        },
+    };
+    const backend_cfg: BackendConfig = .{ .tmux = tmux_cfg };
+    const io_backend: termio.Backend = switch (backend_cfg) {
+        .exec => .{ .exec = undefined },
+        .tmux => |cfg| .{ .tmux = termio.Tmux.init(cfg) },
+    };
+    switch (io_backend) {
+        .tmux => |tmux| {
+            try @import("std").testing.expectEqual(@as(usize, 7), tmux.pane_id);
+        },
+        .exec => return error.UnexpectedBackend,
+    }
 }
