@@ -1674,6 +1674,22 @@ test "initial flow" {
                     try testing.expect(!std.mem.containsAtLeast(u8, command, 1, "-a"));
                 }
             }).check,
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // .windows must be emitted before .command so that
+                    // the surface layer sees topology before outgoing
+                    // commands trigger further protocol traffic.
+                    var windows_idx: ?usize = null;
+                    var command_idx: ?usize = null;
+                    for (actions, 0..) |action, i| {
+                        if (windows_idx == null and action == .windows) windows_idx = i;
+                        if (command_idx == null and action == .command) command_idx = i;
+                    }
+                    try testing.expect(windows_idx != null);
+                    try testing.expect(command_idx != null);
+                    try testing.expect(windows_idx.? < command_idx.?);
+                }
+            }).check,
         },
         .{
             .input = .{ .tmux = .{
