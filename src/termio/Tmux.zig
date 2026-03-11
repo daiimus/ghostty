@@ -37,6 +37,7 @@ const assert = @import("../quirks.zig").inlineAssert;
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
+const apprt = @import("../apprt.zig");
 
 const log = std.log.scoped(.io_tmux);
 
@@ -135,6 +136,71 @@ pub const ParentWriter = struct {
         const msg = termio.Message.writeReq(self.alloc, data) catch
             return error.WriteFailed;
         self.mailbox.send(msg, self.mutex);
+    }
+};
+
+/// A ControlWriter implementation that routes tmux commands through
+/// the app mailbox to the parent surface. This is the Slice 3
+/// replacement for `ParentWriter` in cross-thread scenarios: when a
+/// child tmux pane runs on its own IO thread, it cannot safely write
+/// directly into the parent's SPSC termio mailbox.
+///
+/// Instead, command bytes are wrapped in an `apprt.surface.Message`
+/// (.tmux_write_command) and pushed to the parent surface's mailbox.
+/// The app mailbox is MPSC-safe, so any thread can push. The app
+/// thread delivers the message to the parent surface's `handleMessage`,
+/// which forwards the command bytes into the parent's termio mailbox
+/// via `queueIo` — preserving the SPSC invariant.
+///
+/// ## Relay Path
+///
+///   Child IO thread: SurfaceRelayWriter.writeFn()
+///     → constructs WriteReq from command bytes
+///     → pushes .tmux_write_command to parent surface mailbox
+///     → (app mailbox MPSC push, safe from any thread)
+///   App thread: drainMailbox → parent Surface.handleMessage
+///     → .tmux_write_command → queueIo(.write_small/.write_alloc)
+///     → parent termio mailbox (SPSC: app thread is single producer)
+///
+/// ## Lifetime
+///
+/// The `parent_mailbox` must remain valid for the lifetime of this
+/// writer. In practice, the parent surface outlives all child surfaces
+/// it creates.
+///
+/// ## Upstream Anchor
+///
+/// - `apprt/surface.zig` `Mailbox.push`: routes through app mailbox
+///   with surface pointer, delivered by app thread
+/// - `Surface.zig` `handleMessage(.tmux_write_command)`: relay endpoint
+pub const SurfaceRelayWriter = struct {
+    parent_mailbox: apprt.surface.Mailbox,
+    alloc: Allocator,
+
+    pub fn controlWriter(self: *SurfaceRelayWriter) ControlWriter {
+        return .{
+            .context = @ptrCast(self),
+            .writeFn = &writeFn,
+        };
+    }
+
+    fn writeFn(context: *anyopaque, data: []const u8) ControlWriter.WriteError!void {
+        const self: *SurfaceRelayWriter = @ptrCast(@alignCast(context));
+
+        // Construct a surface-level WriteReq from the command bytes.
+        // Surface WriteReq (MessageData(u8, 255)) can hold up to 255
+        // bytes inline; larger commands are heap-allocated.
+        const SurfaceWriteReq = apprt.surface.Message.WriteReq;
+        const req = SurfaceWriteReq.init(self.alloc, data) catch
+            return error.WriteFailed;
+
+        // Push to the parent surface's mailbox. This goes through the
+        // app mailbox (MPSC-safe). Use .forever since we don't hold
+        // any mutex that could deadlock with the app thread.
+        _ = self.parent_mailbox.push(
+            .{ .tmux_write_command = req },
+            .{ .forever = {} },
+        );
     }
 };
 
@@ -726,5 +792,79 @@ test "ParentWriter used as backend ControlWriter" {
     switch (msg) {
         .write_alloc => |a| a.alloc.free(a.data),
         else => {},
+    }
+}
+
+test "SurfaceRelayWriter WriteReq fits small tmux commands inline" {
+    // Verify that typical tmux commands (< 255 bytes) produce a
+    // WriteReq.small variant, confirming the surface-level WriteReq
+    // handles them without allocation.
+    const alloc = testing.allocator;
+    const SurfaceWriteReq = apprt.surface.Message.WriteReq;
+
+    // A typical resize-pane command (~30 bytes)
+    const cmd: []const u8 = "resize-pane -t %5 -x 80 -y 24\n";
+    const req = try SurfaceWriteReq.init(alloc, cmd);
+    try testing.expect(req == .small);
+    try testing.expectEqualStrings(cmd, req.slice());
+}
+
+test "SurfaceRelayWriter WriteReq allocates for large commands" {
+    // Verify that commands exceeding 255 bytes (surface WriteReq.Small
+    // capacity) use the alloc variant.
+    const alloc = testing.allocator;
+    const SurfaceWriteReq = apprt.surface.Message.WriteReq;
+
+    // Construct a send-keys command larger than 255 bytes
+    const large_cmd: []const u8 = "send-keys -H -t %12345 " ++ "41 " ** 100 ++ "\n";
+    const req = try SurfaceWriteReq.init(alloc, large_cmd);
+    defer req.deinit();
+    try testing.expect(req == .alloc);
+    try testing.expectEqualStrings(large_cmd, req.slice());
+}
+
+test "SurfaceRelayWriter relay conversion preserves data across WriteReq size boundaries" {
+    // Verify the full relay conversion: surface WriteReq.small (up to
+    // 255 bytes) -> termio.Message.writeReq -> write_small (<=38) or
+    // write_alloc (>38). This tests the size mismatch handling in the
+    // Surface.handleMessage(.tmux_write_command) path.
+    const alloc = testing.allocator;
+    const SurfaceWriteReq = apprt.surface.Message.WriteReq;
+
+    // Case 1: Command fits in BOTH surface small (255) and termio small (38)
+    {
+        const cmd: []const u8 = "list-windows\n"; // 14 bytes
+        const surface_req = try SurfaceWriteReq.init(alloc, cmd);
+        try testing.expect(surface_req == .small);
+
+        // Simulate relay: extract data, convert to termio message
+        const io_msg = try termio.Message.writeReq(alloc, surface_req.slice());
+        try testing.expect(io_msg == .write_small);
+        const data = switch (io_msg) {
+            .write_small => |s| s.data[0..s.len],
+            else => unreachable,
+        };
+        try testing.expectEqualStrings(cmd, data);
+    }
+
+    // Case 2: Command fits in surface small (255) but NOT termio small (38)
+    {
+        const cmd: []const u8 = "send-keys -H -t %12345 41 42 43 44 45 46 47 48\n"; // 49 bytes
+        try testing.expect(cmd.len > 38);
+        try testing.expect(cmd.len <= 255);
+
+        const surface_req = try SurfaceWriteReq.init(alloc, cmd);
+        try testing.expect(surface_req == .small);
+
+        // Simulate relay: this must produce write_alloc, not write_small
+        const io_msg = try termio.Message.writeReq(alloc, surface_req.slice());
+        try testing.expect(io_msg == .write_alloc);
+        switch (io_msg) {
+            .write_alloc => |a| {
+                try testing.expectEqualStrings(cmd, a.data);
+                a.alloc.free(a.data);
+            },
+            else => unreachable,
+        }
     }
 }
