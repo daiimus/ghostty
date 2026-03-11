@@ -1359,7 +1359,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             _ = self.rt_app.performAction(
                 .{ .surface = self },
                 .tmux_session_renamed,
-                .{ .data = name.ptr, .len = name.len },
+                apprt.action.TmuxSessionRenamed.init(name),
             ) catch |err| {
                 log.warn("apprt failed to notify tmux session renamed err={}", .{err});
             };

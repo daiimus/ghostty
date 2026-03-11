@@ -763,24 +763,40 @@ pub const TmuxActiveWindowChanged = struct {
 };
 
 /// tmux control mode `%session-renamed` notification.
-/// Carries the new session name.
+/// Carries the new session name in a fixed inline buffer to avoid
+/// dangling pointer risk across the action dispatch boundary.
 pub const TmuxSessionRenamed = struct {
-    /// Pointer to the new session name.
-    data: [*]const u8,
-    /// Length of the new session name.
-    len: usize,
+    /// Session name stored inline. 128 bytes covers all practical
+    /// tmux session names.
+    name: [128]u8 = .{0} ** 128,
+    name_len: u8 = 0,
+
+    pub fn init(data: []const u8) TmuxSessionRenamed {
+        var result: TmuxSessionRenamed = .{};
+        const len: u8 = @intCast(@min(data.len, result.name.len));
+        @memcpy(result.name[0..len], data[0..len]);
+        result.name_len = len;
+        return result;
+    }
+
+    pub fn nameSlice(self: *const TmuxSessionRenamed) []const u8 {
+        return self.name[0..self.name_len];
+    }
 
     // Sync with: ghostty_action_tmux_session_renamed_s
+    // Inline buffer avoids dangling-pointer risk. 23 bytes + length
+    // fits within the 24-byte CValue limit. Session names over 23
+    // characters are truncated in the C representation.
     pub const C = extern struct {
-        data: [*]const u8,
-        len: usize,
+        name: [23]u8,
+        name_len: u8,
     };
 
     pub fn cval(self: TmuxSessionRenamed) C {
-        return .{
-            .data = self.data,
-            .len = self.len,
-        };
+        const len: u8 = @intCast(@min(self.name_len, 23));
+        var c: C = .{ .name = .{0} ** 23, .name_len = len };
+        @memcpy(c.name[0..len], self.name[0..len]);
+        return c;
     }
 };
 
@@ -809,8 +825,10 @@ pub const TmuxFocusedPaneChanged = struct {
 /// tmux control mode `%subscription-changed` notification.
 /// Carries the subscription name and the new format expansion value.
 ///
-/// Name uses sentinel-terminated pointer (like DesktopNotification).
-/// Value uses pointer + length (like TmuxSessionRenamed).
+/// Uses pointers because both name and value can exceed the 24-byte
+/// CValue size limit. Pointers are valid only for the duration of the
+/// action callback invocation (they reference WriteReq heap copies
+/// managed by Surface.zig).
 pub const TmuxSubscriptionChanged = struct {
     /// Subscription name, sentinel-terminated.
     name: [:0]const u8,
