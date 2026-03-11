@@ -256,6 +256,19 @@ pub const Window = extern struct {
         /// setup by `setup-menu`.
         context_menu_page: ?*adw.TabPage = null,
 
+        /// Tmux reconcile state: maps tmux window IDs to the GTK tab
+        /// created for each window. Populated by ensure_window, pruned
+        /// by prune_absent. Keyed by tmux window ID (usize).
+        ///
+        /// Upstream anchor: follows AutoHashMapUnmanaged pattern from
+        /// `src/terminal/kitty/graphics_storage.zig`.
+        tmux_window_to_tab: std.AutoHashMapUnmanaged(usize, *Tab) = .{},
+
+        /// Tmux reconcile state: maps tmux pane IDs to the GTK surface
+        /// created for each pane. Populated by ensure_pane, pruned by
+        /// prune_absent. Keyed by tmux pane ID (usize).
+        tmux_pane_to_surface: std.AutoHashMapUnmanaged(usize, *Surface) = .{},
+
         // Template bindings
         tab_overview: *adw.TabOverview,
         tab_bar: *adw.TabBar,
@@ -402,8 +415,8 @@ pub const Window = extern struct {
 
             pub const none: @This() = .{};
         },
-    ) void {
-        _ = self.newTabPage(
+    ) *adw.TabPage {
+        return self.newTabPage(
             parent_,
             .window,
             .{
@@ -413,6 +426,20 @@ pub const Window = extern struct {
                 .backend = overrides.backend,
             },
         );
+    }
+
+    /// Returns a mutable pointer to the tmux window-to-tab map for
+    /// reconcile operations. Callers must use Application.default().allocator()
+    /// for any map mutations.
+    pub fn tmuxWindowMap(self: *Self) *std.AutoHashMapUnmanaged(usize, *Tab) {
+        return &self.private().tmux_window_to_tab;
+    }
+
+    /// Returns a mutable pointer to the tmux pane-to-surface map for
+    /// reconcile operations. Callers must use Application.default().allocator()
+    /// for any map mutations.
+    pub fn tmuxPaneMap(self: *Self) *std.AutoHashMapUnmanaged(usize, *Surface) {
+        return &self.private().tmux_pane_to_surface;
     }
 
     fn newTabPage(
@@ -1254,7 +1281,11 @@ pub const Window = extern struct {
     fn finalize(self: *Self) callconv(.c) void {
         const priv = self.private();
         priv.tab_bindings.unref();
-        priv.winproto.deinit(Application.default().allocator());
+
+        const alloc = Application.default().allocator();
+        priv.tmux_window_to_tab.deinit(alloc);
+        priv.tmux_pane_to_surface.deinit(alloc);
+        priv.winproto.deinit(alloc);
 
         gobject.Object.virtual_methods.finalize.call(
             Class.parent,

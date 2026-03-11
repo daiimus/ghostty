@@ -2277,7 +2277,7 @@ const Action = struct {
         );
 
         // Create a new tab with window context (first tab in new window)
-        win.newTabForWindow(parent, .{
+        _ = win.newTabForWindow(parent, .{
             .command = overrides.command,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
