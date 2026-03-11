@@ -580,6 +580,21 @@ pub const Viewer = struct {
             return;
         };
 
+        // Clone unchanged windows' layouts into a temporary arena BEFORE
+        // resetting the shared arena. After arena.reset(.retain_capacity),
+        // the backing pages are reused and old layout pointers become
+        // invalid — new allocations from the same arena will overwrite
+        // the old data. We must preserve the unchanged layouts in
+        // separate memory first.
+        var tmp_arena: ArenaAllocator = .init(self.alloc);
+        defer tmp_arena.deinit();
+        const tmp_alloc = tmp_arena.allocator();
+
+        for (self.windows.items) |*w| {
+            if (w.id == window_id) continue;
+            w.layout = try w.layout.clone(tmp_alloc);
+        }
+
         // Reset the shared windows arena and rebuild all layouts. We must
         // rebuild all windows because their layout data shares the arena.
         // Window count is small so this is cheap.
@@ -588,7 +603,7 @@ pub const Viewer = struct {
         _ = win_arena.reset(.retain_capacity);
         const win_alloc = win_arena.allocator();
 
-        // Re-parse the changed window's layout from the new layout string
+        // Parse the changed window's layout from the new layout string.
         const new_layout: Layout = Layout.parseWithChecksum(
             win_alloc,
             layout_str,
@@ -601,16 +616,9 @@ pub const Viewer = struct {
         };
         window.layout = new_layout;
 
-        // Re-parse all other windows' layouts from their existing data.
-        // Since we reset the arena, the old layout tree pointers are
-        // invalid. We must re-parse from the canonical layout string
-        // stored in each window.
-        //
-        // NOTE: We don't currently store the raw layout string on Window.
-        // Instead, the layout tree itself IS the canonical representation.
-        // Since the arena was reset, we need to deep-copy the layout trees
-        // of unchanged windows onto the new arena. We can do this by
-        // walking the layout tree and cloning it.
+        // Re-clone unchanged windows' layouts from the temporary arena
+        // onto the fresh shared arena. The tmp_arena data is still valid
+        // since we haven't freed it yet (deferred above).
         for (self.windows.items) |*w| {
             if (w.id == window_id) continue;
             w.layout = try w.layout.clone(win_alloc);
