@@ -617,7 +617,7 @@ test "ParentWriter routes commands through mailbox" {
     var mailbox = try termio.Mailbox.initSPSC(alloc);
     defer mailbox.deinit(alloc);
 
-    // ParentWriter does not need the mutex in tests (pass null to send).
+    // Mutex is undefined: the queue is empty so send() takes the fast path (instant push).
     var parent_writer = ParentWriter{
         .mailbox = &mailbox,
         .alloc = alloc,
