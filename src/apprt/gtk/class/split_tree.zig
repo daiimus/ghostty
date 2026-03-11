@@ -9,6 +9,7 @@ const gtk = @import("gtk");
 
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
+const CoreSurface = @import("../../../Surface.zig");
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
@@ -208,6 +209,7 @@ pub const SplitTree = extern struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
+            backend: CoreSurface.BackendConfig = .exec,
 
             pub const none: @This() = .{};
         },
@@ -219,6 +221,7 @@ pub const SplitTree = extern struct {
             .command = overrides.command,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
+            .backend = overrides.backend,
         });
         defer surface.unref();
         _ = surface.refSink();

@@ -191,6 +191,7 @@ pub const Tab = extern struct {
         command: ?configpkg.Command = null,
         working_directory: ?[:0]const u8 = null,
         title: ?[:0]const u8 = null,
+        backend: CoreSurface.BackendConfig = .exec,
 
         pub const none: @This() = .{};
     }) *Self {
@@ -214,6 +215,7 @@ pub const Tab = extern struct {
             .command = overrides.command,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
+            .backend = overrides.backend,
         }) catch |err| switch (err) {
             error.OutOfMemory => {
                 // TODO: We should make our "no surfaces" state more aesthetically

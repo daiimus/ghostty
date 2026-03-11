@@ -765,6 +765,8 @@ pub const Application = extern struct {
             .search_total => Action.searchTotal(target, value),
             .search_selected => Action.searchSelected(target, value),
 
+            .tmux_reconcile => Action.tmuxReconcile(target, value),
+
             // Unimplemented
             .secure_input,
             .close_all_windows,
@@ -2805,6 +2807,77 @@ const Action = struct {
                 return true;
             },
         }
+    }
+
+    /// Apply a batch of tmux topology reconcile operations to the GTK
+    /// window/tab/split structure. The payload contains an ordered list
+    /// of structural ops that the core reconcile planner produced from
+    /// a tmux topology snapshot.
+    ///
+    /// The payload is owned by the caller (core handleMessage) and is
+    /// valid for the duration of this call. The apprt must not store it.
+    ///
+    /// Upstream anchor: follows the `configChange` handler pattern that
+    /// receives a pointer-payload and applies structural mutations.
+    pub fn tmuxReconcile(target: apprt.Target, value: apprt.Action.Value(.tmux_reconcile)) void {
+        const payload = value.payload;
+        defer payload.deinit();
+
+        const surface = switch (target) {
+            .app => {
+                log.warn("tmux_reconcile action to app is unexpected", .{});
+                return;
+            },
+            .surface => |core| core.rt_surface.surface,
+        };
+
+        const window = ext.getAncestor(Window, surface.as(gtk.Widget)) orelse {
+            log.warn("tmux_reconcile: surface has no ancestor window", .{});
+            return;
+        };
+
+        for (payload.ops) |op| {
+            switch (op) {
+                .sync_windows_begin => {
+                    log.debug("tmux reconcile: sync_windows_begin", .{});
+                },
+
+                .ensure_window => |ew| {
+                    log.debug("tmux reconcile: ensure_window id={}", .{ew.tmux_window_id});
+                    // TODO: Track tmux window->tab mapping and create/retain tabs.
+                    // For now, log and continue. Full tab creation requires
+                    // associating tmux window IDs with GTK tab pages.
+                },
+
+                .ensure_pane => |ep| {
+                    log.debug("tmux reconcile: ensure_pane window={} pane={}", .{ ep.tmux_window_id, ep.pane_id });
+                    // TODO: Create surfaces with tmux backend for each pane.
+                    // Requires ControlWriter reference to be available.
+                },
+
+                .set_layout => |sl| {
+                    log.debug("tmux reconcile: set_layout window={}", .{sl.tmux_window_id});
+                    // TODO: Rebuild split tree to match tmux layout shape.
+                    _ = sl.layout;
+                },
+
+                .set_focus => |sf| {
+                    log.debug("tmux reconcile: set_focus window={} pane={}", .{ sf.tmux_window_id, sf.pane_id });
+                    // TODO: Switch to the correct tab and focus the correct pane surface.
+                },
+
+                .prune_absent => |pa| {
+                    log.debug("tmux reconcile: prune_absent windows={} panes={}", .{ pa.window_ids.len, pa.pane_ids.len });
+                    // TODO: Close tabs/surfaces whose tmux IDs are not in the keep-set.
+                },
+
+                .sync_windows_end => {
+                    log.debug("tmux reconcile: sync_windows_end", .{});
+                },
+            }
+        }
+
+        _ = window;
     }
 };
 
