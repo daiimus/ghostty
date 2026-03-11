@@ -5,9 +5,11 @@
 //!
 //! User input (keyboard, paste, etc.) is formatted as tmux `send-keys -H`
 //! commands targeting a specific pane, and written to the control connection
-//! via the ControlWriter interface. The parent terminal's stream handler is
-//! responsible for routing `%output` notifications back to this backend's
-//! terminal (not yet wired — see stream_handler.zig `.windows` TODO).
+//! via the ControlWriter interface. The `ParentWriter` implementation routes
+//! commands through the parent terminal's termio mailbox, which writes them
+//! to the pty connected to `tmux -CC`. The parent terminal's stream handler
+//! is responsible for routing `%output` notifications back to this backend's
+//! terminal.
 //!
 //! This backend's types are always compiled into the backend union so that
 //! switch exhaustiveness checks cover it. Actual usage (creating a tmux
@@ -24,9 +26,9 @@
 //! ## Threading
 //!
 //! The ControlWriter is invoked on the IO thread of the child surface.
-//! The implementation must be safe to call from this thread. In practice,
-//! the real ControlWriter (wired in Slice 2) will post commands to the
-//! parent terminal's write path, which requires cross-thread safety.
+//! The `ParentWriter` implementation posts write requests to the parent's
+//! SPSC termio mailbox. See `ParentWriter` doc comments for the full
+//! threading contract and the Slice 3 relay plan for cross-thread safety.
 const Tmux = @This();
 
 const std = @import("std");
@@ -52,12 +54,13 @@ screen_size: renderer.ScreenSize,
 
 /// The writer used to send commands to the tmux control mode connection.
 /// This is an interface so it can be mocked in tests and swapped for a
-/// real implementation when wired to the parent terminal.
+/// real implementation (see `ParentWriter`) when wired to the parent
+/// terminal.
 control_writer: ControlWriter,
 
 /// A writer interface for sending commands to a tmux control mode
-/// connection. The real implementation (Slice 2) will route commands
-/// through the parent terminal's write path.
+/// connection. Implementations include `ParentWriter` (routes through
+/// the parent terminal's termio mailbox) and test mocks.
 pub const ControlWriter = struct {
     /// Opaque context pointer, passed to writeFn on each call.
     context: *anyopaque,
@@ -78,6 +81,60 @@ pub const ControlWriter = struct {
     /// Send a command to tmux via the control connection.
     pub fn write(self: ControlWriter, data: []const u8) WriteError!void {
         return self.writeFn(self.context, data);
+    }
+};
+
+/// A ControlWriter implementation that routes tmux commands through
+/// the parent terminal's termio mailbox. This posts a write request
+/// into the parent's SPSC mailbox, which the parent's IO thread then
+/// writes to the pty (connected to `tmux -CC`).
+///
+/// ## Threading Contract
+///
+/// This writer is safe to call from the parent's IO thread (the same
+/// thread that runs the stream handler). This is the only context in
+/// which it is used in Slice 2: the `.command` viewer action already
+/// writes to the parent termio mailbox from the stream handler via
+/// the same `Mailbox.send` path.
+///
+/// For Slice 3, when child surfaces run on their own IO threads, the
+/// child will NOT call ParentWriter directly. Instead, the child will
+/// post a message through `apprt.surface.Mailbox` (which routes via
+/// the app thread), and the parent's surface will relay the command
+/// into its own termio mailbox. This preserves the SPSC invariant:
+/// the parent's IO thread remains the single producer.
+///
+/// ## Lifetime
+///
+/// The `mailbox` and `alloc` pointers must remain valid for the
+/// lifetime of this writer. In practice, the parent `Termio` owns
+/// both and outlives all child surfaces it creates.
+///
+/// ## Upstream Anchor
+///
+/// - `stream_handler.zig` `.command` handler (line 437-443): uses the
+///   same `Mailbox.send` path to write viewer commands to the parent pty.
+/// - `mailbox.zig`: SPSC send with renderer mutex handoff.
+pub const ParentWriter = struct {
+    mailbox: *termio.Mailbox,
+    alloc: Allocator,
+
+    /// The renderer state mutex, required by `Mailbox.send` for the
+    /// backpressure unlock path. See `mailbox.zig:60-91`.
+    mutex: *std.Thread.Mutex,
+
+    pub fn controlWriter(self: *ParentWriter) ControlWriter {
+        return .{
+            .context = @ptrCast(self),
+            .writeFn = &writeFn,
+        };
+    }
+
+    fn writeFn(context: *anyopaque, data: []const u8) ControlWriter.WriteError!void {
+        const self: *ParentWriter = @ptrCast(@alignCast(context));
+        const msg = termio.Message.writeReq(self.alloc, data) catch
+            return error.WriteFailed;
+        self.mailbox.send(msg, self.mutex);
     }
 };
 
@@ -551,4 +608,120 @@ test "digitCount" {
     try testing.expectEqual(@as(usize, 3), digitCount(100));
     try testing.expectEqual(@as(usize, 5), digitCount(12345));
     try testing.expectEqual(@as(usize, 5), digitCount(99999));
+}
+
+test "ParentWriter routes commands through mailbox" {
+    const alloc = testing.allocator;
+
+    // Create a real SPSC mailbox
+    var mailbox = try termio.Mailbox.initSPSC(alloc);
+    defer mailbox.deinit(alloc);
+
+    // ParentWriter does not need the mutex in tests (pass null to send).
+    var parent_writer = ParentWriter{
+        .mailbox = &mailbox,
+        .alloc = alloc,
+        .mutex = undefined, // Not used when queue has space
+    };
+    const writer = parent_writer.controlWriter();
+
+    // Write a command through the ParentWriter
+    try writer.write("list-windows\n");
+
+    // Verify the command was queued in the mailbox
+    const msg = mailbox.spsc.queue.pop() orelse {
+        return error.TestUnexpectedResult;
+    };
+
+    // The message should be a write_small or write_alloc depending on size.
+    // "list-windows\n" is 14 bytes, which fits in write_small.
+    const data = switch (msg) {
+        .write_small => |small| small.data[0..small.len],
+        .write_alloc => |a| a.data,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqualStrings("list-windows\n", data);
+
+    // Clean up alloc data if it was heap-allocated
+    switch (msg) {
+        .write_alloc => |a| a.alloc.free(a.data),
+        else => {},
+    }
+}
+
+test "ParentWriter handles large commands" {
+    const alloc = testing.allocator;
+
+    var mailbox = try termio.Mailbox.initSPSC(alloc);
+    defer mailbox.deinit(alloc);
+
+    var parent_writer = ParentWriter{
+        .mailbox = &mailbox,
+        .alloc = alloc,
+        .mutex = undefined,
+    };
+    const writer = parent_writer.controlWriter();
+
+    // Write a command larger than WriteReq.Small capacity (38 bytes)
+    const large_cmd = "send-keys -H -t %12345 41 42 43 44 45 46 47 48\n";
+    try writer.write(large_cmd);
+
+    const msg = mailbox.spsc.queue.pop() orelse {
+        return error.TestUnexpectedResult;
+    };
+
+    // Large command should use write_alloc
+    const data = switch (msg) {
+        .write_small => |small| small.data[0..small.len],
+        .write_alloc => |a| a.data,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqualStrings(large_cmd, data);
+
+    switch (msg) {
+        .write_alloc => |a| a.alloc.free(a.data),
+        else => {},
+    }
+}
+
+test "ParentWriter used as backend ControlWriter" {
+    // Verify that ParentWriter integrates with the Tmux backend:
+    // create a Tmux backend with a ParentWriter, call resize, and
+    // confirm the resize-pane command reaches the mailbox.
+    const alloc = testing.allocator;
+
+    var mailbox = try termio.Mailbox.initSPSC(alloc);
+    defer mailbox.deinit(alloc);
+
+    var parent_writer = ParentWriter{
+        .mailbox = &mailbox,
+        .alloc = alloc,
+        .mutex = undefined,
+    };
+
+    var tmux = Tmux.init(.{
+        .pane_id = 7,
+        .control_writer = parent_writer.controlWriter(),
+    });
+
+    try tmux.resize(
+        .{ .columns = 100, .rows = 30 },
+        .{ .width = 1000, .height = 600 },
+    );
+
+    const msg = mailbox.spsc.queue.pop() orelse {
+        return error.TestUnexpectedResult;
+    };
+
+    const data = switch (msg) {
+        .write_small => |small| small.data[0..small.len],
+        .write_alloc => |a| a.data,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqualStrings("resize-pane -t %7 -x 100 -y 30\n", data);
+
+    switch (msg) {
+        .write_alloc => |a| a.alloc.free(a.data),
+        else => {},
+    }
 }
