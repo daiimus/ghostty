@@ -2940,12 +2940,59 @@ const Action = struct {
 
                 .set_focus => |sf| {
                     log.debug("tmux reconcile: set_focus window={} pane={}", .{ sf.tmux_window_id, sf.pane_id });
-                    // TODO: Switch to the correct tab and focus the correct pane surface.
+
+                    // Activate the tab for this tmux window.
+                    if (window_map.get(sf.tmux_window_id)) |tab| {
+                        const tab_view = window.getTabView();
+                        const page = tab_view.getPage(tab.as(gtk.Widget));
+                        tab_view.setSelectedPage(page);
+                    } else {
+                        log.warn("tmux reconcile: set_focus for unknown window {}", .{sf.tmux_window_id});
+                    }
+
+                    // Focus the pane surface.
+                    if (pane_map.get(sf.pane_id)) |entry| {
+                        entry.surface.grabFocus();
+                    } else {
+                        log.warn("tmux reconcile: set_focus for unknown pane {}", .{sf.pane_id});
+                    }
                 },
 
                 .prune_absent => |pa| {
                     log.debug("tmux reconcile: prune_absent windows={} panes={}", .{ pa.window_ids.len, pa.pane_ids.len });
-                    // TODO: Close tabs/surfaces whose tmux IDs are not in the keep-set.
+
+                    const tab_view = window.getTabView();
+
+                    // Prune pane surfaces whose IDs are not in the keep-set.
+                    // pane_ids is sorted, so we can use binary search.
+                    var pane_iter = pane_map.iterator();
+                    while (pane_iter.next()) |entry| {
+                        if (std.sort.binarySearch(usize, entry.key_ptr.*, pa.pane_ids, {}, struct {
+                            fn cmp(_: void, needle: usize, probe: usize) std.math.Order {
+                                return std.math.order(needle, probe);
+                            }
+                        }.cmp) == null) {
+                            // Pane is absent — destroy its relay writer.
+                            alloc.destroy(entry.value_ptr.relay_writer);
+                            pane_map.removeByPtr(entry.key_ptr);
+                        }
+                    }
+
+                    // Prune tabs whose window IDs are not in the keep-set.
+                    var win_iter = window_map.iterator();
+                    while (win_iter.next()) |entry| {
+                        if (std.sort.binarySearch(usize, entry.key_ptr.*, pa.window_ids, {}, struct {
+                            fn cmp(_: void, needle: usize, probe: usize) std.math.Order {
+                                return std.math.order(needle, probe);
+                            }
+                        }.cmp) == null) {
+                            // Window is absent — close its tab.
+                            const tab = entry.value_ptr.*;
+                            const page = tab_view.getPage(tab.as(gtk.Widget));
+                            tab_view.closePage(page);
+                            window_map.removeByPtr(entry.key_ptr);
+                        }
+                    }
                 },
 
                 .sync_windows_end => {
