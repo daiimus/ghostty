@@ -1968,6 +1968,7 @@ pub const CAPI = struct {
         ptr: [*]const u8,
         len: usize,
     ) void {
+        assert(surface.usesExternalBackend());
         surface.core_surface.io.processOutput(ptr[0..len]);
     }
 

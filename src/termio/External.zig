@@ -148,8 +148,8 @@ pub fn focusGained(
     focused: bool,
 ) !void {
     _ = self;
-    _ = td;
     _ = focused;
+    assert(td.backend == .external);
     // External backend doesn't need to do anything special for focus
 }
 
@@ -196,7 +196,7 @@ pub fn queueWrite(
     linefeed: bool,
 ) !void {
     _ = alloc;
-    _ = td;
+    assert(td.backend == .external);
 
     // If we have a write callback, call it
     if (self.write_callback) |cb| {
