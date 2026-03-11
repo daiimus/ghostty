@@ -258,10 +258,13 @@ fn genTable() Table {
         // 0x80-0x9F also need overrides to prevent "anywhere" C1 transitions
         // from kicking the parser out of dcs_passthrough.
         //
-        // 0x9C (C1 ST) is NOT overridden — it is the legitimate 8-bit DCS
-        // string terminator and must still transition to ground.
-        range(&result, 0x80, 0x9B, source, source, .put);
-        range(&result, 0x9D, 0xFF, source, source, .put);
+        // 0x9C (C1 ST) is also overridden because it appears as a valid
+        // UTF-8 continuation byte (range 0x80-0xBF). Characters like
+        // Ŝ (U+015C → C5 9C), ɜ (U+025C → C9 9C), etc. would prematurely
+        // terminate the DCS if 0x9C were left as the 8-bit ST. DCS
+        // termination relies entirely on 7-bit ST (ESC \) via the
+        // pending_esc logic in dcs.zig.
+        range(&result, 0x80, 0xFF, source, source, .put);
     }
 
     // csi_param
@@ -450,11 +453,15 @@ test "dcs_passthrough: C1 0x9D (OSC) stays in dcs_passthrough with put" {
     try @import("std").testing.expectEqual(Action.put, entry.action);
 }
 
-test "dcs_passthrough: C1 ST (0x9C) still transitions to ground" {
+test "dcs_passthrough: C1 ST (0x9C) stays in dcs_passthrough with put" {
+    // 0x9C is overridden to stay in dcs_passthrough because it appears
+    // as a valid UTF-8 continuation byte (range 0x80-0xBF). Characters
+    // like Ŝ (U+015C → C5 9C) would prematurely terminate the DCS if
+    // 0x9C transitioned to ground. DCS termination uses 7-bit ST only.
     const t = table;
     const entry = t[0x9C][@intFromEnum(State.dcs_passthrough)];
-    try @import("std").testing.expectEqual(State.ground, entry.state);
-    try @import("std").testing.expectEqual(Action.none, entry.action);
+    try @import("std").testing.expectEqual(State.dcs_passthrough, entry.state);
+    try @import("std").testing.expectEqual(Action.put, entry.action);
 }
 
 test "dcs_passthrough: regular bytes still produce put" {

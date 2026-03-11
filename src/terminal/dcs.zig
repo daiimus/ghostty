@@ -132,8 +132,12 @@ pub const Handler = struct {
             }
 
             // Not ST: forward the stored ESC to the sub-handler first,
-            // then fall through to handle the current byte normally.
+            // then check if the current byte is also ESC (re-arm pending).
             if (self.forwardPut(0x1B)) |cmd| return cmd;
+            if (byte == 0x1B) {
+                self.pending_esc = true;
+                return null;
+            }
             return self.forwardPut(byte);
         }
 
@@ -601,4 +605,28 @@ test "pending_esc is cleared on hook" {
     // Clean up: unhook so deinit doesn't leak
     var cmd = h.unhook().?;
     cmd.deinit();
+}
+
+test "double-ESC followed by backslash terminates DCS" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Use XTGETTCAP as a simple DCS to test with
+    var h: Handler = .{};
+    defer h.deinit();
+    try testing.expect(h.hook(alloc, .{ .intermediates = "+", .final = 'q' }) == null);
+
+    // Put some data
+    for ("AB") |byte| _ = h.put(byte);
+
+    // Send ESC ESC \ — the second ESC should re-arm pending_esc,
+    // and the backslash should terminate the DCS via 7-bit ST.
+    try testing.expect(h.put(0x1B) == null); // First ESC buffered
+    try testing.expect(h.put(0x1B) == null); // Second ESC: forward first ESC, re-arm pending
+    var cmd = h.put(0x5C); // Backslash: ESC \ = 7-bit ST → terminates DCS
+    try testing.expect(cmd != null);
+    try testing.expect(cmd.? == .xtgettcap);
+    // Buffer should contain: "AB" + ESC (the first one that was forwarded)
+    try testing.expectEqualStrings("AB\x1b", cmd.?.xtgettcap.next().?);
+    cmd.?.deinit();
 }
