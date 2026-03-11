@@ -468,7 +468,7 @@ pub const StreamHandler = struct {
                             // this handler is where Ghostty would diff the
                             // prior state and create/destroy surfaces.
                             for (windows) |window| {
-                                log.info("tmux window id={} size={}x{}", .{
+                                log.debug("tmux window id={} size={}x{}", .{
                                     window.id,
                                     window.width,
                                     window.height,
@@ -1573,7 +1573,7 @@ pub const StreamHandler = struct {
     fn logPaneIds(layout: terminal.tmux.Layout) void {
         switch (layout.content) {
             .pane => |pane_id| {
-                log.info("tmux pane id={} pos={}x{}+{}+{}", .{
+                log.debug("tmux pane id={} pos={}x{}+{}+{}", .{
                     pane_id,
                     layout.width,
                     layout.height,

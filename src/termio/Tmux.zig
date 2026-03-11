@@ -621,7 +621,8 @@ test "ParentWriter routes commands through mailbox" {
     var parent_writer = ParentWriter{
         .mailbox = &mailbox,
         .alloc = alloc,
-        .mutex = undefined, // Not used when queue has space
+        // Mutex is unused: the queue is empty so send() takes the fast path (instant push).
+        .mutex = undefined,
     };
     const writer = parent_writer.controlWriter();
 
@@ -658,6 +659,7 @@ test "ParentWriter handles large commands" {
     var parent_writer = ParentWriter{
         .mailbox = &mailbox,
         .alloc = alloc,
+        // Mutex is unused: the queue is empty so send() takes the fast path (instant push).
         .mutex = undefined,
     };
     const writer = parent_writer.controlWriter();
@@ -696,6 +698,7 @@ test "ParentWriter used as backend ControlWriter" {
     var parent_writer = ParentWriter{
         .mailbox = &mailbox,
         .alloc = alloc,
+        // Mutex is unused: the queue is empty so send() takes the fast path (instant push).
         .mutex = undefined,
     };
 
