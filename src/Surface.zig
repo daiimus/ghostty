@@ -839,6 +839,56 @@ pub fn deinit(self: *Surface) void {
         self.io_thr.join();
     }
 
+    // Source-side: if this surface owns a tmux viewer with observers,
+    // forcibly detach all TARGET observers BEFORE freeing our io/terminal
+    // state. After our threads are stopped, no IO thread is iterating the
+    // observer list, so we can safely access it without the observer-list
+    // lock. However, target renderer threads may still be actively
+    // rendering with the shared mutex and pane terminals, so we must
+    // synchronize:
+    //
+    // Phase 1: Lock our mutex → restore all target terminals to their
+    //   originals → unlock. Any target renderer that was waiting on the
+    //   mutex will wake up and harmlessly use its own terminal.
+    //
+    // Phase 2: Atomically swap each target's mutex pointer back to its
+    //   original, and null its tmux_pane_binding. After this, each
+    //   target is fully independent again.
+    //
+    // We skip our own observer (the source surface may register itself
+    // as an observer for its active pane) since we're about to be freed.
+    {
+        const handler = &self.io.terminal_stream.handler;
+        if (comptime @TypeOf(handler.*).tmux_enabled) {
+            const observers = handler.tmux_observers.items;
+            if (observers.len > 0) {
+                // Phase 1: restore terminals and clear bindings under
+                // the shared lock, so any renderer waking on this mutex
+                // sees consistent state (own terminal, no binding).
+                self.renderer_state.mutex.lock();
+                for (observers) |obs| {
+                    if (obs.target_state == &self.renderer_state) continue;
+                    obs.target_state.terminal = obs.original_terminal;
+                    const target: *Surface = @alignCast(@fieldParentPtr("renderer_state", obs.target_state));
+                    target.tmux_pane_binding = null;
+                }
+                self.renderer_state.mutex.unlock();
+
+                // Phase 2: swap mutex pointers back to originals.
+                for (observers) |obs| {
+                    if (obs.target_state == &self.renderer_state) continue;
+                    @atomicStore(
+                        *std.Thread.Mutex,
+                        &obs.target_state.mutex,
+                        obs.original_mutex,
+                        .release,
+                    );
+                }
+                handler.tmux_observers.clearRetainingCapacity();
+            }
+        }
+    }
+
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
     self.renderer_thread.deinit();
@@ -854,19 +904,28 @@ pub fn deinit(self: *Surface) void {
     // If this surface was a tmux pane observer, restore the original
     // mutex and terminal pointer before cleanup. We must also unregister
     // from the source's observer list so it doesn't try to fix up a dangling
-    // pointer to our renderer_state. The renderer thread is already
-    // stopped at this point so we don't need mutex protection.
+    // pointer to our renderer_state. Our own threads are stopped, but the
+    // SOURCE's IO thread may still be iterating the observer list (e.g.,
+    // in wakeTmuxObservers or fixupTmuxObservers) under renderer_state.mutex.
+    // Since our renderer_state.mutex currently points to the source's mutex,
+    // we must acquire it to synchronize with the source's IO thread.
     if (self.tmux_pane_binding) |binding| {
-        // Unregister from the stream handler's observer list (best-effort).
+        // Lock the shared mutex (source's mutex) to synchronize with
+        // the source's IO thread that accesses the observer list.
+        self.renderer_state.mutex.lock();
+
+        // Unregister from the stream handler's observer list.
         const handler = &binding.source.io.terminal_stream.handler;
         if (comptime @TypeOf(handler.*).tmux_enabled) {
             handler.unregisterTmuxObserver(binding.pane_id, &self.renderer_state.terminal);
         }
 
-        // Restore the original state so deinit below frees the
-        // correct mutex (our own, not the shared source mutex).
-        self.renderer_state.mutex = binding.original_mutex;
+        // Restore the original terminal pointer while holding the lock.
         self.renderer_state.terminal = binding.original_terminal;
+
+        // Unlock the shared mutex, then restore our own mutex pointer.
+        self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex = binding.original_mutex;
         self.tmux_pane_binding = null;
     }
 

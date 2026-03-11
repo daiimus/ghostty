@@ -76,8 +76,8 @@ pub const StreamHandler = struct {
     /// Observer surfaces whose renderer_state.terminal pointers must be
     /// kept in sync when the viewer's pane map is rebuilt. Each observer
     /// is bound to a specific pane_id. Management lives here (not in the
-    /// viewer) because observers are a fork-specific concept for iOS
-    /// multi-pane rendering — keeping them out of the viewer lets the
+    /// viewer) because observers are an extended notification concept for
+    /// iOS multi-pane rendering — keeping them out of the viewer lets the
     /// viewer stay aligned with upstream.
     tmux_observers: if (tmux_enabled) ObserverList else void = if (tmux_enabled) .empty else {},
 
@@ -113,11 +113,23 @@ pub const StreamHandler = struct {
     /// when the viewer's pane map is reallocated. On iOS (where there is
     /// no display link), the notify_cb allows explicit wakeup of the
     /// observer's renderer thread after new output arrives.
+    ///
+    /// The observer also stores the target's original mutex and terminal
+    /// pointers along with a reference to its renderer_state, so the source
+    /// can forcibly restore all observers during its own deinit (preventing
+    /// dangling pointers when the source is destroyed before its observers).
     pub const Observer = struct {
         pane_id: usize,
         terminal_ptr: **terminal.Terminal,
         notify_cb: ?NotifyCallback = null,
         notify_ud: ?*anyopaque = null,
+
+        /// The target's renderer_state, so we can restore mutex + terminal.
+        target_state: *renderer.State = undefined,
+        /// The target's original mutex (before attach replaced it).
+        original_mutex: *std.Thread.Mutex = undefined,
+        /// The target's original terminal (before attach replaced it).
+        original_terminal: *terminal.Terminal = undefined,
 
         pub const NotifyCallback = *const fn (ud: ?*anyopaque) void;
     };
@@ -151,6 +163,9 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         pane_id: usize,
         terminal_ptr: **terminal.Terminal,
+        target_state: *renderer.State,
+        original_mutex: *std.Thread.Mutex,
+        original_terminal: *terminal.Terminal,
         notify_cb: ?Observer.NotifyCallback,
         notify_ud: ?*anyopaque,
     ) bool {
@@ -172,6 +187,9 @@ pub const StreamHandler = struct {
             .terminal_ptr = terminal_ptr,
             .notify_cb = notify_cb,
             .notify_ud = notify_ud,
+            .target_state = target_state,
+            .original_mutex = original_mutex,
+            .original_terminal = original_terminal,
         }) catch return false;
 
         return true;

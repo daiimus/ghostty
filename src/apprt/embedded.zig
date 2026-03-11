@@ -2076,6 +2076,9 @@ pub const CAPI = struct {
         const registered = handler.registerTmuxObserver(
             pane_id,
             &surface.core_surface.renderer_state.terminal,
+            &surface.core_surface.renderer_state,
+            surface.core_surface.renderer_state.mutex,
+            prev_terminal,
             observerWakeup,
             @ptrCast(&surface.core_surface.renderer_thread.wakeup),
         );
@@ -2366,7 +2369,11 @@ pub const CAPI = struct {
         };
 
         // Replace target's renderer state with shared mutex + pane terminal.
-        target.core_surface.renderer_state.mutex = source.core_surface.renderer_state.mutex;
+        // Use @atomicStore for the mutex pointer swap to ensure the target's
+        // renderer thread sees the new mutex pointer atomically. The terminal
+        // pointer swap is safe under the held lock (the renderer reads it
+        // only while holding the mutex).
+        @atomicStore(*std.Thread.Mutex, &target.core_surface.renderer_state.mutex, source.core_surface.renderer_state.mutex, .release);
         target.core_surface.renderer_state.terminal = &pane.terminal;
         target.core_surface.tmux_pane_binding = binding;
 
@@ -2377,6 +2384,9 @@ pub const CAPI = struct {
         if (!handler.registerTmuxObserver(
             pane_id,
             &target.core_surface.renderer_state.terminal,
+            &target.core_surface.renderer_state,
+            binding.original_mutex,
+            binding.original_terminal,
             observerWakeup,
             @ptrCast(&target.core_surface.renderer_thread.wakeup),
         )) {
@@ -2416,31 +2426,26 @@ pub const CAPI = struct {
             handler.unregisterTmuxObserver(binding.pane_id, &target.core_surface.renderer_state.terminal);
         }
 
-        // Restore original terminal before restoring the mutex, while
-        // we still hold the shared lock.
+        // Restore original terminal and null the binding while we still
+        // hold the shared lock. This ensures any thread that acquires the
+        // shared mutex sees consistent state (own terminal, no binding).
         target.core_surface.renderer_state.terminal = binding.original_terminal;
+        target.core_surface.tmux_pane_binding = null;
 
         // Now restore the original mutex pointer. We must unlock the shared
-        // mutex (which we currently hold) and then reassign the pointer field.
-        // The brief moment between unlock and pointer assignment is safe because:
+        // mutex first, then atomically swap the pointer. The window between
+        // unlock and swap is safe because:
         //
-        // 1. The renderer thread may try to lock the old (shared) mutex,
-        //    which was just unlocked — it will acquire it harmlessly and
-        //    release immediately (no shared state depends on it anymore
-        //    since we already restored the terminal pointer above).
+        // 1. The renderer may lock the old (shared) mutex, but terminal
+        //    and binding are already restored — it renders the correct
+        //    (original) terminal harmlessly.
         //
-        // 2. We use @atomicStore to make the pointer swap visible to other
-        //    threads under Zig's memory model. The renderer thread reads
-        //    this field without @atomicLoad, but the subsequent .lock()
-        //    call is itself a synchronization point (acquire fence), so
-        //    the renderer always sees the fully-initialized mutex object
-        //    regardless of which pointer value it reads.
-        //
-        // 3. The tmux_pane_binding = null below ensures subsequent render
-        //    cycles use the surface's own terminal, not the shared pane.
+        // 2. @atomicStore with .release ensures the pointer swap is
+        //    visible to other threads. The renderer's subsequent .lock()
+        //    provides an acquire fence, so it always sees a fully-
+        //    initialized mutex object regardless of which pointer it reads.
         target.core_surface.renderer_state.mutex.unlock();
         @atomicStore(*std.Thread.Mutex, &target.core_surface.renderer_state.mutex, binding.original_mutex, .release);
-        target.core_surface.tmux_pane_binding = null;
 
         // Wake the target's renderer to redraw with its own terminal.
         target.core_surface.renderer_thread.wakeup.notify() catch {};
