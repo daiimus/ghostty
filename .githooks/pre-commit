@@ -1,0 +1,55 @@
+#!/bin/bash
+#
+# Pre-commit hook: block compiled artifacts and large files.
+# Lighter version for the Ghostty fork — most output is already gitignored.
+#
+# Install: git config core.hooksPath .githooks
+# Override: git commit --no-verify
+
+set -euo pipefail
+
+MAX_FILE_SIZE=$((8 * 1024 * 1024))  # 8 MB
+
+FORBIDDEN_EXTENSIONS=(
+    "\.a$"
+    "\.o$"
+    "\.dylib$"
+    "\.xcframework/"
+    "\.app$"
+    "\.dSYM$"
+)
+
+ERRORS=0
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=d 2>/dev/null || true)
+
+if [ -z "$STAGED_FILES" ]; then
+    exit 0
+fi
+
+for pattern in "${FORBIDDEN_EXTENSIONS[@]}"; do
+    MATCHES=$(echo "$STAGED_FILES" | grep -iE "$pattern" || true)
+    if [ -n "$MATCHES" ]; then
+        echo "BLOCKED: Build artifact staged:"
+        echo "$MATCHES" | sed 's/^/  /'
+        echo "  Fix: git reset HEAD <file>"
+        ERRORS=$((ERRORS + 1))
+    fi
+done
+
+while IFS= read -r file; do
+    if [ -f "$file" ]; then
+        FILE_SIZE=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+        if [ "$FILE_SIZE" -gt "$MAX_FILE_SIZE" ]; then
+            SIZE_MB=$(echo "scale=1; $FILE_SIZE / 1048576" | bc)
+            echo "BLOCKED: File exceeds limit (${SIZE_MB} MB): $file"
+            echo "  Fix: git reset HEAD $file"
+            ERRORS=$((ERRORS + 1))
+        fi
+    fi
+done <<< "$STAGED_FILES"
+
+if [ "$ERRORS" -gt 0 ]; then
+    echo "Commit blocked: $ERRORS violation(s). Use --no-verify to override."
+    exit 1
+fi

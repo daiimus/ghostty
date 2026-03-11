@@ -26,3 +26,9 @@ glad.zip
 
 vgcore.*
 
+# iOS/xcframework build output (fork-specific)
+macos/GhosttyKit.xcframework/
+*.a
+*.dSYM/
+DerivedData/
+
