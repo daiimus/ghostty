@@ -785,7 +785,7 @@ pub const StreamHandler = struct {
                     }
                 }
 
-                // Handle fork-specific surface notifications directly from
+                // Handle extended tmux notifications directly from
                 // the raw control notification, without going through the
                 // viewer's Action enum. The viewer treats these as no-ops
                 // (matching upstream), while we track GUI state here.

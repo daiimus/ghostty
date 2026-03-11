@@ -240,7 +240,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
     var term = try terminalpkg.Terminal.init(alloc, opts: {
         const grid_size = opts.size.grid();
         const scrollback_limit = opts.full_config.@"scrollback-limit";
-        log.err("ios_termio: Creating terminal with max_scrollback={d}, rows={d}, cols={d}", .{
+        log.debug("ios_termio: Creating terminal with max_scrollback={d}, rows={d}, cols={d}", .{
             scrollback_limit,
             grid_size.rows,
             grid_size.columns,
