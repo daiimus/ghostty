@@ -3269,3 +3269,137 @@ fn findActiveWindow(data: ?*const anyopaque, _: ?*const anyopaque) callconv(.c) 
     // Abusing integers to be enums and booleans is a terrible idea, C.
     return if (window.isActive() != 0) 0 else -1;
 }
+
+// --- Tests ---
+
+const testing = std.testing;
+
+test "countTreeNodes: single pane" {
+    const layout: terminal.tmux.Layout = .{
+        .width = 80,
+        .height = 24,
+        .x = 0,
+        .y = 0,
+        .content = .{ .pane = 1 },
+    };
+    try testing.expectEqual(@as(usize, 1), Action.countTreeNodes(layout));
+}
+
+test "countTreeNodes: horizontal split two panes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // 80x24,0,0{40x24,0,0,1,40x24,40,0,2}
+    const layout: terminal.tmux.Layout = try .parse(arena.allocator(), "80x24,0,0{40x24,0,0,1,40x24,40,0,2}");
+    // Binary: split(leaf, leaf) = 1 split + 2 leaves = 3 nodes
+    try testing.expectEqual(@as(usize, 3), Action.countTreeNodes(layout));
+}
+
+test "countTreeNodes: vertical split two panes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const layout: terminal.tmux.Layout = try .parse(arena.allocator(), "80x24,0,0[80x12,0,0,1,80x12,0,12,2]");
+    try testing.expectEqual(@as(usize, 3), Action.countTreeNodes(layout));
+}
+
+test "countTreeNodes: three-way horizontal split" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // 80x24,0,0{27x24,0,0,1,26x24,28,0,2,26x24,55,0,3}
+    const layout: terminal.tmux.Layout = try .parse(
+        arena.allocator(),
+        "80x24,0,0{27x24,0,0,1,26x24,28,0,2,26x24,55,0,3}",
+    );
+    // N-ary with 3 children → 2 split nodes + 3 leaves = 5
+    try testing.expectEqual(@as(usize, 5), Action.countTreeNodes(layout));
+}
+
+test "countTreeNodes: nested layout" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // 80x24,0,0{40x24,0,0,1,40x24,40,0[40x12,40,0,2,40x12,40,12,3]}
+    const layout: terminal.tmux.Layout = try .parse(
+        arena.allocator(),
+        "80x24,0,0{40x24,0,0,1,40x24,40,0[40x12,40,0,2,40x12,40,12,3]}",
+    );
+    // Outer horizontal: split(leaf=1, vertical_split(leaf=2, leaf=3))
+    // = 1 outer split + 1 leaf + 1 inner split + 2 leaves = 5
+    try testing.expectEqual(@as(usize, 5), Action.countTreeNodes(layout));
+}
+
+test "countChildrenNodes: empty children" {
+    const empty: []const terminal.tmux.Layout = &.{};
+    try testing.expectEqual(@as(usize, 0), Action.countChildrenNodes(empty));
+}
+
+test "countChildrenNodes: single child pane" {
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 80, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+    };
+    try testing.expectEqual(@as(usize, 1), Action.countChildrenNodes(children));
+}
+
+test "computeSplitRatio: equal horizontal split" {
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 40, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+        .{ .width = 40, .height = 24, .x = 40, .y = 0, .content = .{ .pane = 2 } },
+    };
+    const ratio = Action.computeSplitRatio(.horizontal, children);
+    try testing.expectEqual(@as(f16, 0.5), ratio);
+}
+
+test "computeSplitRatio: unequal horizontal split" {
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 60, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+        .{ .width = 20, .height = 24, .x = 60, .y = 0, .content = .{ .pane = 2 } },
+    };
+    const ratio = Action.computeSplitRatio(.horizontal, children);
+    try testing.expectEqual(@as(f16, 0.75), ratio);
+}
+
+test "computeSplitRatio: equal vertical split" {
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 80, .height = 12, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+        .{ .width = 80, .height = 12, .x = 0, .y = 12, .content = .{ .pane = 2 } },
+    };
+    const ratio = Action.computeSplitRatio(.vertical, children);
+    try testing.expectEqual(@as(f16, 0.5), ratio);
+}
+
+test "computeSplitRatio: three-way split uses first child ratio" {
+    // With three children [27, 26, 26], first ratio = 27/79
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 27, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+        .{ .width = 26, .height = 24, .x = 28, .y = 0, .content = .{ .pane = 2 } },
+        .{ .width = 26, .height = 24, .x = 55, .y = 0, .content = .{ .pane = 3 } },
+    };
+    const ratio = Action.computeSplitRatio(.horizontal, children);
+    const expected: f16 = @floatCast(@as(f64, 27.0) / @as(f64, 79.0));
+    try testing.expectEqual(expected, ratio);
+}
+
+test "computeSplitRatio: single child returns 0.5" {
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 80, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+    };
+    const ratio = Action.computeSplitRatio(.horizontal, children);
+    try testing.expectEqual(@as(f16, 0.5), ratio);
+}
+
+test "computeSplitRatio: empty children returns 0.5" {
+    const empty: []const terminal.tmux.Layout = &.{};
+    const ratio = Action.computeSplitRatio(.horizontal, empty);
+    try testing.expectEqual(@as(f16, 0.5), ratio);
+}
+
+test "computeSplitRatio: zero dimension returns 0.5" {
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 0, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+        .{ .width = 0, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 2 } },
+    };
+    const ratio = Action.computeSplitRatio(.horizontal, children);
+    try testing.expectEqual(@as(f16, 0.5), ratio);
+}
