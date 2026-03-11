@@ -1590,4 +1590,91 @@ pub const StreamHandler = struct {
             },
         }
     }
+
+    test "logPaneIds walks single leaf pane" {
+        // Base case: a single pane with no children. Verifies
+        // the function handles leaf nodes without crashing.
+        const layout: terminal.tmux.Layout = .{
+            .width = 80,
+            .height = 24,
+            .x = 0,
+            .y = 0,
+            .content = .{ .pane = 1 },
+        };
+        logPaneIds(layout);
+    }
+
+    test "logPaneIds walks horizontal split" {
+        // Two panes in a horizontal split. Verifies recursion
+        // into .horizontal children.
+        const children = [_]terminal.tmux.Layout{
+            .{
+                .width = 40,
+                .height = 24,
+                .x = 0,
+                .y = 0,
+                .content = .{ .pane = 1 },
+            },
+            .{
+                .width = 40,
+                .height = 24,
+                .x = 40,
+                .y = 0,
+                .content = .{ .pane = 2 },
+            },
+        };
+        const layout: terminal.tmux.Layout = .{
+            .width = 80,
+            .height = 24,
+            .x = 0,
+            .y = 0,
+            .content = .{ .horizontal = &children },
+        };
+        logPaneIds(layout);
+    }
+
+    test "logPaneIds walks nested layout tree" {
+        // A horizontal split where the right child is a vertical
+        // split of two panes. Exercises deeper recursion.
+        const right_children = [_]terminal.tmux.Layout{
+            .{
+                .width = 40,
+                .height = 12,
+                .x = 40,
+                .y = 0,
+                .content = .{ .pane = 2 },
+            },
+            .{
+                .width = 40,
+                .height = 12,
+                .x = 40,
+                .y = 12,
+                .content = .{ .pane = 3 },
+            },
+        };
+        const children = [_]terminal.tmux.Layout{
+            .{
+                .width = 40,
+                .height = 24,
+                .x = 0,
+                .y = 0,
+                .content = .{ .pane = 1 },
+            },
+            .{
+                .width = 40,
+                .height = 24,
+                .x = 40,
+                .y = 0,
+                .content = .{ .vertical = &right_children },
+            },
+        };
+        const layout: terminal.tmux.Layout = .{
+            .width = 80,
+            .height = 24,
+            .x = 0,
+            .y = 0,
+            .content = .{ .horizontal = &children },
+        };
+        logPaneIds(layout);
+    }
 };
