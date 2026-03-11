@@ -1452,6 +1452,41 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{ .payload = payload },
             );
         },
+
+        .tmux_write_command => |w| {
+            // A tmux child pane relayed a command to this (parent) surface.
+            // Forward it into our termio mailbox so the parent IO thread
+            // writes it to the pty connected to `tmux -CC`.
+            //
+            // This is the SPSC-safe relay endpoint: the child IO thread
+            // posted this message through the app mailbox targeting our
+            // surface. We (the app thread) are the only thread calling
+            // queueIo, which calls mailbox.send — making the app thread
+            // the single producer for this surface's termio mailbox from
+            // outside the IO thread.
+            //
+            // Upstream anchor: same pattern as `report_title` handler
+            // which calls queueIo with write data.
+            // Surface WriteReq.Small holds up to 255 bytes but termio
+            // WriteReq.Small holds only 38. Use writeReq() to handle
+            // the size decision for the small case; stable and alloc
+            // map directly since their layouts are compatible.
+            const io_msg: termio.Message = switch (w) {
+                .small => |v| termio.Message.writeReq(
+                    self.alloc,
+                    v.data[0..v.len],
+                ) catch |err| {
+                    log.warn("tmux relay alloc failed: {}", .{err});
+                    return;
+                },
+                .stable => |v| .{ .write_stable = v },
+                .alloc => |v| .{ .write_alloc = .{
+                    .alloc = v.alloc,
+                    .data = v.data,
+                } },
+            };
+            self.queueIo(io_msg, .unlocked);
+        },
     }
 }
 
