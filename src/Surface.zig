@@ -1149,6 +1149,11 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{ .selected = v },
             );
         },
+
+        .tmux_topology_changed => |snapshot| {
+            defer snapshot.deinit();
+            log.debug("tmux topology changed: {} windows", .{snapshot.windows.len});
+        },
     }
 }
 
