@@ -510,10 +510,19 @@ fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !vo
     // a simple linear search here.
     if (self.hasSurface(surface)) {
         try surface.handleMessage(msg);
+        return;
     }
 
-    // Window was not found, it probably quit before we handled the message.
-    // Not a problem.
+    // Surface was not found — it probably quit before we handled the
+    // message. Free any heap-owning tmux payloads that would otherwise
+    // leak. Upstream messages are either value types or stable pointers
+    // that don't need cleanup here.
+    switch (msg) {
+        .tmux_topology_changed => |snapshot| snapshot.deinit(),
+        .tmux_write_command => |w| w.deinit(),
+        .tmux_pane_output => |po| po.data.deinit(),
+        else => {},
+    }
 }
 
 fn hasSurface(self: *const App, surface: *const Surface) bool {
