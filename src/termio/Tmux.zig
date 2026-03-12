@@ -484,6 +484,22 @@ const TestControlWriter = struct {
     }
 };
 
+/// A test mock for ControlWriter that always returns ConnectionClosed.
+/// Used to verify that callers handle write failures gracefully without
+/// corrupting internal state.
+const FailingControlWriter = struct {
+    fn controlWriter() ControlWriter {
+        return .{
+            .context = undefined,
+            .writeFn = &writeFn,
+        };
+    }
+
+    fn writeFn(_: *anyopaque, _: []const u8) ControlWriter.WriteError!void {
+        return error.ConnectionClosed;
+    }
+};
+
 /// Create a minimal Termio.ThreadData with .tmux backend for testing.
 /// Only the `backend` field is meaningfully set; other fields are
 /// undefined since the tmux backend does not access them in queueWrite.
@@ -547,6 +563,104 @@ test "resize with large pane_id" {
     );
 
     try testing.expectEqualStrings("resize-pane -t %12345 -x 120 -y 40\n", writer.lastCommand().?);
+}
+
+test "resize consecutive calls track latest dimensions" {
+    // Verify that multiple resize calls correctly update internal state
+    // and emit one command per call. The coalesce timer in Thread.zig
+    // handles deduplication at the IO thread level — the backend itself
+    // must faithfully emit every resize it receives.
+    const alloc = testing.allocator;
+    var writer = TestControlWriter.init(alloc);
+    defer writer.deinit();
+
+    var tmux = Tmux.init(.{
+        .pane_id = 3,
+        .control_writer = writer.controlWriter(),
+    });
+
+    // First resize
+    try tmux.resize(
+        .{ .columns = 80, .rows = 24 },
+        .{ .width = 800, .height = 480 },
+    );
+    // Second resize (window grew)
+    try tmux.resize(
+        .{ .columns = 120, .rows = 40 },
+        .{ .width = 1200, .height = 800 },
+    );
+    // Third resize (window shrunk)
+    try tmux.resize(
+        .{ .columns = 60, .rows = 15 },
+        .{ .width = 600, .height = 300 },
+    );
+
+    // All three commands must have been emitted
+    try testing.expectEqual(@as(usize, 3), writer.commands.items.len);
+    try testing.expectEqualStrings("resize-pane -t %3 -x 80 -y 24\n", writer.commands.items[0]);
+    try testing.expectEqualStrings("resize-pane -t %3 -x 120 -y 40\n", writer.commands.items[1]);
+    try testing.expectEqualStrings("resize-pane -t %3 -x 60 -y 15\n", writer.commands.items[2]);
+
+    // Internal state must reflect the latest resize
+    try testing.expectEqual(@as(renderer.GridSize.Unit, 60), tmux.grid_size.columns);
+    try testing.expectEqual(@as(renderer.GridSize.Unit, 15), tmux.grid_size.rows);
+    try testing.expectEqual(@as(u32, 600), tmux.screen_size.width);
+    try testing.expectEqual(@as(u32, 300), tmux.screen_size.height);
+}
+
+test "resize updates state even when control writer fails" {
+    // The resize method updates grid_size and screen_size before
+    // attempting the control_writer.write call. This ensures local
+    // state remains consistent even if the control connection is dead.
+    var tmux = Tmux.init(.{
+        .pane_id = 99,
+        .control_writer = FailingControlWriter.controlWriter(),
+    });
+
+    // Verify initial state is zero
+    try testing.expectEqual(@as(renderer.GridSize.Unit, 0), tmux.grid_size.columns);
+    try testing.expectEqual(@as(renderer.GridSize.Unit, 0), tmux.grid_size.rows);
+
+    // resize should propagate the ConnectionClosed error
+    try testing.expectError(error.ConnectionClosed, tmux.resize(
+        .{ .columns = 100, .rows = 50 },
+        .{ .width = 1000, .height = 500 },
+    ));
+
+    // But state must still be updated (write happens after state update)
+    try testing.expectEqual(@as(renderer.GridSize.Unit, 100), tmux.grid_size.columns);
+    try testing.expectEqual(@as(renderer.GridSize.Unit, 50), tmux.grid_size.rows);
+    try testing.expectEqual(@as(u32, 1000), tmux.screen_size.width);
+    try testing.expectEqual(@as(u32, 500), tmux.screen_size.height);
+}
+
+test "resize tracks screen_size alongside grid_size" {
+    // Verify that screen_size (pixel dimensions) is tracked alongside
+    // grid_size (cell dimensions). Both are needed: grid_size for the
+    // resize-pane command, screen_size for pixel-level state in
+    // Termio.resize (terminal.width_px / height_px).
+    const alloc = testing.allocator;
+    var writer = TestControlWriter.init(alloc);
+    defer writer.deinit();
+
+    var tmux = Tmux.init(.{
+        .pane_id = 1,
+        .control_writer = writer.controlWriter(),
+    });
+
+    try tmux.resize(
+        .{ .columns = 132, .rows = 43 },
+        .{ .width = 1584, .height = 774 },
+    );
+
+    // Grid size
+    try testing.expectEqual(@as(renderer.GridSize.Unit, 132), tmux.grid_size.columns);
+    try testing.expectEqual(@as(renderer.GridSize.Unit, 43), tmux.grid_size.rows);
+    // Screen size (pixel dimensions)
+    try testing.expectEqual(@as(u32, 1584), tmux.screen_size.width);
+    try testing.expectEqual(@as(u32, 774), tmux.screen_size.height);
+    // Command uses grid dimensions, not pixel dimensions
+    try testing.expectEqualStrings("resize-pane -t %1 -x 132 -y 43\n", writer.lastCommand().?);
 }
 
 test "queueWrite formats send-keys with hex encoding" {
