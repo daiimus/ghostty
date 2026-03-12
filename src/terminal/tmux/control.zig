@@ -29,7 +29,7 @@ pub const Parser = struct {
     /// exited and future data dropped).
     max_bytes: usize = 1024 * 1024,
 
-    const State = enum {
+    const State = union(enum) {
         /// Outside of any active notifications. This should drop any output
         /// unless it is '%' on the first byte of a line. The buffer will be
         /// cleared when it sees '%', this is so that the previous notification
@@ -44,8 +44,22 @@ pub const Parser = struct {
         /// Inside an active notification (started with '%').
         notification,
 
-        /// Inside a begin/end block.
-        block,
+        /// Inside a begin/end block. Carries the guard tokens from the
+        /// opening %begin line for matching against %end/%error.
+        block: Guard,
+    };
+
+    /// Guard tokens from a %begin line (the "time cmd-number flags" suffix),
+    /// stored for matching against the corresponding %end/%error terminator.
+    /// Without this, payload lines starting with %end or %error prematurely
+    /// terminate the block (ghostty-org/ghostty#11395).
+    const Guard = struct {
+        buf: [64]u8 = undefined,
+        len: u8 = 0,
+
+        fn eql(self: Guard, other: []const u8) bool {
+            return std.mem.eql(u8, self.buf[0..self.len], other);
+        }
     };
 
     pub fn deinit(self: *Parser) void {
@@ -107,28 +121,45 @@ pub const Parser = struct {
 
             // If we're in a block then we accumulate until we see a newline
             // and then we check to see if that line ended the block.
-            .block => if (byte == '\n') {
+            .block => |guard| if (byte == '\n') {
                 const written = self.buffer.written();
                 const idx = if (std.mem.lastIndexOfScalar(
                     u8,
                     written,
                     '\n',
                 )) |v| v + 1 else 0;
-                const line = written[idx..];
+                const raw_line = written[idx..];
 
-                if (std.mem.startsWith(u8, line, "%end") or
-                    std.mem.startsWith(u8, line, "%error"))
-                {
-                    const err = std.mem.startsWith(u8, line, "%error");
+                // Strip trailing \r for consistent comparison with guard
+                // tokens, which were stored after \r stripping.
+                const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
+                    raw_line[0 .. raw_line.len - 1]
+                else
+                    raw_line;
+
+                // Match the full guard-line format to determine block
+                // termination. A line must match "%end <guard>" or
+                // "%error <guard>" exactly — a prefix match alone is not
+                // sufficient because payload content can start with
+                // %end or %error (ghostty-org/ghostty#11395).
+                const is_end = blk: {
+                    if (guard.len == 0) break :blk std.mem.eql(u8, line, "%end");
+                    break :blk std.mem.startsWith(u8, line, "%end ") and guard.eql(line["%end ".len..]);
+                };
+                const is_err = blk: {
+                    if (guard.len == 0) break :blk std.mem.eql(u8, line, "%error");
+                    break :blk std.mem.startsWith(u8, line, "%error ") and guard.eql(line["%error ".len..]);
+                };
+
+                if (is_end or is_err) {
                     const output = std.mem.trimRight(u8, written[0..idx], "\r\n");
 
-                    // If it is an error then log it.
-                    if (err) log.warn("tmux control mode error={s}", .{output});
+                    if (is_err) log.warn("tmux control mode error={s}", .{output});
 
                     // Important: do not clear buffer since the notification
                     // contains it.
                     self.state = .idle;
-                    return if (err) .{ .block_err = output } else .{ .block_end = output };
+                    return if (is_err) .{ .block_err = output } else .{ .block_end = output };
                 }
 
                 // Didn't end the block, continue accumulating.
@@ -160,15 +191,20 @@ pub const Parser = struct {
         // The notification MUST exist because we guard entering the notification
         // state on seeing at least a '%'.
         if (std.mem.eql(u8, cmd, "%begin")) {
-            // We don't use the rest of the tokens for now because tmux
-            // claims to guarantee that begin/end are always in order and
-            // never intermixed. In the future, we should probably validate
-            // this.
-            // TODO(tmuxcc): do this before merge?
+            // Store the guard tokens (time, command-number, flags) from the
+            // %begin line. These are matched against %end/%error lines to
+            // correctly identify block termination — payload content can
+            // start with %end or %error (ghostty-org/ghostty#11395).
+            const guard_str = if (line.len > "%begin".len and line["%begin".len] == ' ')
+                line["%begin".len + 1 ..]
+            else
+                "";
+            var guard: Guard = .{};
+            const copy_len: u8 = @intCast(@min(guard_str.len, guard.buf.len));
+            @memcpy(guard.buf[0..copy_len], guard_str[0..copy_len]);
+            guard.len = copy_len;
 
-            // Move to block state because we expect a corresponding end/error
-            // and want to accumulate the data.
-            self.state = .block;
+            self.state = .{ .block = guard };
             self.buffer.clearRetainingCapacity();
             return null;
         } else if (std.mem.eql(u8, cmd, "%output")) cmd: {
@@ -722,4 +758,68 @@ test "tmux client-session-changed" {
     try testing.expectEqualStrings("/dev/pts/1", n.client_session_changed.client);
     try testing.expectEqual(2, n.client_session_changed.session_id);
     try testing.expectEqualStrings("mysession", n.client_session_changed.name);
+}
+
+// Regression tests for ghostty-org/ghostty#11395:
+// Block termination must match the full guard-line format, not just
+// a %end/%error prefix — payload content can start with those words.
+
+test "tmux block payload starting with %end is not a terminator" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%begin 1 1 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    // Payload line that starts with %end but doesn't match the guard
+    for ("%end hello\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("real content\n") |byte| try testing.expect(try c.put(byte) == null);
+    // The real terminator with matching guard tokens
+    for ("%end 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_end);
+    try testing.expectEqualStrings("%end hello\nreal content", n.block_end);
+}
+
+test "tmux block payload starting with %error is not a terminator" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%begin 1 1 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%error something\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%end 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_end);
+    try testing.expectEqualStrings("%error something", n.block_end);
+}
+
+test "tmux block mismatched guard tokens do not terminate" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%begin 1 1 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    // Different guard tokens — must not terminate the block
+    for ("%end 2 2 2\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%end 1 1 1") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_end);
+    try testing.expectEqualStrings("%end 2 2 2", n.block_end);
+}
+
+test "tmux block %error with matching guard terminates as error" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%begin 99 42 0\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("some output\n") |byte| try testing.expect(try c.put(byte) == null);
+    for ("%error 99 42 0") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_err);
+    try testing.expectEqualStrings("some output", n.block_err);
 }
