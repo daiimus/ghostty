@@ -3007,7 +3007,11 @@ const Action = struct {
                                 return std.math.order(needle, probe);
                             }
                         }.cmp) == null) {
-                            // Pane is absent — destroy its relay writer.
+                            // Pane is absent — destroy its surface before its
+                            // relay writer. The surface holds a control_writer
+                            // that points into relay_writer memory; freeing
+                            // the relay_writer first leaves a dangling pointer.
+                            entry.value_ptr.surface.unref();
                             alloc.destroy(entry.value_ptr.relay_writer);
                             pane_map.removeByPtr(entry.key_ptr);
                         }
