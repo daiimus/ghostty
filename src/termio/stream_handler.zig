@@ -425,7 +425,7 @@ pub const StreamHandler = struct {
                 };
 
                 for (viewer.next(.{ .tmux = tmux })) |action| {
-                    log.info("tmux viewer action={f}", .{action});
+                    log.debug("tmux viewer action={f}", .{action});
                     switch (action) {
                         .exit => {
                             // We ignore this because we will fully exit when
