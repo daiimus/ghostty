@@ -2998,54 +2998,82 @@ const Action = struct {
                     const tab_view = window.getTabView();
                     const buf_map = window.tmuxPaneOutputBuffers();
 
+                    // Collect-then-remove pattern: std hash map iterators are
+                    // invalidated by any map modification. Collect keys during
+                    // iteration, then remove in a second pass. Cleanup actions
+                    // (surface.unref, alloc.destroy) don't modify the map and
+                    // are safe during iteration.
+
                     // Prune pane surfaces whose IDs are not in the keep-set.
-                    // pane_ids is sorted, so we can use binary search.
-                    var pane_iter = pane_map.iterator();
-                    while (pane_iter.next()) |entry| {
-                        if (std.sort.binarySearch(usize, entry.key_ptr.*, pa.pane_ids, {}, struct {
-                            fn cmp(_: void, needle: usize, probe: usize) std.math.Order {
-                                return std.math.order(needle, probe);
+                    var panes_buf: [512]usize = undefined;
+                    var panes_n: usize = 0;
+                    {
+                        var pane_iter = pane_map.iterator();
+                        while (pane_iter.next()) |entry| {
+                            if (std.sort.binarySearch(usize, entry.key_ptr.*, pa.pane_ids, {}, struct {
+                                fn cmp(_: void, needle: usize, probe: usize) std.math.Order {
+                                    return std.math.order(needle, probe);
+                                }
+                            }.cmp) == null) {
+                                entry.value_ptr.surface.unref();
+                                alloc.destroy(entry.value_ptr.relay_writer);
+                                if (panes_n < panes_buf.len) {
+                                    panes_buf[panes_n] = entry.key_ptr.*;
+                                    panes_n += 1;
+                                }
                             }
-                        }.cmp) == null) {
-                            // Pane is absent — destroy its surface before its
-                            // relay writer. The surface holds a control_writer
-                            // that points into relay_writer memory; freeing
-                            // the relay_writer first leaves a dangling pointer.
-                            entry.value_ptr.surface.unref();
-                            alloc.destroy(entry.value_ptr.relay_writer);
-                            pane_map.removeByPtr(entry.key_ptr);
                         }
                     }
+                    for (panes_buf[0..panes_n]) |pane_id| {
+                        _ = pane_map.remove(pane_id);
+                    }
 
-                    // Prune output buffers for panes that are not in the
-                    // keep-set. This frees any data buffered for panes that
-                    // were never created or were already removed above.
-                    var buf_iter = buf_map.iterator();
-                    while (buf_iter.next()) |entry| {
-                        if (std.sort.binarySearch(usize, entry.key_ptr.*, pa.pane_ids, {}, struct {
-                            fn cmp(_: void, needle: usize, probe: usize) std.math.Order {
-                                return std.math.order(needle, probe);
+                    // Prune output buffers for absent panes.
+                    var bufs_buf: [512]usize = undefined;
+                    var bufs_n: usize = 0;
+                    {
+                        var buf_iter = buf_map.iterator();
+                        while (buf_iter.next()) |entry| {
+                            if (std.sort.binarySearch(usize, entry.key_ptr.*, pa.pane_ids, {}, struct {
+                                fn cmp(_: void, needle: usize, probe: usize) std.math.Order {
+                                    return std.math.order(needle, probe);
+                                }
+                            }.cmp) == null) {
+                                entry.value_ptr.deinit(alloc);
+                                if (bufs_n < bufs_buf.len) {
+                                    bufs_buf[bufs_n] = entry.key_ptr.*;
+                                    bufs_n += 1;
+                                }
                             }
-                        }.cmp) == null) {
-                            entry.value_ptr.deinit(alloc);
-                            buf_map.removeByPtr(entry.key_ptr);
                         }
+                    }
+                    for (bufs_buf[0..bufs_n]) |buf_id| {
+                        _ = buf_map.remove(buf_id);
                     }
 
                     // Prune tabs whose window IDs are not in the keep-set.
-                    var win_iter = window_map.iterator();
-                    while (win_iter.next()) |entry| {
-                        if (std.sort.binarySearch(usize, entry.key_ptr.*, pa.window_ids, {}, struct {
-                            fn cmp(_: void, needle: usize, probe: usize) std.math.Order {
-                                return std.math.order(needle, probe);
+                    var wins_buf: [512]usize = undefined;
+                    var wins_n: usize = 0;
+                    {
+                        var win_iter = window_map.iterator();
+                        while (win_iter.next()) |entry| {
+                            if (std.sort.binarySearch(usize, entry.key_ptr.*, pa.window_ids, {}, struct {
+                                fn cmp(_: void, needle: usize, probe: usize) std.math.Order {
+                                    return std.math.order(needle, probe);
+                                }
+                            }.cmp) == null) {
+                                const tab = entry.value_ptr.*;
+                                const page = tab_view.getPage(tab.as(gtk.Widget));
+                                tab_view.closePage(page);
+                                if (wins_n < wins_buf.len) {
+                                    wins_buf[wins_n] = entry.key_ptr.*;
+                                    wins_n += 1;
+                                }
                             }
-                        }.cmp) == null) {
-                            // Window is absent — close its tab.
-                            const tab = entry.value_ptr.*;
-                            const page = tab_view.getPage(tab.as(gtk.Widget));
-                            tab_view.closePage(page);
-                            window_map.removeByPtr(entry.key_ptr);
                         }
+                    }
+                    for (wins_buf[0..wins_n]) |win_id| {
+                        _ = window_map.remove(win_id);
                     }
                 },
 
