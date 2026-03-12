@@ -2448,3 +2448,66 @@ test "layout change preserves other windows on shared arena" {
         },
     });
 }
+
+test "Action.format suppresses raw bytes for output action" {
+    // Validates that formatting an .output action does NOT dump
+    // raw pane bytes but instead shows pane_id and byte count.
+    const action: Viewer.Action = .{ .output = .{
+        .pane_id = 42,
+        .data = "\x1b[31mhello\x1b[0m",
+    } };
+
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+    try action.format(&builder.writer);
+    const result = builder.writer.buffered();
+
+    // Must contain pane_id and byte count, not raw VT bytes
+    try testing.expect(std.mem.indexOf(u8, result, "pane_id=42") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "bytes=14") != null);
+    // Must NOT contain raw escape sequences
+    try testing.expect(std.mem.indexOf(u8, result, "\x1b[31m") == null);
+    try testing.expect(std.mem.indexOf(u8, result, "hello") == null);
+}
+
+test "Action.format preserves normal formatting for command action" {
+    // Regression guard: non-output actions should still format
+    // their payload contents normally.
+    const action: Viewer.Action = .{ .command = "list-windows\n" };
+
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+    try action.format(&builder.writer);
+    const result = builder.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, result, "command") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "list-windows") != null);
+}
+
+test "Action.format handles exit action" {
+    const action: Viewer.Action = .exit;
+
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+    try action.format(&builder.writer);
+    const result = builder.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, result, "exit") != null);
+}
+
+test "Action.format output with empty data" {
+    // Edge case: .output with zero-length data should still format
+    // without crashing, showing bytes=0.
+    const action: Viewer.Action = .{ .output = .{
+        .pane_id = 0,
+        .data = "",
+    } };
+
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+    try action.format(&builder.writer);
+    const result = builder.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, result, "pane_id=0") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "bytes=0") != null);
+}
