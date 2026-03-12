@@ -2885,6 +2885,11 @@ const Action = struct {
                         .relay_writer = relay_writer,
                     }) catch |err| {
                         log.warn("tmux reconcile: failed to store pane mapping: {}", .{err});
+                        // Destroy surface before relay_writer: the surface
+                        // holds a control_writer that points into relay_writer.
+                        // Destroying relay_writer first would leave the surface
+                        // with a dangling control_writer pointer.
+                        pane_surface.unref();
                         alloc.destroy(relay_writer);
                         continue;
                     };
@@ -2903,9 +2908,19 @@ const Action = struct {
                             for (buf.chunks.items) |chunk| {
                                 child_core.io.processOutput(chunk);
                             }
+                            buf.deinit(alloc);
+                            _ = buf_map.remove(ep.pane_id);
+                        } else {
+                            // Surface not yet realized (core() returns null).
+                            // Leave the buffer in the map — prune_absent will
+                            // clean it up if the pane disappears, or a future
+                            // reconcile cycle will retry when the surface is
+                            // realized.
+                            log.debug("tmux reconcile: deferring buffered output replay (no core): pane={} bytes={}", .{
+                                ep.pane_id,
+                                buf.total_bytes,
+                            });
                         }
-                        buf.deinit(alloc);
-                        _ = buf_map.remove(ep.pane_id);
                     }
                 },
 
@@ -3052,6 +3067,7 @@ const Action = struct {
         }
 
         // Pane not yet created — buffer the output for replay on ensure_pane.
+        if (value.data_len == 0) return;
         const alloc = Application.default().allocator();
         const buf_map = window.tmuxPaneOutputBuffers();
         const gop = buf_map.getOrPut(alloc, value.pane_id) catch {
@@ -3104,8 +3120,14 @@ const Action = struct {
 
         // Fill nodes starting at index 0 (root). fillNodes returns
         // the next free index; it must consume exactly node_count.
-        const next = fillLayoutNode(layout, nodes, 0, pane_map) orelse
+        const next = fillLayoutNode(layout, nodes, 0, pane_map) orelse {
+            // fillLayoutNode returned null (pane not found in map).
+            // This is a normal return, not an error, so errdefer
+            // does not fire. Deinit the arena explicitly to avoid
+            // leaking the allocated nodes.
+            arena.deinit();
             return Surface.Tree.empty;
+        };
         assert(next == node_count);
 
         // Ref all leaf surfaces. SplitTree owns refs and will unref
