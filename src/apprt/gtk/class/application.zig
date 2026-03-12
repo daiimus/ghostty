@@ -3093,6 +3093,7 @@ const Action = struct {
         }
 
         // Pane not yet created — buffer the output for replay on ensure_pane.
+        if (value.data_len == 0) return;
         const alloc = Application.default().allocator();
         const buf_map = window.tmuxPaneOutputBuffers();
         const gop = buf_map.getOrPut(alloc, value.pane_id) catch {
