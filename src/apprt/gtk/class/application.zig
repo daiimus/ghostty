@@ -767,6 +767,7 @@ pub const Application = extern struct {
             .search_selected => Action.searchSelected(target, value),
 
             .tmux_reconcile => Action.tmuxReconcile(target, value),
+            .tmux_pane_output => Action.tmuxPaneOutput(target, value),
 
             // Unimplemented
             .secure_input,
@@ -3000,6 +3001,48 @@ const Action = struct {
                 },
             }
         }
+    }
+
+    /// Route tmux pane output to the correct child surface. Resolves
+    /// the pane_id to a child surface via the window's pane map and
+    /// calls processOutput on its Termio. If the pane is not found
+    /// (not yet created or already pruned), the output is silently
+    /// dropped with a debug log.
+    ///
+    /// Upstream anchor: follows the tmux_reconcile pattern for
+    /// target → surface → window resolution.
+    pub fn tmuxPaneOutput(target: apprt.Target, value: apprt.Action.Value(.tmux_pane_output)) void {
+        const surface = switch (target) {
+            .app => {
+                log.warn("tmux_pane_output action to app is unexpected", .{});
+                return;
+            },
+            .surface => |core| core.rt_surface.surface,
+        };
+
+        const window = ext.getAncestor(Window, surface.as(gtk.Widget)) orelse {
+            log.warn("tmux_pane_output: surface has no ancestor window", .{});
+            return;
+        };
+
+        const pane_map = window.tmuxPaneMap();
+        const entry = pane_map.get(value.pane_id) orelse {
+            log.debug("tmux pane output dropped: pane_id={} bytes={}", .{
+                value.pane_id,
+                value.data_len,
+            });
+            return;
+        };
+
+        const child_core = entry.surface.core() orelse {
+            log.debug("tmux pane output dropped (no core surface): pane_id={}", .{value.pane_id});
+            return;
+        };
+
+        // processOutput is mutex-protected and safe to call from the
+        // app thread. This is the same cross-thread pattern used by the
+        // exec backend's read thread (Exec.zig:1326).
+        child_core.io.processOutput(value.data[0..value.data_len]);
     }
 
     /// Build a `Surface.Tree` (datastruct.SplitTree(Surface)) from a tmux
