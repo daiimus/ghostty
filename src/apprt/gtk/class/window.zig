@@ -2245,3 +2245,98 @@ pub const Window = extern struct {
         pub const bindTemplateCallback = C.Class.bindTemplateCallback;
     };
 };
+
+const testing = std.testing;
+
+test "PaneOutputBuffer: append and drain chunks in order" {
+    var buf: Window.PaneOutputBuffer = .{};
+    defer buf.deinit(testing.allocator);
+
+    try testing.expect(buf.append(testing.allocator, "hello"));
+    try testing.expect(buf.append(testing.allocator, " world"));
+
+    try testing.expectEqual(@as(usize, 2), buf.chunks.items.len);
+    try testing.expectEqual(@as(usize, 11), buf.total_bytes);
+    try testing.expectEqualStrings("hello", buf.chunks.items[0]);
+    try testing.expectEqualStrings(" world", buf.chunks.items[1]);
+}
+
+test "PaneOutputBuffer: empty append succeeds" {
+    var buf: Window.PaneOutputBuffer = .{};
+    defer buf.deinit(testing.allocator);
+
+    try testing.expect(buf.append(testing.allocator, ""));
+    try testing.expectEqual(@as(usize, 0), buf.chunks.items.len);
+    try testing.expectEqual(@as(usize, 0), buf.total_bytes);
+}
+
+test "PaneOutputBuffer: overflow drops newest" {
+    var buf: Window.PaneOutputBuffer = .{};
+    defer buf.deinit(testing.allocator);
+
+    // Fill buffer to just under capacity.
+    const fill_size = Window.PaneOutputBuffer.max_bytes - 1;
+    const fill_data = try testing.allocator.alloc(u8, fill_size);
+    defer testing.allocator.free(fill_data);
+    @memset(fill_data, 'A');
+
+    try testing.expect(buf.append(testing.allocator, fill_data));
+    try testing.expectEqual(fill_size, buf.total_bytes);
+
+    // One more byte fits.
+    try testing.expect(buf.append(testing.allocator, "B"));
+    try testing.expectEqual(Window.PaneOutputBuffer.max_bytes, buf.total_bytes);
+
+    // Any additional data must be rejected (drop-newest).
+    try testing.expect(!buf.append(testing.allocator, "C"));
+    try testing.expectEqual(Window.PaneOutputBuffer.max_bytes, buf.total_bytes);
+    try testing.expectEqual(@as(usize, 2), buf.chunks.items.len);
+}
+
+test "PaneOutputBuffer: deinit resets state" {
+    var buf: Window.PaneOutputBuffer = .{};
+
+    try testing.expect(buf.append(testing.allocator, "data"));
+    try testing.expectEqual(@as(usize, 4), buf.total_bytes);
+
+    buf.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), buf.total_bytes);
+    try testing.expectEqual(@as(usize, 0), buf.chunks.items.len);
+}
+
+test "PaneOutputBuffer: multiple chunks replay order" {
+    var buf: Window.PaneOutputBuffer = .{};
+    defer buf.deinit(testing.allocator);
+
+    const chunks = [_][]const u8{ "first", "second", "third" };
+    for (&chunks) |chunk| {
+        try testing.expect(buf.append(testing.allocator, chunk));
+    }
+
+    try testing.expectEqual(@as(usize, 3), buf.chunks.items.len);
+
+    // Verify chunks are in insertion order.
+    for (buf.chunks.items, 0..) |chunk, i| {
+        try testing.expectEqualStrings(chunks[i], chunk);
+    }
+
+    // Verify total_bytes is sum of all chunks.
+    try testing.expectEqual(@as(usize, 5 + 6 + 5), buf.total_bytes);
+}
+
+test "PaneOutputBuffer: capacity boundary exact fit" {
+    var buf: Window.PaneOutputBuffer = .{};
+    defer buf.deinit(testing.allocator);
+
+    // Fill buffer to exactly capacity.
+    const fill_data = try testing.allocator.alloc(u8, Window.PaneOutputBuffer.max_bytes);
+    defer testing.allocator.free(fill_data);
+    @memset(fill_data, 'X');
+
+    try testing.expect(buf.append(testing.allocator, fill_data));
+    try testing.expectEqual(Window.PaneOutputBuffer.max_bytes, buf.total_bytes);
+
+    // Next append of any size must fail.
+    try testing.expect(!buf.append(testing.allocator, "Y"));
+    try testing.expectEqual(@as(usize, 1), buf.chunks.items.len);
+}
