@@ -692,6 +692,39 @@ fn collectPaneIds(layout: terminal.tmux.Layout, ids: []usize, idx: *usize) void 
     }
 }
 
+/// Build a minimal reconcile payload containing a single `.set_focus`
+/// op for the given tmux window and pane. Used when focus changes
+/// without a topology change (i.e. `%window-pane-changed`).
+///
+/// Reuses the existing `TmuxReconcilePayload` / `tmux_reconcile`
+/// action so the apprt handler doesn't need a separate code path.
+///
+/// This is a pure function — no Surface instance needed — making it
+/// straightforward to unit test.
+pub fn focusTmuxReconcile(
+    alloc: Allocator,
+    window_id: usize,
+    pane_id: usize,
+) Allocator.Error!*TmuxReconcilePayload {
+    var arena: ArenaAllocator = .init(alloc);
+    errdefer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const ops = try arena_alloc.alloc(TmuxReconcileOp, 1);
+    ops[0] = .{ .set_focus = .{
+        .tmux_window_id = window_id,
+        .pane_id = pane_id,
+    } };
+
+    const payload = try alloc.create(TmuxReconcilePayload);
+    payload.* = .{
+        .alloc = alloc,
+        .arena = arena,
+        .ops = ops,
+    };
+    return payload;
+}
+
 /// Create a new surface with the default exec backend. This must be
 /// called from the main thread. The pointer to the memory for the
 /// surface must be provided and must be stable due to interfacing
@@ -1511,6 +1544,33 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                     .data = data.ptr,
                     .data_len = data.len,
                 },
+            );
+        },
+
+        .tmux_focus_changed => |fc| {
+            // A tmux %window-pane-changed notification arrived.
+            // Build a minimal reconcile payload with a single
+            // set_focus op and dispatch through the existing
+            // tmux_reconcile action. This avoids a separate apprt
+            // handler — the GTK set_focus op handler already knows
+            // how to select the correct tab and pane.
+            //
+            // Upstream anchor: reuses the tmux_reconcile action
+            // and TmuxReconcilePayload established in Slice 3.
+            const payload = focusTmuxReconcile(
+                self.alloc,
+                fc.window_id,
+                fc.pane_id,
+            ) catch |err| {
+                log.warn("tmux focus reconcile failed: {}", .{err});
+                return;
+            };
+            errdefer payload.deinit();
+
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_reconcile,
+                .{ .payload = payload },
             );
         },
     }
@@ -7457,4 +7517,40 @@ test "planTmuxReconcile repeated identical snapshot yields same ops" {
             },
         }
     }
+}
+
+test "focusTmuxReconcile builds single set_focus op" {
+    const testing = @import("std").testing;
+    const alloc = testing.allocator;
+
+    const payload = try focusTmuxReconcile(alloc, 3, 7);
+    defer payload.deinit();
+
+    // Exactly one op: set_focus
+    try testing.expectEqual(@as(usize, 1), payload.ops.len);
+    switch (payload.ops[0]) {
+        .set_focus => |sf| {
+            try testing.expectEqual(@as(usize, 3), sf.tmux_window_id);
+            try testing.expectEqual(@as(usize, 7), sf.pane_id);
+        },
+        else => return error.UnexpectedOp,
+    }
+}
+
+test "focusTmuxReconcile repeated calls produce identical payloads" {
+    const testing = @import("std").testing;
+    const alloc = testing.allocator;
+
+    const payload1 = try focusTmuxReconcile(alloc, 1, 42);
+    defer payload1.deinit();
+    const payload2 = try focusTmuxReconcile(alloc, 1, 42);
+    defer payload2.deinit();
+
+    try testing.expectEqual(payload1.ops.len, payload2.ops.len);
+    try testing.expectEqual(@as(usize, 1), payload1.ops.len);
+
+    const sf1 = payload1.ops[0].set_focus;
+    const sf2 = payload2.ops[0].set_focus;
+    try testing.expectEqual(sf1.tmux_window_id, sf2.tmux_window_id);
+    try testing.expectEqual(sf1.pane_id, sf2.pane_id);
 }

@@ -141,6 +141,19 @@ pub const Message = union(enum) {
     /// a struct wraps `WriteReq` with additional metadata.
     tmux_pane_output: TmuxPaneOutput,
 
+    /// The active pane changed in tmux (`%window-pane-changed`
+    /// notification). The parent surface's stream handler constructs
+    /// this message so the app thread can update focus to the correct
+    /// window tab and pane surface.
+    ///
+    /// Lightweight value type — no heap allocation needed since it
+    /// carries only two IDs.
+    ///
+    /// Upstream anchor: follows the `scrollbar: terminal.Scrollbar`
+    /// pattern where a small value struct is passed directly in the
+    /// message union without heap allocation.
+    tmux_focus_changed: TmuxFocusChanged,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
@@ -169,6 +182,13 @@ pub const Message = union(enum) {
     pub const TmuxPaneOutput = struct {
         pane_id: usize,
         data: WriteReq,
+    };
+
+    /// Carries the window and pane IDs from a tmux
+    /// `%window-pane-changed` notification.
+    pub const TmuxFocusChanged = struct {
+        window_id: usize,
+        pane_id: usize,
     };
 
     /// A deep-copy snapshot of the tmux viewer's window topology. Owns

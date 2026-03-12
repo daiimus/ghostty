@@ -502,6 +502,25 @@ pub const StreamHandler = struct {
                                 },
                             });
                         },
+
+                        .focus => |focus| {
+                            // Forward focus change to the parent surface's
+                            // mailbox so the app thread can update which tab
+                            // and pane has focus.
+                            //
+                            // Lightweight value message — no heap allocation
+                            // needed, just two IDs.
+                            //
+                            // Upstream anchor: follows the scrollbar message
+                            // pattern where a small value struct is sent
+                            // directly through the surface mailbox.
+                            self.surfaceMessageWriter(.{
+                                .tmux_focus_changed = .{
+                                    .window_id = focus.window_id,
+                                    .pane_id = focus.pane_id,
+                                },
+                            });
+                        },
                     }
                 }
             },
