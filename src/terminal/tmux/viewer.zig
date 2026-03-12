@@ -238,10 +238,18 @@ pub const Viewer = struct {
 
                 inline for (info.fields) |u_field| {
                     if (self == @field(TagType, u_field.name)) {
-                        const value = @field(self, u_field.name);
-                        switch (u_field.type) {
-                            []const u8 => try writer.print("\"{s}\"", .{std.mem.trim(u8, value, " \t\r\n")}),
-                            else => try writer.print("{any}", .{value}),
+                        if (comptime std.mem.eql(u8, u_field.name, "output")) {
+                            // Suppress raw pane bytes: log only the pane ID
+                            // and byte count to avoid dumping arbitrary VT
+                            // data into logs on every %output notification.
+                            const out = @field(self, "output");
+                            try writer.print("pane_id={} bytes={}", .{ out.pane_id, out.data.len });
+                        } else {
+                            const value = @field(self, u_field.name);
+                            switch (u_field.type) {
+                                []const u8 => try writer.print("\"{s}\"", .{std.mem.trim(u8, value, " \t\r\n")}),
+                                else => try writer.print("{any}", .{value}),
+                            }
                         }
                     }
                 }
