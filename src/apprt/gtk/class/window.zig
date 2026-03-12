@@ -225,6 +225,51 @@ pub const Window = extern struct {
         relay_writer: *termio.Tmux.SurfaceRelayWriter,
     };
 
+    /// Bounded buffer for tmux pane output that arrives before the pane
+    /// surface has been created. Output chunks are appended in order and
+    /// replayed once ensure_pane creates the surface. Overflow follows a
+    /// drop-newest policy: new chunks are rejected when the buffer is at
+    /// capacity.
+    ///
+    /// Upstream anchor: capacity matches the 1 MiB hard cap used by the
+    /// tmux control parser (control.zig:30) and DCS handler (dcs.zig:19).
+    pub const PaneOutputBuffer = struct {
+        /// Maximum bytes buffered per pane before dropping new output.
+        const max_bytes: usize = 1024 * 1024;
+
+        /// Buffered output chunks in insertion order. Each chunk is a
+        /// heap-allocated copy of the data that was received.
+        chunks: std.ArrayListUnmanaged([]const u8) = .{},
+
+        /// Total bytes currently buffered across all chunks.
+        total_bytes: usize = 0,
+
+        /// Append a copy of `data` to the buffer. Returns false if the
+        /// buffer is at capacity (drop-newest policy). The caller must
+        /// provide the allocator used for all buffer operations.
+        pub fn append(self: *PaneOutputBuffer, alloc: std.mem.Allocator, data: []const u8) bool {
+            if (data.len == 0) return true;
+            if (self.total_bytes + data.len > max_bytes) return false;
+
+            const copy = alloc.dupe(u8, data) catch return false;
+            self.chunks.append(alloc, copy) catch {
+                alloc.free(copy);
+                return false;
+            };
+            self.total_bytes += data.len;
+            return true;
+        }
+
+        /// Release all buffered data and the chunk list itself.
+        pub fn deinit(self: *PaneOutputBuffer, alloc: std.mem.Allocator) void {
+            for (self.chunks.items) |chunk| {
+                alloc.free(chunk);
+            }
+            self.chunks.deinit(alloc);
+            self.total_bytes = 0;
+        }
+    };
+
     const Private = struct {
         /// Whether this window is a quick terminal. If it is then it
         /// behaves slightly differently under certain scenarios.
@@ -278,6 +323,16 @@ pub const Window = extern struct {
         /// and its relay writer. Populated by ensure_pane, pruned by
         /// prune_absent. Keyed by tmux pane ID (usize).
         tmux_pane_to_surface: std.AutoHashMapUnmanaged(usize, TmuxPaneEntry) = .{},
+
+        /// Tmux pre-pane output buffers: holds output that arrived for
+        /// pane IDs before ensure_pane created their surfaces. Keyed by
+        /// tmux pane ID (usize). Entries are created on first buffered
+        /// output, drained on ensure_pane replay, and freed on
+        /// prune_absent or window finalize.
+        ///
+        /// Upstream anchor: bounded buffer pattern from control.zig:30
+        /// and dcs.zig:19 (1 MiB cap).
+        tmux_pane_output_buffers: std.AutoHashMapUnmanaged(usize, PaneOutputBuffer) = .{},
 
         // Template bindings
         tab_overview: *adw.TabOverview,
@@ -450,6 +505,12 @@ pub const Window = extern struct {
     /// for any map mutations.
     pub fn tmuxPaneMap(self: *Self) *std.AutoHashMapUnmanaged(usize, TmuxPaneEntry) {
         return &self.private().tmux_pane_to_surface;
+    }
+
+    /// Returns a mutable pointer to the tmux pane output buffer map.
+    /// Used by tmuxPaneOutput (to buffer) and tmuxReconcile (to replay/prune).
+    pub fn tmuxPaneOutputBuffers(self: *Self) *std.AutoHashMapUnmanaged(usize, PaneOutputBuffer) {
+        return &self.private().tmux_pane_output_buffers;
     }
 
     fn newTabPage(
@@ -1299,6 +1360,14 @@ pub const Window = extern struct {
         while (pane_iter.next()) |entry| {
             alloc.destroy(entry.value_ptr.relay_writer);
         }
+
+        // Free any remaining tmux pane output buffers (e.g. panes that
+        // never got created before the window was destroyed).
+        var buf_iter = priv.tmux_pane_output_buffers.iterator();
+        while (buf_iter.next()) |entry| {
+            entry.value_ptr.deinit(alloc);
+        }
+        priv.tmux_pane_output_buffers.deinit(alloc);
 
         priv.tmux_window_to_tab.deinit(alloc);
         priv.tmux_pane_to_surface.deinit(alloc);
