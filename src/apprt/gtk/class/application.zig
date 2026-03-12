@@ -2934,9 +2934,19 @@ const Action = struct {
                             for (buf.chunks.items) |chunk| {
                                 child_core.io.processOutput(chunk);
                             }
+                            buf.deinit(alloc);
+                            _ = buf_map.remove(ep.pane_id);
+                        } else {
+                            // Surface not yet realized (core() returns null).
+                            // Leave the buffer in the map — prune_absent will
+                            // clean it up if the pane disappears, or a future
+                            // reconcile cycle will retry when the surface is
+                            // realized.
+                            log.debug("tmux reconcile: deferring buffered output replay (no core): pane={} bytes={}", .{
+                                ep.pane_id,
+                                buf.total_bytes,
+                            });
                         }
-                        buf.deinit(alloc);
-                        _ = buf_map.remove(ep.pane_id);
                     }
                 },
 
