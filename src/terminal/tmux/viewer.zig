@@ -217,6 +217,15 @@ pub const Viewer = struct {
         /// never reuses window IDs within a server process lifetime.
         windows: []const Window,
 
+        /// Raw output from a tmux pane. The caller is responsible for
+        /// routing this data to the correct child surface's terminal.
+        /// The data slice is valid only for the duration of the action
+        /// iteration (it points into the control parser's buffer).
+        output: struct {
+            pane_id: usize,
+            data: []const u8,
+        },
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -461,14 +470,26 @@ pub const Viewer = struct {
                 command_consumed = true;
             },
 
-            .output => |out| self.receivedOutput(
-                out.pane_id,
-                out.data,
-            ) catch |err| {
-                log.warn(
-                    "failed to process output for pane id={}: {}",
-                    .{ out.pane_id, err },
-                );
+            .output => |out| {
+                self.receivedOutput(
+                    out.pane_id,
+                    out.data,
+                ) catch |err| {
+                    log.warn(
+                        "failed to process output for pane id={}: {}",
+                        .{ out.pane_id, err },
+                    );
+                };
+
+                // Forward output to the caller so it can route the data
+                // to the correct child surface's terminal.
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(arena.allocator(), .{
+                    .output = .{ .pane_id = out.pane_id, .data = out.data },
+                }) catch {
+                    log.warn("failed to queue output action for pane id={}", .{out.pane_id});
+                };
             },
 
             // Session changed means we switched to a different tmux session.
@@ -1818,7 +1839,12 @@ test "initial flow" {
             .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = "new output" } } },
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(0, actions.len);
+                    // Output action forwarded to caller for routing.
+                    try testing.expectEqual(1, actions.len);
+                    try testing.expect(actions[0] == .output);
+                    try testing.expectEqual(0, actions[0].output.pane_id);
+                    try testing.expectEqualStrings("new output", actions[0].output.data);
+                    // Viewer also processes output into its own pane terminal.
                     const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
                     const screen: *Screen = pane.terminal.screens.active;
                     const str = try screen.dumpStringAlloc(
@@ -1834,7 +1860,12 @@ test "initial flow" {
             .input = .{ .tmux = .{ .output = .{ .pane_id = 999, .data = "ignored" } } },
             .check = (struct {
                 fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(0, actions.len);
+                    // Output for untracked pane is still forwarded to caller
+                    // (caller decides to drop/route). Viewer logs and skips
+                    // internal processing.
+                    try testing.expectEqual(1, actions.len);
+                    try testing.expect(actions[0] == .output);
+                    try testing.expectEqual(999, actions[0].output.pane_id);
                 }
             }).check,
         },
