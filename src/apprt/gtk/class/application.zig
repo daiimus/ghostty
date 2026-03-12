@@ -2910,6 +2910,11 @@ const Action = struct {
                         .relay_writer = relay_writer,
                     }) catch |err| {
                         log.warn("tmux reconcile: failed to store pane mapping: {}", .{err});
+                        // Destroy surface before relay_writer: the surface
+                        // holds a control_writer that points into relay_writer.
+                        // Destroying relay_writer first would leave the surface
+                        // with a dangling control_writer pointer.
+                        pane_surface.unref();
                         alloc.destroy(relay_writer);
                         continue;
                     };
