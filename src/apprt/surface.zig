@@ -131,6 +131,16 @@ pub const Message = union(enum) {
     /// `WriteReq` carries command bytes with small/alloc ownership.
     tmux_write_command: WriteReq,
 
+    /// Pane output from the tmux control mode stream (`%output`
+    /// notification). The parent surface's stream handler constructs
+    /// this message targeting the parent surface's own mailbox.
+    /// `handleMessage` dispatches it as a `tmux_pane_output` action
+    /// so the apprt can route the data to the correct child surface.
+    ///
+    /// Upstream anchor: follows the `clipboard_write` pattern where
+    /// a struct wraps `WriteReq` with additional metadata.
+    tmux_pane_output: TmuxPaneOutput,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
@@ -151,6 +161,14 @@ pub const Message = union(enum) {
 
             .none => void,
         };
+    };
+
+    /// Carries a tmux pane's output data with its pane identifier.
+    /// Follows the `clipboard_write` pattern: a struct wrapping
+    /// `WriteReq` with metadata (pane_id instead of clipboard_type).
+    pub const TmuxPaneOutput = struct {
+        pane_id: usize,
+        data: WriteReq,
     };
 
     /// A deep-copy snapshot of the tmux viewer's window topology. Owns

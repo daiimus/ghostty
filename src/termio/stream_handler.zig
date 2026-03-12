@@ -473,6 +473,35 @@ pub const StreamHandler = struct {
                             };
                             self.surfaceMessageWriter(.{ .tmux_topology_changed = snapshot });
                         },
+
+                        .output => |output| {
+                            // Forward pane output to the parent surface's
+                            // mailbox so the app thread can route it to the
+                            // correct child surface via the apprt action
+                            // system (pane_id → child surface lookup).
+                            //
+                            // The viewer has already processed this data into
+                            // its internal pane terminal (shadow copy). This
+                            // handler copies the data into a WriteReq so it
+                            // survives beyond the current parser buffer
+                            // lifetime.
+                            //
+                            // Upstream anchor: follows the tmux_write_command
+                            // relay pattern (SurfaceRelayWriter) where
+                            // WriteReq copies command bytes for cross-thread
+                            // delivery.
+                            const SurfaceWriteReq = apprt.surface.Message.WriteReq;
+                            const req = SurfaceWriteReq.init(self.alloc, output.data) catch |err| {
+                                log.warn("tmux pane output alloc failed: {}", .{err});
+                                return;
+                            };
+                            self.surfaceMessageWriter(.{
+                                .tmux_pane_output = .{
+                                    .pane_id = output.pane_id,
+                                    .data = req,
+                                },
+                            });
+                        },
                     }
                 }
             },
