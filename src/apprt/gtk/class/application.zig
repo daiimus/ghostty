@@ -3109,18 +3109,18 @@ const Action = struct {
 
         const pane_map = window.tmuxPaneMap();
 
-        // If the pane surface already exists, route immediately.
+        // If the pane surface already exists and is realized, route
+        // immediately. If the surface exists but core() is null (not
+        // yet realized), fall through to buffer the output for replay
+        // once the surface is ready.
         if (pane_map.get(value.pane_id)) |entry| {
-            const child_core = entry.surface.core() orelse {
-                log.debug("tmux pane output dropped (no core surface): pane_id={}", .{value.pane_id});
+            if (entry.surface.core()) |child_core| {
+                // processOutput is mutex-protected and safe to call from the
+                // app thread. This is the same cross-thread pattern used by the
+                // exec backend's read thread (Exec.zig:1326).
+                child_core.io.processOutput(value.data[0..value.data_len]);
                 return;
-            };
-
-            // processOutput is mutex-protected and safe to call from the
-            // app thread. This is the same cross-thread pattern used by the
-            // exec backend's read thread (Exec.zig:1326).
-            child_core.io.processOutput(value.data[0..value.data_len]);
-            return;
+            }
         }
 
         // Pane not yet created — buffer the output for replay on ensure_pane.
