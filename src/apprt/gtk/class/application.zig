@@ -22,6 +22,7 @@ const xev = @import("../../../global.zig").xev;
 const Binding = @import("../../../input.zig").Binding;
 const CoreConfig = configpkg.Config;
 const CoreSurface = @import("../../../Surface.zig");
+const termio = @import("../../../termio.zig");
 const lib = @import("../../../lib/main.zig");
 
 const ext = @import("../ext.zig");
@@ -2276,7 +2277,7 @@ const Action = struct {
         );
 
         // Create a new tab with window context (first tab in new window)
-        win.newTabForWindow(parent, .{
+        _ = win.newTabForWindow(parent, .{
             .command = overrides.command,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
@@ -2805,10 +2806,20 @@ const Action = struct {
             .surface => |core| core.rt_surface.surface,
         };
 
+        const parent_core: *CoreSurface = switch (target) {
+            .app => unreachable,
+            .surface => |core| core,
+        };
+
         const window = ext.getAncestor(Window, surface.as(gtk.Widget)) orelse {
             log.warn("tmux_reconcile: surface has no ancestor window", .{});
             return;
         };
+
+        const app = Application.default();
+        const alloc = app.allocator();
+        const window_map = window.tmuxWindowMap();
+        const pane_map = window.tmuxPaneMap();
 
         for (payload.ops) |op| {
             switch (op) {
@@ -2818,31 +2829,144 @@ const Action = struct {
 
                 .ensure_window => |ew| {
                     log.debug("tmux reconcile: ensure_window id={}", .{ew.tmux_window_id});
-                    // TODO: Track tmux window->tab mapping and create/retain tabs.
-                    // For now, log and continue. Full tab creation requires
-                    // associating tmux window IDs with GTK tab pages.
+
+                    // If we already have a tab for this window, keep it.
+                    if (window_map.get(ew.tmux_window_id) != null) continue;
+
+                    // Create a new tab. The first pane surface will be
+                    // created by ensure_pane and placed via set_layout.
+                    // For now, the tab gets a default exec surface that
+                    // will be replaced when set_layout applies the tree.
+                    const page = window.newTabForWindow(parent_core, .{});
+                    const child = page.getChild();
+                    const tab = gobject.ext.cast(Tab, child) orelse {
+                        log.warn("tmux reconcile: new tab is not a Tab", .{});
+                        continue;
+                    };
+
+                    window_map.put(alloc, ew.tmux_window_id, tab) catch |err| {
+                        log.warn("tmux reconcile: failed to store window mapping: {}", .{err});
+                        continue;
+                    };
                 },
 
                 .ensure_pane => |ep| {
                     log.debug("tmux reconcile: ensure_pane window={} pane={}", .{ ep.tmux_window_id, ep.pane_id });
-                    // TODO: Create surfaces with tmux backend for each pane.
-                    // Requires ControlWriter reference to be available.
+
+                    // If we already have a surface for this pane, keep it.
+                    if (pane_map.get(ep.pane_id) != null) continue;
+
+                    // Heap-allocate a SurfaceRelayWriter so the ControlWriter's
+                    // context pointer remains stable for the surface's lifetime.
+                    const relay_writer = alloc.create(termio.Tmux.SurfaceRelayWriter) catch |err| {
+                        log.warn("tmux reconcile: failed to allocate relay writer: {}", .{err});
+                        continue;
+                    };
+                    relay_writer.* = .{
+                        .parent_mailbox = .{
+                            .surface = parent_core,
+                            .app = .{ .rt_app = app.rt(), .mailbox = &app.core().mailbox },
+                        },
+                        .alloc = alloc,
+                    };
+
+                    // Create the pane surface with a tmux backend. It will
+                    // be placed into the correct split position by set_layout.
+                    const pane_surface: *Surface = .new(.{
+                        .backend = .{ .tmux = .{
+                            .pane_id = ep.pane_id,
+                            .control_writer = relay_writer.controlWriter(),
+                        } },
+                    });
+
+                    pane_map.put(alloc, ep.pane_id, .{
+                        .surface = pane_surface,
+                        .relay_writer = relay_writer,
+                    }) catch |err| {
+                        log.warn("tmux reconcile: failed to store pane mapping: {}", .{err});
+                        alloc.destroy(relay_writer);
+                        continue;
+                    };
                 },
 
                 .set_layout => |sl| {
                     log.debug("tmux reconcile: set_layout window={}", .{sl.tmux_window_id});
-                    // TODO: Rebuild split tree to match tmux layout shape.
-                    _ = sl.layout;
+
+                    const tab = window_map.get(sl.tmux_window_id) orelse {
+                        log.warn("tmux reconcile: set_layout for unknown window {}", .{sl.tmux_window_id});
+                        continue;
+                    };
+
+                    const split_tree = tab.getSplitTree();
+
+                    // Build a Surface.Tree from the tmux layout shape using
+                    // pane surfaces that were created by ensure_pane.
+                    var tree = buildSurfaceTree(alloc, sl.layout.*, pane_map) catch |err| {
+                        log.warn("tmux reconcile: failed to build surface tree: {}", .{err});
+                        continue;
+                    };
+                    defer tree.deinit();
+
+                    // Apply the new tree. setTree clones it internally and
+                    // triggers a deferred GTK widget rebuild.
+                    split_tree.setTree(&tree);
                 },
 
                 .set_focus => |sf| {
                     log.debug("tmux reconcile: set_focus window={} pane={}", .{ sf.tmux_window_id, sf.pane_id });
-                    // TODO: Switch to the correct tab and focus the correct pane surface.
+
+                    // Activate the tab for this tmux window.
+                    if (window_map.get(sf.tmux_window_id)) |tab| {
+                        const tab_view = window.getTabView();
+                        const page = tab_view.getPage(tab.as(gtk.Widget));
+                        tab_view.setSelectedPage(page);
+                    } else {
+                        log.warn("tmux reconcile: set_focus for unknown window {}", .{sf.tmux_window_id});
+                    }
+
+                    // Focus the pane surface.
+                    if (pane_map.get(sf.pane_id)) |entry| {
+                        entry.surface.grabFocus();
+                    } else {
+                        log.warn("tmux reconcile: set_focus for unknown pane {}", .{sf.pane_id});
+                    }
                 },
 
                 .prune_absent => |pa| {
                     log.debug("tmux reconcile: prune_absent windows={} panes={}", .{ pa.window_ids.len, pa.pane_ids.len });
-                    // TODO: Close tabs/surfaces whose tmux IDs are not in the keep-set.
+
+                    const tab_view = window.getTabView();
+
+                    // Prune pane surfaces whose IDs are not in the keep-set.
+                    // pane_ids is sorted, so we can use binary search.
+                    var pane_iter = pane_map.iterator();
+                    while (pane_iter.next()) |entry| {
+                        if (std.sort.binarySearch(usize, entry.key_ptr.*, pa.pane_ids, {}, struct {
+                            fn cmp(_: void, needle: usize, probe: usize) std.math.Order {
+                                return std.math.order(needle, probe);
+                            }
+                        }.cmp) == null) {
+                            // Pane is absent — destroy its relay writer.
+                            alloc.destroy(entry.value_ptr.relay_writer);
+                            pane_map.removeByPtr(entry.key_ptr);
+                        }
+                    }
+
+                    // Prune tabs whose window IDs are not in the keep-set.
+                    var win_iter = window_map.iterator();
+                    while (win_iter.next()) |entry| {
+                        if (std.sort.binarySearch(usize, entry.key_ptr.*, pa.window_ids, {}, struct {
+                            fn cmp(_: void, needle: usize, probe: usize) std.math.Order {
+                                return std.math.order(needle, probe);
+                            }
+                        }.cmp) == null) {
+                            // Window is absent — close its tab.
+                            const tab = entry.value_ptr.*;
+                            const page = tab_view.getPage(tab.as(gtk.Widget));
+                            tab_view.closePage(page);
+                            window_map.removeByPtr(entry.key_ptr);
+                        }
+                    }
                 },
 
                 .sync_windows_end => {
@@ -2850,8 +2974,157 @@ const Action = struct {
                 },
             }
         }
+    }
 
-        _ = window;
+    /// Build a `Surface.Tree` (datastruct.SplitTree(Surface)) from a tmux
+    /// layout tree. Converts N-ary tmux splits into right-nested binary
+    /// splits with ratios derived from the tmux geometry.
+    ///
+    /// The returned tree holds refs on the surfaces; the caller must
+    /// call `deinit()` to release them.
+    ///
+    /// Upstream anchor: follows SplitTree construction pattern from
+    /// `src/datastruct/split_tree.zig:init` and `split`.
+    fn buildSurfaceTree(
+        gpa: Allocator,
+        layout: terminal.tmux.Layout,
+        pane_map: *const std.AutoHashMapUnmanaged(usize, Window.TmuxPaneEntry),
+    ) Allocator.Error!Surface.Tree {
+        const node_count = countTreeNodes(layout);
+        if (node_count == 0) return Surface.Tree.empty;
+
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+
+        const nodes = try alloc.alloc(Surface.Tree.Node, node_count);
+
+        // Fill nodes starting at index 0 (root). fillNodes returns
+        // the next free index; it must consume exactly node_count.
+        const next = fillLayoutNode(layout, nodes, 0, pane_map) orelse
+            return Surface.Tree.empty;
+        assert(next == node_count);
+
+        // Ref all leaf surfaces. SplitTree owns refs and will unref
+        // on deinit.
+        for (nodes) |*node| {
+            switch (node.*) {
+                .leaf => |surface| {
+                    _ = surface.ref();
+                },
+                .split => {},
+            }
+        }
+
+        return .{
+            .arena = arena,
+            .nodes = nodes,
+            .zoomed = null,
+        };
+    }
+
+    /// Count the total number of SplitTree nodes needed to represent
+    /// a tmux Layout as a binary tree. Each leaf pane = 1 node. Each
+    /// N-ary split = (N-1) split nodes + sum of child subtrees.
+    fn countTreeNodes(layout: terminal.tmux.Layout) usize {
+        return switch (layout.content) {
+            .pane => 1,
+            .horizontal, .vertical => |children| countChildrenNodes(children),
+        };
+    }
+
+    fn countChildrenNodes(children: []const terminal.tmux.Layout) usize {
+        if (children.len == 0) return 0;
+        if (children.len == 1) return countTreeNodes(children[0]);
+
+        // One split node for this level, plus nodes for left child
+        // and nodes for the right subtree (remaining children).
+        return 1 + countTreeNodes(children[0]) + countChildrenNodes(children[1..]);
+    }
+
+    /// Recursively fill nodes array for a tmux Layout. Returns the
+    /// next free index, or null if a required pane surface is missing.
+    fn fillLayoutNode(
+        layout: terminal.tmux.Layout,
+        nodes: []Surface.Tree.Node,
+        idx: usize,
+        pane_map: *const std.AutoHashMapUnmanaged(usize, Window.TmuxPaneEntry),
+    ) ?usize {
+        return switch (layout.content) {
+            .pane => |pane_id| {
+                const entry = pane_map.get(pane_id) orelse {
+                    log.warn("tmux reconcile: set_layout references unknown pane {}", .{pane_id});
+                    return null;
+                };
+                nodes[idx] = .{ .leaf = entry.surface };
+                return idx + 1;
+            },
+            .horizontal => |children| fillChildrenNodes(.horizontal, children, nodes, idx, pane_map),
+            .vertical => |children| fillChildrenNodes(.vertical, children, nodes, idx, pane_map),
+        };
+    }
+
+    /// Fill nodes for an N-ary split, converting to right-nested
+    /// binary splits. The split ratio at each level is computed from
+    /// the tmux geometry (width for horizontal, height for vertical).
+    fn fillChildrenNodes(
+        direction: Surface.Tree.Split.Layout,
+        children: []const terminal.tmux.Layout,
+        nodes: []Surface.Tree.Node,
+        idx: usize,
+        pane_map: *const std.AutoHashMapUnmanaged(usize, Window.TmuxPaneEntry),
+    ) ?usize {
+        if (children.len == 0) return idx;
+        if (children.len == 1) return fillLayoutNode(children[0], nodes, idx, pane_map);
+
+        // Binary split: left = children[0], right = rest.
+        // Place split node at idx, left subtree at idx+1, right
+        // subtree immediately after left.
+        const left_start = idx + 1;
+        const right_start = fillLayoutNode(children[0], nodes, left_start, pane_map) orelse
+            return null;
+        const next = fillChildrenNodes(direction, children[1..], nodes, right_start, pane_map) orelse
+            return null;
+
+        // Compute ratio from tmux geometry. For horizontal splits,
+        // use width; for vertical, use height.
+        const ratio: f16 = computeSplitRatio(direction, children);
+
+        nodes[idx] = .{ .split = .{
+            .layout = direction,
+            .ratio = ratio,
+            .left = @enumFromInt(left_start),
+            .right = @enumFromInt(right_start),
+        } };
+
+        return next;
+    }
+
+    /// Compute the ratio of the first child relative to the total
+    /// dimension of all children in the slice. Returns 0.5 as a
+    /// fallback if the total is zero.
+    fn computeSplitRatio(
+        direction: Surface.Tree.Split.Layout,
+        children: []const terminal.tmux.Layout,
+    ) f16 {
+        if (children.len < 2) return 0.5;
+
+        var total: usize = 0;
+        for (children) |child| {
+            total += switch (direction) {
+                .horizontal => child.width,
+                .vertical => child.height,
+            };
+        }
+
+        if (total == 0) return 0.5;
+
+        const first_dim: usize = switch (direction) {
+            .horizontal => children[0].width,
+            .vertical => children[0].height,
+        };
+
+        return @floatCast(@as(f64, @floatFromInt(first_dim)) / @as(f64, @floatFromInt(total)));
     }
 };
 
@@ -2970,4 +3243,138 @@ fn findActiveWindow(data: ?*const anyopaque, _: ?*const anyopaque) callconv(.c) 
     // but we want to return 0 to indicate equality.
     // Abusing integers to be enums and booleans is a terrible idea, C.
     return if (window.isActive() != 0) 0 else -1;
+}
+
+// --- Tests ---
+
+const testing = std.testing;
+
+test "countTreeNodes: single pane" {
+    const layout: terminal.tmux.Layout = .{
+        .width = 80,
+        .height = 24,
+        .x = 0,
+        .y = 0,
+        .content = .{ .pane = 1 },
+    };
+    try testing.expectEqual(@as(usize, 1), Action.countTreeNodes(layout));
+}
+
+test "countTreeNodes: horizontal split two panes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // 80x24,0,0{40x24,0,0,1,40x24,40,0,2}
+    const layout: terminal.tmux.Layout = try .parse(arena.allocator(), "80x24,0,0{40x24,0,0,1,40x24,40,0,2}");
+    // Binary: split(leaf, leaf) = 1 split + 2 leaves = 3 nodes
+    try testing.expectEqual(@as(usize, 3), Action.countTreeNodes(layout));
+}
+
+test "countTreeNodes: vertical split two panes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const layout: terminal.tmux.Layout = try .parse(arena.allocator(), "80x24,0,0[80x12,0,0,1,80x12,0,12,2]");
+    try testing.expectEqual(@as(usize, 3), Action.countTreeNodes(layout));
+}
+
+test "countTreeNodes: three-way horizontal split" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // 80x24,0,0{27x24,0,0,1,26x24,28,0,2,26x24,55,0,3}
+    const layout: terminal.tmux.Layout = try .parse(
+        arena.allocator(),
+        "80x24,0,0{27x24,0,0,1,26x24,28,0,2,26x24,55,0,3}",
+    );
+    // N-ary with 3 children → 2 split nodes + 3 leaves = 5
+    try testing.expectEqual(@as(usize, 5), Action.countTreeNodes(layout));
+}
+
+test "countTreeNodes: nested layout" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // 80x24,0,0{40x24,0,0,1,40x24,40,0[40x12,40,0,2,40x12,40,12,3]}
+    const layout: terminal.tmux.Layout = try .parse(
+        arena.allocator(),
+        "80x24,0,0{40x24,0,0,1,40x24,40,0[40x12,40,0,2,40x12,40,12,3]}",
+    );
+    // Outer horizontal: split(leaf=1, vertical_split(leaf=2, leaf=3))
+    // = 1 outer split + 1 leaf + 1 inner split + 2 leaves = 5
+    try testing.expectEqual(@as(usize, 5), Action.countTreeNodes(layout));
+}
+
+test "countChildrenNodes: empty children" {
+    const empty: []const terminal.tmux.Layout = &.{};
+    try testing.expectEqual(@as(usize, 0), Action.countChildrenNodes(empty));
+}
+
+test "countChildrenNodes: single child pane" {
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 80, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+    };
+    try testing.expectEqual(@as(usize, 1), Action.countChildrenNodes(children));
+}
+
+test "computeSplitRatio: equal horizontal split" {
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 40, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+        .{ .width = 40, .height = 24, .x = 40, .y = 0, .content = .{ .pane = 2 } },
+    };
+    const ratio = Action.computeSplitRatio(.horizontal, children);
+    try testing.expectEqual(@as(f16, 0.5), ratio);
+}
+
+test "computeSplitRatio: unequal horizontal split" {
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 60, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+        .{ .width = 20, .height = 24, .x = 60, .y = 0, .content = .{ .pane = 2 } },
+    };
+    const ratio = Action.computeSplitRatio(.horizontal, children);
+    try testing.expectEqual(@as(f16, 0.75), ratio);
+}
+
+test "computeSplitRatio: equal vertical split" {
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 80, .height = 12, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+        .{ .width = 80, .height = 12, .x = 0, .y = 12, .content = .{ .pane = 2 } },
+    };
+    const ratio = Action.computeSplitRatio(.vertical, children);
+    try testing.expectEqual(@as(f16, 0.5), ratio);
+}
+
+test "computeSplitRatio: three-way split uses first child ratio" {
+    // With three children [27, 26, 26], first ratio = 27/79
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 27, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+        .{ .width = 26, .height = 24, .x = 28, .y = 0, .content = .{ .pane = 2 } },
+        .{ .width = 26, .height = 24, .x = 55, .y = 0, .content = .{ .pane = 3 } },
+    };
+    const ratio = Action.computeSplitRatio(.horizontal, children);
+    const expected: f16 = @floatCast(@as(f64, 27.0) / @as(f64, 79.0));
+    try testing.expectEqual(expected, ratio);
+}
+
+test "computeSplitRatio: single child returns 0.5" {
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 80, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+    };
+    const ratio = Action.computeSplitRatio(.horizontal, children);
+    try testing.expectEqual(@as(f16, 0.5), ratio);
+}
+
+test "computeSplitRatio: empty children returns 0.5" {
+    const empty: []const terminal.tmux.Layout = &.{};
+    const ratio = Action.computeSplitRatio(.horizontal, empty);
+    try testing.expectEqual(@as(f16, 0.5), ratio);
+}
+
+test "computeSplitRatio: zero dimension returns 0.5" {
+    const children: []const terminal.tmux.Layout = &.{
+        .{ .width = 0, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 1 } },
+        .{ .width = 0, .height = 24, .x = 0, .y = 0, .content = .{ .pane = 2 } },
+    };
+    const ratio = Action.computeSplitRatio(.horizontal, children);
+    try testing.expectEqual(@as(f16, 0.5), ratio);
 }
