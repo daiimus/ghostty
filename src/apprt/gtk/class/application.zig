@@ -3129,8 +3129,14 @@ const Action = struct {
 
         // Fill nodes starting at index 0 (root). fillNodes returns
         // the next free index; it must consume exactly node_count.
-        const next = fillLayoutNode(layout, nodes, 0, pane_map) orelse
+        const next = fillLayoutNode(layout, nodes, 0, pane_map) orelse {
+            // fillLayoutNode returned null (pane not found in map).
+            // This is a normal return, not an error, so errdefer
+            // does not fire. Deinit the arena explicitly to avoid
+            // leaking the allocated nodes.
+            arena.deinit();
             return Surface.Tree.empty;
+        };
         assert(next == node_count);
 
         // Ref all leaf surfaces. SplitTree owns refs and will unref
