@@ -226,6 +226,14 @@ pub const Viewer = struct {
             data: []const u8,
         },
 
+        /// The active pane changed in tmux. The caller should update
+        /// focus to the specified window and pane. This is emitted in
+        /// response to `%window-pane-changed` notifications from tmux.
+        focus: struct {
+            window_id: usize,
+            pane_id: usize,
+        },
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -536,9 +544,23 @@ pub const Viewer = struct {
                 return self.defunct();
             },
 
-            // The active pane changed. We don't care about this because
-            // we handle our own focus.
-            .window_pane_changed => {},
+            // The active pane changed in tmux. Forward to the caller
+            // so it can update focus to the correct window and pane.
+            .window_pane_changed => |info| {
+                var arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = arena.state;
+                actions.append(arena.allocator(), .{
+                    .focus = .{
+                        .window_id = info.window_id,
+                        .pane_id = info.pane_id,
+                    },
+                }) catch {
+                    log.warn("failed to queue focus action for window={} pane={}", .{
+                        info.window_id,
+                        info.pane_id,
+                    });
+                };
+            },
 
             // We ignore this one. It means a session was created or
             // destroyed. If it was our own session we will get an exit
@@ -2510,4 +2532,88 @@ test "Action.format output with empty data" {
 
     try testing.expect(std.mem.indexOf(u8, result, "pane_id=0") != null);
     try testing.expect(std.mem.indexOf(u8, result, "bytes=0") != null);
+}
+
+test "window_pane_changed produces focus action" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        // Receive version response, which triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Receive initial window layout with two panes
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete all capture-pane commands (4 per pane × 2 panes = 8)
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Queue should now be empty
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+        // Send window_pane_changed - should produce .focus action
+        .{
+            .input = .{ .tmux = .{ .window_pane_changed = .{
+                .window_id = 0,
+                .pane_id = 1,
+            } } },
+            .contains_tags = &.{.focus},
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    var found = false;
+                    for (actions) |action| {
+                        if (action == .focus) {
+                            try testing.expectEqual(@as(usize, 0), action.focus.window_id);
+                            try testing.expectEqual(@as(usize, 1), action.focus.pane_id);
+                            found = true;
+                        }
+                    }
+                    try testing.expect(found);
+                }
+            }).check,
+        },
+    });
+}
+
+test "Action.format handles focus action" {
+    const action: Viewer.Action = .{ .focus = .{
+        .window_id = 5,
+        .pane_id = 12,
+    } };
+
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+    try action.format(&builder.writer);
+    const result = builder.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, result, "focus") != null);
 }
