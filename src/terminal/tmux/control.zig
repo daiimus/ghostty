@@ -232,7 +232,10 @@ pub const Parser = struct {
                 usize,
                 line[@intCast(starts[1])..@intCast(ends[1])],
                 10,
-            ) catch unreachable;
+            ) catch {
+                log.warn("integer overflow in notification cmd={s}", .{cmd});
+                break :cmd;
+            };
             const data = line[@intCast(starts[2])..@intCast(ends[2])];
 
             // Important: do not clear buffer here since name points to it
@@ -263,7 +266,10 @@ pub const Parser = struct {
                 usize,
                 line[@intCast(starts[1])..@intCast(ends[1])],
                 10,
-            ) catch unreachable;
+            ) catch {
+                log.warn("integer overflow in notification cmd={s}", .{cmd});
+                break :cmd;
+            };
             const name = line[@intCast(starts[2])..@intCast(ends[2])];
 
             // Important: do not clear buffer here since name points to it
@@ -303,7 +309,10 @@ pub const Parser = struct {
                 usize,
                 line[@intCast(starts[1])..@intCast(ends[1])],
                 10,
-            ) catch unreachable;
+            ) catch {
+                log.warn("integer overflow in notification cmd={s}", .{cmd});
+                break :cmd;
+            };
             const layout = line[@intCast(starts[2])..@intCast(ends[2])];
             const visible_layout = line[@intCast(starts[3])..@intCast(ends[3])];
             const raw_flags = line[@intCast(starts[4])..@intCast(ends[4])];
@@ -341,7 +350,10 @@ pub const Parser = struct {
                 usize,
                 line[@intCast(starts[1])..@intCast(ends[1])],
                 10,
-            ) catch unreachable;
+            ) catch {
+                log.warn("integer overflow in notification cmd={s}", .{cmd});
+                break :cmd;
+            };
 
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
@@ -371,7 +383,10 @@ pub const Parser = struct {
                 usize,
                 line[@intCast(starts[1])..@intCast(ends[1])],
                 10,
-            ) catch unreachable;
+            ) catch {
+                log.warn("integer overflow in notification cmd={s}", .{cmd});
+                break :cmd;
+            };
             const name = line[@intCast(starts[2])..@intCast(ends[2])];
 
             // Important: do not clear buffer here since name points to it
@@ -402,12 +417,18 @@ pub const Parser = struct {
                 usize,
                 line[@intCast(starts[1])..@intCast(ends[1])],
                 10,
-            ) catch unreachable;
+            ) catch {
+                log.warn("integer overflow in notification cmd={s}", .{cmd});
+                break :cmd;
+            };
             const pane_id = std.fmt.parseInt(
                 usize,
                 line[@intCast(starts[2])..@intCast(ends[2])],
                 10,
-            ) catch unreachable;
+            ) catch {
+                log.warn("integer overflow in notification cmd={s}", .{cmd});
+                break :cmd;
+            };
 
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
@@ -464,7 +485,10 @@ pub const Parser = struct {
                 usize,
                 line[@intCast(starts[2])..@intCast(ends[2])],
                 10,
-            ) catch unreachable;
+            ) catch {
+                log.warn("integer overflow in notification cmd={s}", .{cmd});
+                break :cmd;
+            };
             const name = line[@intCast(starts[3])..@intCast(ends[3])];
 
             // Important: do not clear buffer here since client/name point to it
@@ -822,4 +846,33 @@ test "tmux block %error with matching guard terminates as error" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_err);
     try testing.expectEqualStrings("some output", n.block_err);
+}
+
+test "tmux output with overflowing pane id is skipped" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    // Pane ID exceeding usize — parser should skip, not crash
+    for ("%output %99999999999999999999999 data") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expect(try c.put('\n') == null);
+    // Parser should return to idle and handle the next notification
+    for ("%sessions-changed") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .sessions_changed);
+}
+
+test "tmux window-add with overflowing id is skipped" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%window-add @99999999999999999999999") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expect(try c.put('\n') == null);
+    // Parser recovers and handles next notification
+    for ("%sessions-changed") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .sessions_changed);
 }
