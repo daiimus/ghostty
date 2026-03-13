@@ -347,9 +347,6 @@ pub const Action = union(Key) {
     /// is a heap-allocated list of structural ops (ensure/prune tabs and
     /// panes) that the apprt applies atomically. The receiver must call
     /// `deinit` on the payload after processing.
-    ///
-    /// Upstream anchor: follows the `config_change` pointer-payload
-    /// pattern from `src/apprt/action.zig`.
     tmux_reconcile: TmuxReconcile,
 
     /// Route tmux pane output to the correct child surface. The parent
