@@ -2856,24 +2856,10 @@ const Action = struct {
                 .ensure_window => |ew| {
                     log.debug("tmux reconcile: ensure_window id={}", .{ew.tmux_window_id});
 
-                    // If we already have a tab for this window, keep it.
+                    // Tab creation is deferred to set_layout so we don't
+                    // spawn a throwaway exec surface. The tab will be
+                    // created with the correct tree already available.
                     if (window_map.get(ew.tmux_window_id) != null) continue;
-
-                    // Create a new tab. The first pane surface will be
-                    // created by ensure_pane and placed via set_layout.
-                    // For now, the tab gets a default exec surface that
-                    // will be replaced when set_layout applies the tree.
-                    const page = window.newTabForWindow(parent_core, .{});
-                    const child = page.getChild();
-                    const tab = gobject.ext.cast(Tab, child) orelse {
-                        log.warn("tmux reconcile: new tab is not a Tab", .{});
-                        continue;
-                    };
-
-                    window_map.put(alloc, ew.tmux_window_id, tab) catch |err| {
-                        log.warn("tmux reconcile: failed to store window mapping: {}", .{err});
-                        continue;
-                    };
                 },
 
                 .ensure_pane => |ep| {
@@ -2952,9 +2938,21 @@ const Action = struct {
                 .set_layout => |sl| {
                     log.debug("tmux reconcile: set_layout window={}", .{sl.tmux_window_id});
 
-                    const tab = window_map.get(sl.tmux_window_id) orelse {
-                        log.warn("tmux reconcile: set_layout for unknown window {}", .{sl.tmux_window_id});
-                        continue;
+                    // Create the tab on first layout, deferring creation from
+                    // ensure_window so the throwaway initial surface from
+                    // Tab.new is immediately replaced before GTK realizes it.
+                    const tab = window_map.get(sl.tmux_window_id) orelse tab: {
+                        const page = window.newTabForWindow(parent_core, .{});
+                        const child = page.getChild();
+                        const new_tab = gobject.ext.cast(Tab, child) orelse {
+                            log.warn("tmux reconcile: new tab is not a Tab", .{});
+                            continue;
+                        };
+                        window_map.put(alloc, sl.tmux_window_id, new_tab) catch |err| {
+                            log.warn("tmux reconcile: failed to store window mapping: {}", .{err});
+                            continue;
+                        };
+                        break :tab new_tab;
                     };
 
                     const split_tree = tab.getSplitTree();
