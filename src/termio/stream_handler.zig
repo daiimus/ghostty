@@ -447,14 +447,12 @@ pub const StreamHandler = struct {
                             // Deep-copy the window topology and forward it to
                             // the app thread via the surface mailbox. The app
                             // thread will reconcile tmux windows/panes into
-                            // apprt surfaces (Slice 3 commit 4).
+                            // apprt surfaces.
                             //
-                            // Upstream anchor: PR #9860 (viewer reconciliation
-                            // loop) emits .windows actions when list-windows
-                            // output is parsed. The viewer already maintains
-                            // the authoritative window list in viewer.windows;
-                            // this handler forwards the topology so the app
-                            // thread can diff and create/destroy surfaces.
+                            // The viewer already maintains the authoritative
+                            // window list; this handler forwards the topology
+                            // so the app thread can diff and create/destroy
+                            // surfaces.
                             for (windows) |window| {
                                 log.debug("tmux window id={} size={}x{}", .{
                                     window.id,
@@ -485,11 +483,6 @@ pub const StreamHandler = struct {
                             // handler copies the data into a WriteReq so it
                             // survives beyond the current parser buffer
                             // lifetime.
-                            //
-                            // Upstream anchor: follows the tmux_write_command
-                            // relay pattern (SurfaceRelayWriter) where
-                            // WriteReq copies command bytes for cross-thread
-                            // delivery.
                             const SurfaceWriteReq = apprt.surface.Message.WriteReq;
                             const req = SurfaceWriteReq.init(self.alloc, output.data) catch |err| {
                                 log.warn("tmux pane output alloc failed: {}", .{err});
@@ -510,10 +503,6 @@ pub const StreamHandler = struct {
                             //
                             // Lightweight value message — no heap allocation
                             // needed, just two IDs.
-                            //
-                            // Upstream anchor: follows the scrollbar message
-                            // pattern where a small value struct is sent
-                            // directly through the surface mailbox.
                             self.surfaceMessageWriter(.{
                                 .tmux_focus_changed = .{
                                     .window_id = focus.window_id,

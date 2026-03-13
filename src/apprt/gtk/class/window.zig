@@ -229,10 +229,7 @@ pub const Window = extern struct {
     /// surface has been created. Output chunks are appended in order and
     /// replayed once ensure_pane creates the surface. Overflow follows a
     /// drop-newest policy: new chunks are rejected when the buffer is at
-    /// capacity.
-    ///
-    /// Upstream anchor: capacity matches the 1 MiB hard cap used by the
-    /// tmux control parser (control.zig:30) and DCS handler (dcs.zig:19).
+    /// capacity (1 MiB, matching the tmux control parser cap).
     pub const PaneOutputBuffer = struct {
         /// Maximum bytes buffered per pane before dropping new output.
         const max_bytes: usize = 1024 * 1024;
@@ -312,11 +309,8 @@ pub const Window = extern struct {
         context_menu_page: ?*adw.TabPage = null,
 
         /// Tmux reconcile state: maps tmux window IDs to the GTK tab
-        /// created for each window. Populated by ensure_window, pruned
+        /// created for each window. Populated by set_layout, pruned
         /// by prune_absent. Keyed by tmux window ID (usize).
-        ///
-        /// Upstream anchor: follows AutoHashMapUnmanaged pattern from
-        /// `src/terminal/kitty/graphics_storage.zig`.
         tmux_window_to_tab: std.AutoHashMapUnmanaged(usize, *Tab) = .{},
 
         /// Tmux reconcile state: maps tmux pane IDs to the GTK surface
@@ -329,9 +323,6 @@ pub const Window = extern struct {
         /// tmux pane ID (usize). Entries are created on first buffered
         /// output, drained on ensure_pane replay, and freed on
         /// prune_absent or window finalize.
-        ///
-        /// Upstream anchor: bounded buffer pattern from control.zig:30
-        /// and dcs.zig:19 (1 MiB cap).
         tmux_pane_output_buffers: std.AutoHashMapUnmanaged(usize, PaneOutputBuffer) = .{},
 
         // Template bindings
