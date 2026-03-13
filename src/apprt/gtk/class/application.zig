@@ -2817,9 +2817,6 @@ const Action = struct {
     ///
     /// The payload is owned by the caller (core handleMessage) and is
     /// valid for the duration of this call. The apprt must not store it.
-    ///
-    /// Upstream anchor: follows the `configChange` handler pattern that
-    /// receives a pointer-payload and applies structural mutations.
     pub fn tmuxReconcile(target: apprt.Target, value: apprt.Action.Value(.tmux_reconcile)) void {
         const payload = value.payload;
         defer payload.deinit();
@@ -3094,10 +3091,6 @@ const Action = struct {
     /// calls processOutput on its Termio. If the pane is not yet
     /// created, the output is buffered (up to 1 MiB per pane) for
     /// replay when ensure_pane creates the surface.
-    ///
-    /// Upstream anchor: follows the tmux_reconcile pattern for
-    /// target → surface → window resolution. Buffer cap follows
-    /// control.zig:30 / dcs.zig:19 (1 MiB).
     pub fn tmuxPaneOutput(target: apprt.Target, value: apprt.Action.Value(.tmux_pane_output)) void {
         const surface = switch (target) {
             .app => {

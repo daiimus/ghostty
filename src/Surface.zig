@@ -467,10 +467,8 @@ pub const InitOptions = struct {
 /// identified by a pane ID and a ControlWriter to the parent
 /// terminal's pty.
 ///
-/// Upstream anchor: `src/termio/backend.zig` defines `Kind` and
-/// `Backend` as the dispatch union. This type mirrors that for the
-/// surface creation seam so the decision is made once at init time,
-/// not scattered across handlers.
+/// Mirrors `termio.backend.Kind` so the backend decision is made
+/// once at surface init, not scattered across handlers.
 pub const BackendConfig = union(enum) {
     /// Standard exec backend — spawn a child process with a pty.
     exec,
@@ -489,9 +487,6 @@ pub const BackendConfig = union(enum) {
 /// converts a `TmuxTopologySnapshot` into an ordered list of these ops.
 /// The apprt receives them via the `tmux_reconcile` action and applies
 /// them using its own tab/split/surface primitives.
-///
-/// Upstream anchor: follows the tagged-union dispatch pattern from
-/// `src/termio/backend.zig` (`Kind`/`Backend`).
 pub const TmuxReconcileOp = union(enum) {
     /// Begin an atomic reconcile transaction. The apprt may defer
     /// visual updates until `sync_windows_end`.
@@ -545,8 +540,7 @@ pub const TmuxReconcileOp = union(enum) {
 /// (layout trees, ID slices). The receiver must call `deinit` after
 /// processing.
 ///
-/// Upstream anchor: follows the `change_config: *const Config` pattern
-/// in `src/apprt/surface.zig` — heap-allocated, pointer-passed, callee-freed.
+/// Heap-allocated and pointer-passed; the receiver frees via `deinit`.
 pub const TmuxReconcilePayload = struct {
     /// Allocator used to create this struct itself.
     alloc: Allocator,
@@ -747,11 +741,6 @@ pub fn init(
 /// The `opts.backend` field selects which termio backend to use:
 /// - `.exec`: spawns a subprocess with a pty (default behavior)
 /// - `.tmux`: routes I/O through a tmux control mode connection
-///
-/// Upstream anchor: the backend decision happens here at the
-/// canonical construction seam (`Surface.init`), not scattered
-/// across runtime handlers. See `src/termio/backend.zig` for
-/// the backend dispatch union this feeds into.
 pub fn initWithOptions(
     self: *Surface,
     alloc: Allocator,
@@ -1498,8 +1487,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             // the single producer for this surface's termio mailbox from
             // outside the IO thread.
             //
-            // Upstream anchor: same pattern as `report_title` handler
-            // which calls queueIo with write data.
             // Surface WriteReq.Small holds up to 255 bytes but termio
             // WriteReq.Small holds only 38. Use writeReq() to handle
             // the size decision for the small case; stable and alloc
@@ -1529,11 +1516,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             // The WriteReq may hold heap-allocated data (alloc variant)
             // for output larger than 255 bytes. Free it after the
             // synchronous performAction call consumes the slice.
-            //
-            // Upstream anchor: follows the tmux_reconcile pattern where
-            // handleMessage dispatches to performAction for apprt-specific
-            // resolution (pane_id → child surface lookup), and the
-            // pwd_change pattern for WriteReq lifetime (defer deinit).
             defer po.data.deinit();
             const data = po.data.slice();
             _ = try self.rt_app.performAction(
@@ -1554,9 +1536,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             // tmux_reconcile action. This avoids a separate apprt
             // handler — the GTK set_focus op handler already knows
             // how to select the correct tab and pane.
-            //
-            // Upstream anchor: reuses the tmux_reconcile action
-            // and TmuxReconcilePayload established in Slice 3.
             const payload = focusTmuxReconcile(
                 self.alloc,
                 fc.window_id,

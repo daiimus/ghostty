@@ -15,20 +15,13 @@
 //! switch exhaustiveness checks cover it. Actual usage (creating a tmux
 //! surface) is gated at call sites by `tmux_control_mode` build option.
 //!
-//! ## Upstream Anchor
-//!
-//! - Issue #1935: Support for tmux's Control Mode
-//! - PR #1948: Termio refactor separating Backend and Mailbox (established
-//!   the Backend union pattern this implements)
-//! - PR #9860: tmux Viewer reconciliation loop (defines the Viewer that
-//!   owns the tmux session state on the parent terminal)
-//!
 //! ## Threading
 //!
 //! The ControlWriter is invoked on the IO thread of the child surface.
 //! The `ParentWriter` implementation posts write requests to the parent's
 //! SPSC termio mailbox. See `ParentWriter` doc comments for the full
-//! threading contract and the Slice 3 relay plan for cross-thread safety.
+//! threading contract. `SurfaceRelayWriter` provides the cross-thread
+//! relay path through the app mailbox.
 const Tmux = @This();
 
 const std = @import("std");
@@ -93,17 +86,16 @@ pub const ControlWriter = struct {
 /// ## Threading Contract
 ///
 /// This writer is safe to call from the parent's IO thread (the same
-/// thread that runs the stream handler). This is the only context in
-/// which it is used in Slice 2: the `.command` viewer action already
-/// writes to the parent termio mailbox from the stream handler via
-/// the same `Mailbox.send` path.
+/// thread that runs the stream handler). The `.command` viewer action
+/// already writes to the parent termio mailbox from the stream handler
+/// via the same `Mailbox.send` path.
 ///
-/// For Slice 3, when child surfaces run on their own IO threads, the
-/// child will NOT call ParentWriter directly. Instead, the child will
-/// post a message through `apprt.surface.Mailbox` (which routes via
-/// the app thread), and the parent's surface will relay the command
-/// into its own termio mailbox. This preserves the SPSC invariant:
-/// the parent's IO thread remains the single producer.
+/// When child surfaces run on their own IO threads, the child does NOT
+/// call ParentWriter directly. Instead, the child posts a message
+/// through `apprt.surface.Mailbox` (which routes via the app thread),
+/// and the parent's surface relays the command into its own termio
+/// mailbox. This preserves the SPSC invariant: the parent's IO thread
+/// remains the single producer.
 ///
 /// ## Lifetime
 ///
@@ -111,10 +103,10 @@ pub const ControlWriter = struct {
 /// lifetime of this writer. In practice, the parent `Termio` owns
 /// both and outlives all child surfaces it creates.
 ///
-/// ## Upstream Anchor
+/// ## References
 ///
-/// - `stream_handler.zig` `.command` handler (line 437-443): uses the
-///   same `Mailbox.send` path to write viewer commands to the parent pty.
+/// - `stream_handler.zig` `.command` handler: uses the same
+///   `Mailbox.send` path to write viewer commands to the parent pty.
 /// - `mailbox.zig`: SPSC send with renderer mutex handoff.
 pub const ParentWriter = struct {
     mailbox: *termio.Mailbox,
@@ -140,10 +132,9 @@ pub const ParentWriter = struct {
 };
 
 /// A ControlWriter implementation that routes tmux commands through
-/// the app mailbox to the parent surface. This is the Slice 3
-/// replacement for `ParentWriter` in cross-thread scenarios: when a
-/// child tmux pane runs on its own IO thread, it cannot safely write
-/// directly into the parent's SPSC termio mailbox.
+/// the app mailbox to the parent surface. When a child tmux pane runs
+/// on its own IO thread, it cannot safely write directly into the
+/// parent's SPSC termio mailbox.
 ///
 /// Instead, command bytes are wrapped in an `apprt.surface.Message`
 /// (.tmux_write_command) and pushed to the parent surface's mailbox.
@@ -167,12 +158,6 @@ pub const ParentWriter = struct {
 /// The `parent_mailbox` must remain valid for the lifetime of this
 /// writer. In practice, the parent surface outlives all child surfaces
 /// it creates.
-///
-/// ## Upstream Anchor
-///
-/// - `apprt/surface.zig` `Mailbox.push`: routes through app mailbox
-///   with surface pointer, delivered by app thread
-/// - `Surface.zig` `handleMessage(.tmux_write_command)`: relay endpoint
 pub const SurfaceRelayWriter = struct {
     parent_mailbox: apprt.surface.Mailbox,
     alloc: Allocator,

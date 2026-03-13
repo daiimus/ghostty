@@ -112,10 +112,6 @@ pub const Message = union(enum) {
     /// deep copy of the viewer's windows and layouts, allocated on its own
     /// arena. The receiver (app thread) owns the snapshot and must call
     /// deinit when done.
-    ///
-    /// Upstream anchor: follows the `change_config: *const Config` pattern
-    /// where the IO thread heap-allocates a payload and sends a pointer
-    /// through the surface mailbox; the app thread consumes and frees it.
     tmux_topology_changed: *TmuxTopologySnapshot,
 
     /// A tmux child pane is relaying a command to its parent surface's
@@ -126,9 +122,6 @@ pub const Message = union(enum) {
     /// This preserves the SPSC invariant: the parent's IO thread remains
     /// the single consumer of its termio mailbox. The child never writes
     /// directly to the parent's mailbox.
-    ///
-    /// Upstream anchor: follows the `clipboard_write` pattern where
-    /// `WriteReq` carries command bytes with small/alloc ownership.
     tmux_write_command: WriteReq,
 
     /// Pane output from the tmux control mode stream (`%output`
@@ -136,9 +129,6 @@ pub const Message = union(enum) {
     /// this message targeting the parent surface's own mailbox.
     /// `handleMessage` dispatches it as a `tmux_pane_output` action
     /// so the apprt can route the data to the correct child surface.
-    ///
-    /// Upstream anchor: follows the `clipboard_write` pattern where
-    /// a struct wraps `WriteReq` with additional metadata.
     tmux_pane_output: TmuxPaneOutput,
 
     /// The active pane changed in tmux (`%window-pane-changed`
@@ -148,10 +138,6 @@ pub const Message = union(enum) {
     ///
     /// Lightweight value type — no heap allocation needed since it
     /// carries only two IDs.
-    ///
-    /// Upstream anchor: follows the `scrollbar: terminal.Scrollbar`
-    /// pattern where a small value struct is passed directly in the
-    /// message union without heap allocation.
     tmux_focus_changed: TmuxFocusChanged,
 
     pub const ReportTitleStyle = enum {
