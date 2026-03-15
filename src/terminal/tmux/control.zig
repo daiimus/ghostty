@@ -201,6 +201,9 @@ pub const Parser = struct {
                 "";
             var guard: Guard = .{};
             const copy_len: u8 = @intCast(@min(guard_str.len, guard.buf.len));
+            if (guard_str.len > guard.buf.len) {
+                log.warn("tmux guard string truncated: {d} bytes exceeds {d}-byte buffer", .{ guard_str.len, guard.buf.len });
+            }
             @memcpy(guard.buf[0..copy_len], guard_str[0..copy_len]);
             guard.len = copy_len;
 
