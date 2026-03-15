@@ -271,11 +271,12 @@ pub const Layout = struct {
             switch (node.*) {
                 .leaf => |view| {
                     const func = @typeInfo(@TypeOf(V.ref)).@"fn";
-                    _ = switch (func.params.len) {
+                    const reffed = switch (func.params.len) {
                         1 => view.ref(),
                         2 => try view.ref(gpa),
                         else => @compileError("invalid view ref function"),
                     };
+                    node.* = .{ .leaf = reffed };
                 },
                 .split => {},
             }
