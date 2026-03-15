@@ -1025,6 +1025,11 @@ pub const Viewer = struct {
             // Determine which screen to use based on alternate_on
             const screen_key: ScreenSet.Key = if (data.alternate_on) .alternate else .primary;
 
+            // Switch the terminal to the correct active screen. The
+            // capture sequence processes primary then alternate, so the
+            // terminal may be left on the wrong screen without this.
+            _ = try t.switchScreen(screen_key);
+
             // Set cursor position on the appropriate screen (tmux uses 0-based)
             if (t.screens.get(screen_key)) |screen| {
                 cursor: {
