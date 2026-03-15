@@ -3004,11 +3004,12 @@ const Action = struct {
                     // invalidated by any map modification. Collect keys during
                     // iteration, then remove in a second pass. Cleanup actions
                     // (surface.unref, alloc.destroy) don't modify the map and
-                    // are safe during iteration.
+                    // are safe during iteration. Dynamic lists are used to
+                    // avoid silent truncation with fixed-size buffers.
 
                     // Prune pane surfaces whose IDs are not in the keep-set.
-                    var panes_buf: [512]usize = undefined;
-                    var panes_n: usize = 0;
+                    var panes_to_remove: std.ArrayListUnmanaged(usize) = .empty;
+                    defer panes_to_remove.deinit(alloc);
                     {
                         var pane_iter = pane_map.iterator();
                         while (pane_iter.next()) |entry| {
@@ -3019,20 +3020,19 @@ const Action = struct {
                             }.cmp) == null) {
                                 entry.value_ptr.surface.unref();
                                 alloc.destroy(entry.value_ptr.relay_writer);
-                                if (panes_n < panes_buf.len) {
-                                    panes_buf[panes_n] = entry.key_ptr.*;
-                                    panes_n += 1;
-                                }
+                                panes_to_remove.append(alloc, entry.key_ptr.*) catch |err| {
+                                    log.warn("prune_absent pane key alloc failed: {}", .{err});
+                                };
                             }
                         }
                     }
-                    for (panes_buf[0..panes_n]) |pane_id| {
+                    for (panes_to_remove.items) |pane_id| {
                         _ = pane_map.remove(pane_id);
                     }
 
                     // Prune output buffers for absent panes.
-                    var bufs_buf: [512]usize = undefined;
-                    var bufs_n: usize = 0;
+                    var bufs_to_remove: std.ArrayListUnmanaged(usize) = .empty;
+                    defer bufs_to_remove.deinit(alloc);
                     {
                         var buf_iter = buf_map.iterator();
                         while (buf_iter.next()) |entry| {
@@ -3042,20 +3042,19 @@ const Action = struct {
                                 }
                             }.cmp) == null) {
                                 entry.value_ptr.deinit(alloc);
-                                if (bufs_n < bufs_buf.len) {
-                                    bufs_buf[bufs_n] = entry.key_ptr.*;
-                                    bufs_n += 1;
-                                }
+                                bufs_to_remove.append(alloc, entry.key_ptr.*) catch |err| {
+                                    log.warn("prune_absent buf key alloc failed: {}", .{err});
+                                };
                             }
                         }
                     }
-                    for (bufs_buf[0..bufs_n]) |buf_id| {
+                    for (bufs_to_remove.items) |buf_id| {
                         _ = buf_map.remove(buf_id);
                     }
 
                     // Prune tabs whose window IDs are not in the keep-set.
-                    var wins_buf: [512]usize = undefined;
-                    var wins_n: usize = 0;
+                    var wins_to_remove: std.ArrayListUnmanaged(usize) = .empty;
+                    defer wins_to_remove.deinit(alloc);
                     {
                         var win_iter = window_map.iterator();
                         while (win_iter.next()) |entry| {
@@ -3067,14 +3066,13 @@ const Action = struct {
                                 const tab = entry.value_ptr.*;
                                 const page = tab_view.getPage(tab.as(gtk.Widget));
                                 tab_view.closePage(page);
-                                if (wins_n < wins_buf.len) {
-                                    wins_buf[wins_n] = entry.key_ptr.*;
-                                    wins_n += 1;
-                                }
+                                wins_to_remove.append(alloc, entry.key_ptr.*) catch |err| {
+                                    log.warn("prune_absent win key alloc failed: {}", .{err});
+                                };
                             }
                         }
                     }
-                    for (wins_buf[0..wins_n]) |win_id| {
+                    for (wins_to_remove.items) |win_id| {
                         _ = window_map.remove(win_id);
                     }
                 },
