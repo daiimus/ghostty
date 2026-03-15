@@ -293,7 +293,7 @@ extension Ghostty {
                         y: 0),
                     rectangle: false)
                 guard ghostty_surface_read_text(surface, sel, &text) else { return "" }
-                defer { ghostty_surface_free_text(surface, &text) }
+                defer { ghostty_surface_free_text(&text) }
                 return String(cString: text.text)
             }
             cachedVisibleContents = .init(duration: .milliseconds(500)) { [weak self] in
@@ -313,7 +313,7 @@ extension Ghostty {
                         y: 0),
                     rectangle: false)
                 guard ghostty_surface_read_text(surface, sel, &text) else { return "" }
-                defer { ghostty_surface_free_text(surface, &text) }
+                defer { ghostty_surface_free_text(&text) }
                 return String(cString: text.text)
             }
 
@@ -1431,7 +1431,7 @@ extension Ghostty {
             // Grab the text under the cursor
             var text = ghostty_text_s()
             guard ghostty_surface_quicklook_word(surface, &text) else { return super.quickLook(with: event) }
-            defer { ghostty_surface_free_text(surface, &text) }
+            defer { ghostty_surface_free_text(&text) }
             guard text.text_len > 0  else { return super.quickLook(with: event) }
 
             // If we can get a font then we use the font. This should always work
@@ -1825,7 +1825,7 @@ extension Ghostty.SurfaceView: NSTextInputClient {
         // way I can think of to solve this for AppKit.
         var text = ghostty_text_s()
         guard ghostty_surface_read_selection(surface, &text) else { return NSRange() }
-        defer { ghostty_surface_free_text(surface, &text) }
+        defer { ghostty_surface_free_text(&text) }
         return NSRange(location: Int(text.offset_start), length: Int(text.offset_len))
     }
 
@@ -1876,7 +1876,7 @@ extension Ghostty.SurfaceView: NSTextInputClient {
         // Get our selection text
         var text = ghostty_text_s()
         guard ghostty_surface_read_selection(surface, &text) else { return nil }
-        defer { ghostty_surface_free_text(surface, &text) }
+        defer { ghostty_surface_free_text(&text) }
 
         // If we can get a font then we use the font. This should always work
         // since we always have a primary font. The only scenario this doesn't
@@ -1924,7 +1924,7 @@ extension Ghostty.SurfaceView: NSTextInputClient {
                 y = text.tl_px_y + 2
 
                 // Free our text
-                ghostty_surface_free_text(surface, &text)
+                ghostty_surface_free_text(&text)
             } else {
                 ghostty_surface_ime_point(surface, &x, &y, &width, &height)
             }
@@ -2091,7 +2091,7 @@ extension Ghostty.SurfaceView: NSServicesMenuRequestor {
         // Read the selection
         var text = ghostty_text_s()
         guard ghostty_surface_read_selection(surface, &text) else { return false }
-        defer { ghostty_surface_free_text(surface, &text) }
+        defer { ghostty_surface_free_text(&text) }
 
         pboard.declareTypes([.string], owner: nil)
         pboard.setString(String(cString: text.text), forType: .string)
@@ -2235,7 +2235,7 @@ extension Ghostty.SurfaceView {
         // Attempt to read the selection
         var text = ghostty_text_s()
         guard ghostty_surface_read_selection(surface, &text) else { return nil }
-        defer { ghostty_surface_free_text(surface, &text) }
+        defer { ghostty_surface_free_text(&text) }
 
         let str = String(cString: text.text)
         return str.isEmpty ? nil : str
