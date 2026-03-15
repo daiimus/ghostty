@@ -391,7 +391,7 @@ typedef enum {
   GHOSTTY_POINT_ACTIVE,
   GHOSTTY_POINT_VIEWPORT,
   GHOSTTY_POINT_SCREEN,
-  GHOSTTY_POINT_SURFACE,
+  GHOSTTY_POINT_HISTORY,
 } ghostty_point_tag_e;
 
 typedef enum {
