@@ -5,7 +5,6 @@ const testing = std.testing;
 const assert = @import("../../quirks.zig").inlineAssert;
 const size = @import("../size.zig");
 const CircBuf = @import("../../datastruct/main.zig").CircBuf;
-const CursorStyle = @import("../cursor.zig").Style;
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const Terminal = @import("../Terminal.zig");
@@ -423,19 +422,6 @@ pub const Viewer = struct {
                 };
             },
 
-            else => return &.{},
-        }
-    }
-
-    fn nextIdle(
-        self: *Viewer,
-        n: control.Notification,
-    ) []const Action {
-        assert(self.state == .idle);
-
-        switch (n) {
-            .enter => unreachable,
-            .exit => return self.defunct(),
             else => return &.{},
         }
     }
