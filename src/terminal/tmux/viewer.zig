@@ -631,6 +631,23 @@ pub const Viewer = struct {
             return;
         };
 
+        // Validate the layout string before doing any destructive arena
+        // work. The arena reset below invalidates all existing layout
+        // pointers, so a parse failure after that point would leave
+        // dangling references. Validating first keeps state intact on
+        // bad input from tmux.
+        {
+            var check_arena: ArenaAllocator = .init(self.alloc);
+            defer check_arena.deinit();
+            _ = Layout.parseWithChecksum(check_arena.allocator(), layout_str) catch {
+                log.warn(
+                    "failed to parse window layout id={} layout={s}",
+                    .{ window_id, layout_str },
+                );
+                return;
+            };
+        }
+
         // Clone unchanged windows' layouts into a temporary arena BEFORE
         // resetting the shared arena. After arena.reset(.retain_capacity),
         // the backing pages are reused and old layout pointers become
@@ -654,17 +671,9 @@ pub const Viewer = struct {
         _ = win_arena.reset(.retain_capacity);
         const win_alloc = win_arena.allocator();
 
-        // Parse the changed window's layout from the new layout string.
-        const new_layout: Layout = Layout.parseWithChecksum(
-            win_alloc,
-            layout_str,
-        ) catch |err| {
-            log.info(
-                "failed to parse window layout id={} layout={s}",
-                .{ window_id, layout_str },
-            );
-            return err;
-        };
+        // Parse the layout. Validation above confirmed the string is
+        // well-formed, so only allocation failure is possible here.
+        const new_layout: Layout = try Layout.parseWithChecksum(win_alloc, layout_str);
         window.layout = new_layout;
 
         // Re-clone unchanged windows' layouts from the temporary arena
@@ -910,9 +919,9 @@ pub const Viewer = struct {
             Format.tmux_version.Struct(),
             line,
             Format.tmux_version.delim,
-        ) catch |err| {
-            log.info("failed to parse tmux version: {s}", .{line});
-            return err;
+        ) catch {
+            log.warn("failed to parse tmux version: {s}", .{line});
+            return;
         };
 
         if (self.tmux_version.len > 0) {
@@ -951,21 +960,21 @@ pub const Viewer = struct {
                 Format.list_windows.Struct(),
                 line,
                 Format.list_windows.delim,
-            ) catch |err| {
-                log.info("failed to parse list-windows line: {s}", .{line});
-                return err;
+            ) catch {
+                log.warn("failed to parse list-windows line: {s}", .{line});
+                continue;
             };
 
             // Parse the layout onto the shared windows arena
             const layout: Layout = Layout.parseWithChecksum(
                 win_alloc,
                 data.window_layout,
-            ) catch |err| {
-                log.info(
+            ) catch {
+                log.warn(
                     "failed to parse window layout id={} layout={s}",
                     .{ data.window_id, data.window_layout },
                 );
-                return err;
+                continue;
             };
 
             try windows.append(self.alloc, .{
@@ -1000,9 +1009,9 @@ pub const Viewer = struct {
                 Format.list_panes.Struct(),
                 line,
                 Format.list_panes.delim,
-            ) catch |err| {
-                log.info("failed to parse list-panes line: {s}", .{line});
-                return err;
+            ) catch {
+                log.warn("failed to parse list-panes line: {s}", .{line});
+                continue;
             };
 
             // Get the pane for this ID
