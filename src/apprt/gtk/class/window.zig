@@ -1346,9 +1346,12 @@ pub const Window = extern struct {
 
         const alloc = Application.default().allocator();
 
-        // Destroy heap-allocated relay writers for tmux pane entries.
+        // Unref surfaces and destroy heap-allocated relay writers for
+        // tmux pane entries. Surface must be unreffed before destroying
+        // the relay writer it references.
         var pane_iter = priv.tmux_pane_to_surface.iterator();
         while (pane_iter.next()) |entry| {
+            entry.value_ptr.surface.unref();
             alloc.destroy(entry.value_ptr.relay_writer);
         }
 
