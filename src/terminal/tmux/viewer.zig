@@ -974,12 +974,16 @@ pub const Viewer = struct {
         // Save arena state before we hand off to syncLayouts/actions
         self.windows_arena = win_arena.state;
 
-        // Setup our windows action so the caller can process GUI
-        // window changes.
-        try actions.append(arena_alloc, .{ .windows = windows.items });
-
-        // Sync up our layouts. This will populate unknown panes, prune, etc.
+        // Sync up our layouts first — this copies windows into
+        // self.windows so the action can reference the persistent
+        // field. Using the local windows.items would be a
+        // use-after-free since defer windows.deinit frees it.
         try self.syncLayouts(windows.items);
+
+        // Setup our windows action so the caller can process GUI
+        // window changes. Uses self.windows.items (persistent) to
+        // match the layoutChanged pattern.
+        try actions.append(arena_alloc, .{ .windows = self.windows.items });
     }
 
     fn receivedPaneState(
