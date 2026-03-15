@@ -1172,7 +1172,7 @@ void ghostty_inspector_text(ghostty_inspector_t, const char*);
 #ifdef __APPLE__
 bool ghostty_inspector_metal_init(ghostty_inspector_t, void*);
 void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
-bool ghostty_inspector_metal_shutdown(ghostty_inspector_t);
+void ghostty_inspector_metal_shutdown(ghostty_inspector_t);
 #endif
 
 // APIs I'd like to get rid of eventually but are still needed for now.
