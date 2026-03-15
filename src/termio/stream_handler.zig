@@ -477,7 +477,7 @@ pub const StreamHandler = struct {
                                 windows,
                             ) catch |err| {
                                 log.warn("failed to snapshot tmux topology: {}", .{err});
-                                return;
+                                continue;
                             };
                             self.surfaceMessageWriter(.{ .tmux_topology_changed = snapshot });
                         },
@@ -496,7 +496,7 @@ pub const StreamHandler = struct {
                             const SurfaceWriteReq = apprt.surface.Message.WriteReq;
                             const req = SurfaceWriteReq.init(self.alloc, output.data) catch |err| {
                                 log.warn("tmux pane output alloc failed: {}", .{err});
-                                return;
+                                continue;
                             };
                             self.surfaceMessageWriter(.{
                                 .tmux_pane_output = .{
