@@ -196,7 +196,7 @@ pub const Viewer = struct {
     action_single: [1]Action,
 
     pub const CommandQueue = CircBuf(Command, undefined);
-    pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, Pane);
+    pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, *Pane);
 
     pub const Action = union(enum) {
         /// Tmux has closed the control mode connection, we should end
@@ -324,7 +324,10 @@ pub const Viewer = struct {
         }
         {
             var it = self.panes.iterator();
-            while (it.next()) |kv| kv.value_ptr.deinit(self.alloc);
+            while (it.next()) |kv| {
+                kv.value_ptr.*.deinit(self.alloc);
+                self.alloc.destroy(kv.value_ptr.*);
+            }
             self.panes.deinit(self.alloc);
         }
         if (self.tmux_version.len > 0) {
@@ -708,7 +711,8 @@ pub const Viewer = struct {
             var panes_it = panes.iterator();
             while (panes_it.next()) |kv| {
                 if (!self.panes.contains(kv.key_ptr.*)) {
-                    kv.value_ptr.deinit(self.alloc);
+                    kv.value_ptr.*.deinit(self.alloc);
+                    self.alloc.destroy(kv.value_ptr.*);
                 }
             }
             panes.deinit(self.alloc);
@@ -778,8 +782,9 @@ pub const Viewer = struct {
             for (removed.items) |id| if (self.panes.fetchSwapRemove(
                 id,
             )) |entry_const| {
-                var entry = entry_const;
-                entry.value.deinit(self.alloc);
+                var pane = entry_const.value;
+                pane.deinit(self.alloc);
+                self.alloc.destroy(pane);
             };
             // We can now deinit self.panes because the existing
             // entries are preserved.
@@ -1009,7 +1014,7 @@ pub const Viewer = struct {
                 log.info("received pane state for untracked pane id={}", .{data.pane_id});
                 continue;
             };
-            const pane: *Pane = entry.value_ptr;
+            const pane: *Pane = entry.value_ptr.*;
             const t: *Terminal = &pane.terminal;
 
             // Determine which screen to use based on alternate_on
@@ -1133,7 +1138,7 @@ pub const Viewer = struct {
             log.info("received pane history for untracked pane id={}", .{id});
             return;
         };
-        const pane: *Pane = entry.value_ptr;
+        const pane: *Pane = entry.value_ptr.*;
         const t: *Terminal = &pane.terminal;
         _ = try t.switchScreen(screen_key);
         const screen: *Screen = t.screens.active;
@@ -1173,7 +1178,7 @@ pub const Viewer = struct {
             log.info("received pane visible for untracked pane id={}", .{id});
             return;
         };
-        const pane: *Pane = entry.value_ptr;
+        const pane: *Pane = entry.value_ptr.*;
         const t: *Terminal = &pane.terminal;
         _ = try t.switchScreen(screen_key);
 
@@ -1196,7 +1201,7 @@ pub const Viewer = struct {
             log.info("received output for untracked pane id={}", .{id});
             return;
         };
-        const pane: *Pane = entry.value_ptr;
+        const pane: *Pane = entry.value_ptr.*;
         const t: *Terminal = &pane.terminal;
 
         var stream = t.vtStream();
@@ -1229,8 +1234,7 @@ pub const Viewer = struct {
                 if (gop.found_existing) break :pane;
                 errdefer _ = panes_new.swapRemove(gop.key_ptr.*);
 
-                // If we already have this pane, it is already initialized
-                // so just copy it over.
+                // If we already have this pane, move the pointer over.
                 if (panes_old.getEntry(id)) |entry| {
                     gop.value_ptr.* = entry.value_ptr.*;
                     break :pane;
@@ -1245,9 +1249,11 @@ pub const Viewer = struct {
                 });
                 errdefer t.deinit(gpa_alloc);
 
-                gop.value_ptr.* = .{
+                const pane = try gpa_alloc.create(Pane);
+                pane.* = .{
                     .terminal = t,
                 };
+                gop.value_ptr.* = pane;
             },
         }
     }
@@ -1770,7 +1776,7 @@ test "initial flow" {
             }).check,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     {
                         const str = try screen.dumpStringAlloc(
@@ -1870,7 +1876,7 @@ test "initial flow" {
                     try testing.expectEqual(0, actions[0].output.pane_id);
                     try testing.expectEqualStrings("new output", actions[0].output.data);
                     // Viewer also processes output into its own pane terminal.
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     const str = try screen.dumpStringAlloc(
                         testing.allocator,
@@ -2281,7 +2287,7 @@ test "two pane flow with pane state" {
             } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     {
                         const str = try screen.dumpStringAlloc(
@@ -2324,7 +2330,7 @@ test "two pane flow with pane state" {
             } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     {
                         const str = try screen.dumpStringAlloc(
@@ -2362,7 +2368,7 @@ test "two pane flow with pane state" {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     // Pane 0: cursor at (42, 0), cursor visible, wraparound on
                     {
-                        const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                        const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                         const t: *Terminal = &pane.terminal;
                         const screen: *Screen = t.screens.get(.primary).?;
                         try testing.expectEqual(42, screen.cursor.x);
@@ -2376,7 +2382,7 @@ test "two pane flow with pane state" {
                     }
                     // Pane 4: cursor at (10, 5), cursor visible, wraparound on
                     {
-                        const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr;
+                        const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr.*;
                         const t: *Terminal = &pane.terminal;
                         const screen: *Screen = t.screens.get(.primary).?;
                         try testing.expectEqual(10, screen.cursor.x);
