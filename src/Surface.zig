@@ -6089,6 +6089,20 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
         .close_surface => self.close(),
 
+        .tmux_detach => {
+            switch (self.io.backend) {
+                .tmux => {
+                    const cmd = "detach-client\n";
+                    var small: termio.Message.WriteReq.Small = .{};
+                    @memcpy(small.data[0..cmd.len], cmd);
+                    small.len = @intCast(cmd.len);
+                    self.queueIo(.{ .tmux_command = small }, .unlocked);
+                    return true;
+                },
+                .exec => return false,
+            }
+        },
+
         .close_window => return try self.rt_app.performAction(
             .{ .surface = self },
             .close_window,
