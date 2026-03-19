@@ -5839,21 +5839,69 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             v,
         ),
 
-        .new_tab => return try self.rt_app.performAction(
-            .{ .surface = self },
-            .new_tab,
-            {},
-        ),
+        .new_tab => {
+            // For tmux-backed surfaces, ask tmux to create a new window
+            // (tmux windows map to Ghostty tabs). tmux will respond with
+            // notifications that flow through the topology reconciler.
+            switch (self.io.backend) {
+                .tmux => {
+                    const cmd = "new-window\n";
+                    var small: termio.Message.WriteReq.Small = .{};
+                    @memcpy(small.data[0..cmd.len], cmd);
+                    small.len = @intCast(cmd.len);
+                    self.queueIo(.{ .tmux_command = small }, .unlocked);
+                    return true;
+                },
+                .exec => {},
+            }
 
-        .close_tab => |v| return try self.rt_app.performAction(
-            .{ .surface = self },
-            .close_tab,
-            switch (v) {
-                .this => .this,
-                .other => .other,
-                .right => .right,
-            },
-        ),
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_tab,
+                {},
+            );
+        },
+
+        .close_tab => |v| {
+            // For tmux-backed surfaces with "this" mode, ask tmux to kill
+            // the window containing this pane. tmux resolves the pane ID
+            // to its containing window automatically.
+            switch (self.io.backend) {
+                .tmux => |tmux_backend| {
+                    switch (v) {
+                        .this => {
+                            var buf: [termio.Message.WriteReq.Small.Max]u8 = undefined;
+                            const cmd = std.fmt.bufPrint(&buf, "kill-window -t %{d}\n", .{
+                                tmux_backend.pane_id,
+                            }) catch {
+                                log.warn("kill-window command too large for buffer", .{});
+                                return false;
+                            };
+
+                            var small: termio.Message.WriteReq.Small = .{};
+                            @memcpy(small.data[0..cmd.len], cmd);
+                            small.len = @intCast(cmd.len);
+                            self.queueIo(.{ .tmux_command = small }, .unlocked);
+                            return true;
+                        },
+                        // "other" and "right" modes require window ID
+                        // enumeration which is not yet implemented.
+                        .other, .right => {},
+                    }
+                },
+                .exec => {},
+            }
+
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .close_tab,
+                switch (v) {
+                    .this => .this,
+                    .other => .other,
+                    .right => .right,
+                },
+            );
+        },
 
         inline .previous_tab,
         .next_tab,
