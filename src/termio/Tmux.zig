@@ -39,6 +39,18 @@ const log = std.log.scoped(.io_tmux);
 /// (e.g., pane_id 5 corresponds to `%5`).
 pane_id: usize,
 
+/// Pointer to the viewer-owned terminal for this pane. When set, the
+/// renderer's terminal pointer is swapped at `threadEnter` to read
+/// directly from the viewer's terminal state rather than the Termio's
+/// internal (unused) terminal. This implements Mitchell's single-terminal
+/// architecture: the viewer's pane terminals ARE the terminals; child
+/// surfaces render from them.
+///
+/// Upstream anchor: `src/termio/Options.zig:27-30` — "the IO impl is
+/// free to change [the terminal pointer] if that is useful (i.e. doing
+/// some sort of dual terminal implementation.)"
+viewer_terminal: ?*terminal.Terminal,
+
 /// The current grid size, tracked locally so we can issue resize
 /// commands when the surface dimensions change.
 grid_size: renderer.GridSize,
@@ -196,6 +208,11 @@ pub const Config = struct {
 
     /// The writer for sending commands to the tmux control connection.
     control_writer: ControlWriter,
+
+    /// Pointer to the viewer-owned terminal for this pane. When non-null,
+    /// the child surface's renderer will read from this terminal instead
+    /// of the Termio's internal terminal. See `Tmux.viewer_terminal`.
+    viewer_terminal: ?*terminal.Terminal = null,
 };
 
 /// Initialize the tmux backend. This does NOT start any I/O; it only
@@ -203,6 +220,7 @@ pub const Config = struct {
 pub fn init(cfg: Config) Tmux {
     return .{
         .pane_id = cfg.pane_id,
+        .viewer_terminal = cfg.viewer_terminal,
         .grid_size = .{},
         .screen_size = .{ .width = 0, .height = 0 },
         .control_writer = cfg.control_writer,
@@ -239,9 +257,20 @@ pub fn threadEnter(
     td: *termio.Termio.ThreadData,
 ) !void {
     _ = alloc;
-    _ = io;
 
     log.info("tmux backend thread enter pane_id={}", .{self.pane_id});
+
+    // Swap the renderer's terminal pointer to the viewer's pane terminal.
+    // This makes the child surface render directly from the viewer-owned
+    // terminal, which the parent IO thread feeds via VT output processing.
+    // The renderer reads terminal state only under this mutex (see
+    // renderer/generic.zig:updateFrame), so the swap is safe here before
+    // any rendering begins.
+    if (self.viewer_terminal) |vt| {
+        io.renderer_state.mutex.lock();
+        defer io.renderer_state.mutex.unlock();
+        io.renderer_state.terminal = vt;
+    }
 
     // Populate the thread data with our (empty) thread state.
     td.backend = .{ .tmux = .{} };

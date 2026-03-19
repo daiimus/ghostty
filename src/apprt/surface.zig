@@ -195,12 +195,20 @@ pub const Message = union(enum) {
         /// of the viewer's backing memory.
         windows: []const terminal.tmux.Viewer.Window,
 
+        /// Optional pointer to the viewer's panes map. The viewer's
+        /// panes are heap-allocated (boxed) so the pointers remain stable
+        /// across map mutations. This allows the reconcile planner to
+        /// pass viewer-owned terminal pointers to child surfaces.
+        /// Null when no viewer panes are available (e.g., in tests).
+        panes: ?*const terminal.tmux.Viewer.PanesMap,
+
         /// Create a snapshot by deep-copying `windows`. Each window's
         /// layout tree is cloned into a dedicated arena so the snapshot
         /// is independent of the source memory.
         pub fn initFromWindows(
             alloc: Allocator,
             windows: []const terminal.tmux.Viewer.Window,
+            panes: ?*const terminal.tmux.Viewer.PanesMap,
         ) Allocator.Error!*TmuxTopologySnapshot {
             var arena: std.heap.ArenaAllocator = .init(alloc);
             errdefer arena.deinit();
@@ -224,6 +232,7 @@ pub const Message = union(enum) {
                 .alloc = alloc,
                 .arena = arena,
                 .windows = cloned_windows,
+                .panes = panes,
             };
             return self;
         }
@@ -335,7 +344,7 @@ test "TmuxTopologySnapshot initFromWindows deep copies layouts" {
     };
 
     // Create the snapshot.
-    const snapshot = try Message.TmuxTopologySnapshot.initFromWindows(alloc, source_windows);
+    const snapshot = try Message.TmuxTopologySnapshot.initFromWindows(alloc, source_windows, null);
     defer snapshot.deinit();
 
     // Free the source arena — if the snapshot referenced source memory,
@@ -377,7 +386,7 @@ test "TmuxTopologySnapshot deinit frees owned arena" {
         },
     };
 
-    const snapshot = try Message.TmuxTopologySnapshot.initFromWindows(alloc, windows);
+    const snapshot = try Message.TmuxTopologySnapshot.initFromWindows(alloc, windows, null);
     // Verify it was created successfully, then deinit immediately.
     // If any memory leaks, the testing allocator will report it.
     try std.testing.expectEqual(@as(usize, 1), snapshot.windows.len);

@@ -475,6 +475,7 @@ pub const StreamHandler = struct {
                             const snapshot = apprt.surface.Message.TmuxTopologySnapshot.initFromWindows(
                                 self.alloc,
                                 windows,
+                                &viewer.panes,
                             ) catch |err| {
                                 log.warn("failed to snapshot tmux topology: {}", .{err});
                                 continue;

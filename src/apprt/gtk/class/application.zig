@@ -2886,6 +2886,7 @@ const Action = struct {
                         .backend = .{ .tmux = .{
                             .pane_id = ep.pane_id,
                             .control_writer = relay_writer.controlWriter(),
+                            .viewer_terminal = ep.viewer_terminal,
                         } },
                     });
 

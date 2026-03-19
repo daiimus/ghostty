@@ -506,6 +506,12 @@ pub const TmuxReconcileOp = union(enum) {
     ensure_pane: struct {
         tmux_window_id: usize,
         pane_id: usize,
+        /// Pointer to the viewer-owned terminal for this pane. The child
+        /// surface's renderer will read from this terminal, implementing
+        /// the single-terminal architecture where the viewer's pane
+        /// terminals ARE the terminals. Null when the viewer terminal is
+        /// not yet available (e.g., during tests without a real viewer).
+        viewer_terminal: ?*terminal.Terminal = null,
     },
 
     /// Update the split tree of the given tmux window to match
@@ -572,6 +578,7 @@ pub const TmuxReconcilePayload = struct {
 pub fn planTmuxReconcile(
     alloc: Allocator,
     windows: []const terminal.tmux.Viewer.Window,
+    panes: ?*const terminal.tmux.Viewer.PanesMap,
 ) Allocator.Error!*TmuxReconcilePayload {
     var arena: ArenaAllocator = .init(alloc);
     errdefer arena.deinit();
@@ -616,6 +623,10 @@ pub fn planTmuxReconcile(
             ops[op_idx] = .{ .ensure_pane = .{
                 .tmux_window_id = window.id,
                 .pane_id = pid,
+                .viewer_terminal = if (panes) |p| vt: {
+                    const entry = p.getEntry(pid) orelse break :vt null;
+                    break :vt &entry.value_ptr.*.terminal;
+                } else null,
             } };
             op_idx += 1;
         }
@@ -1458,6 +1469,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             const payload = planTmuxReconcile(
                 self.alloc,
                 snapshot.windows,
+                snapshot.panes,
             ) catch |err| {
                 log.warn("tmux reconcile plan failed: {}", .{err});
                 return;
@@ -7103,7 +7115,7 @@ test "planTmuxReconcile single window single pane" {
         },
     };
 
-    const payload = try planTmuxReconcile(alloc, &windows);
+    const payload = try planTmuxReconcile(alloc, &windows, null);
     defer payload.deinit();
 
     // Expected: begin, ensure_window, ensure_pane, set_layout, prune, end = 6 ops
@@ -7210,7 +7222,7 @@ test "planTmuxReconcile multi window multi pane stable ordering" {
         },
     };
 
-    const payload = try planTmuxReconcile(alloc, &windows);
+    const payload = try planTmuxReconcile(alloc, &windows, null);
     defer payload.deinit();
 
     // Expected: begin + (ensure_window + 2 ensure_pane + set_layout) +
@@ -7287,9 +7299,9 @@ test "planTmuxReconcile repeated identical snapshot yields same ops" {
     };
 
     // Plan twice from same input
-    const payload1 = try planTmuxReconcile(alloc, &windows);
+    const payload1 = try planTmuxReconcile(alloc, &windows, null);
     defer payload1.deinit();
-    const payload2 = try planTmuxReconcile(alloc, &windows);
+    const payload2 = try planTmuxReconcile(alloc, &windows, null);
     defer payload2.deinit();
 
     // Same number of ops
