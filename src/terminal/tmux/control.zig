@@ -384,6 +384,36 @@ pub const Parser = struct {
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .window_add = .{ .id = id } };
+        } else if (std.mem.eql(u8, cmd, "%window-close")) cmd: {
+            var re = oni.Regex.init(
+                "^%window-close @([0-9]+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .window_close = .{ .id = id } };
         } else if (std.mem.eql(u8, cmd, "%window-renamed")) cmd: {
             var re = oni.Regex.init(
                 "^%window-renamed @([0-9]+) (.+)$",
@@ -584,6 +614,11 @@ pub const Notification = union(enum) {
 
     /// The window with ID window-id was linked to the current session.
     window_add: struct {
+        id: usize,
+    },
+
+    /// The window with ID window-id was closed.
+    window_close: struct {
         id: usize,
     },
 
@@ -852,6 +887,18 @@ test "tmux window-add" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .window_add);
     try testing.expectEqual(14, n.window_add.id);
+}
+
+test "tmux window-close" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%window-close @7") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .window_close);
+    try testing.expectEqual(7, n.window_close.id);
 }
 
 test "tmux window-renamed" {
