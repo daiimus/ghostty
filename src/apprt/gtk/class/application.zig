@@ -2887,6 +2887,7 @@ const Action = struct {
                             .pane_id = ep.pane_id,
                             .control_writer = relay_writer.controlWriter(),
                             .viewer_terminal = ep.viewer_terminal,
+                            .viewer_pane = ep.viewer_pane,
                         } },
                     });
 

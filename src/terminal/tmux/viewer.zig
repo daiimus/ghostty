@@ -281,6 +281,17 @@ pub const Viewer = struct {
     pub const Pane = struct {
         terminal: Terminal,
 
+        /// Mutex protecting concurrent access to `terminal`. This is set
+        /// by the child surface's tmux backend during `threadEnter` to
+        /// point at the child's `renderer_state.mutex`. Before it is set
+        /// (null), no child renderer is reading, so no locking is needed.
+        ///
+        /// The viewer acquires this mutex in all terminal-write paths
+        /// (`receivedOutput`, `receivedPaneHistory`, `receivedPaneVisible`,
+        /// `receivedPaneState`) to coordinate with the child surface's
+        /// renderer thread.
+        renderer_mutex: ?*std.Thread.Mutex = null,
+
         pub fn deinit(self: *Pane, alloc: Allocator) void {
             self.terminal.deinit(alloc);
         }
@@ -1015,6 +1026,10 @@ pub const Viewer = struct {
                 continue;
             };
             const pane: *Pane = entry.value_ptr.*;
+
+            if (pane.renderer_mutex) |m| m.lock();
+            defer if (pane.renderer_mutex) |m| m.unlock();
+
             const t: *Terminal = &pane.terminal;
 
             // Determine which screen to use based on alternate_on
@@ -1139,6 +1154,10 @@ pub const Viewer = struct {
             return;
         };
         const pane: *Pane = entry.value_ptr.*;
+
+        if (pane.renderer_mutex) |m| m.lock();
+        defer if (pane.renderer_mutex) |m| m.unlock();
+
         const t: *Terminal = &pane.terminal;
         _ = try t.switchScreen(screen_key);
         const screen: *Screen = t.screens.active;
@@ -1179,6 +1198,10 @@ pub const Viewer = struct {
             return;
         };
         const pane: *Pane = entry.value_ptr.*;
+
+        if (pane.renderer_mutex) |m| m.lock();
+        defer if (pane.renderer_mutex) |m| m.unlock();
+
         const t: *Terminal = &pane.terminal;
         _ = try t.switchScreen(screen_key);
 
@@ -1202,8 +1225,14 @@ pub const Viewer = struct {
             return;
         };
         const pane: *Pane = entry.value_ptr.*;
-        const t: *Terminal = &pane.terminal;
 
+        // Lock the renderer mutex if a child surface has registered one.
+        // This coordinates with the child's renderer thread which reads
+        // from the same terminal under this mutex.
+        if (pane.renderer_mutex) |m| m.lock();
+        defer if (pane.renderer_mutex) |m| m.unlock();
+
+        const t: *Terminal = &pane.terminal;
         var stream = t.vtStream();
         defer stream.deinit();
         stream.nextSlice(data);

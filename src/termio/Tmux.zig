@@ -51,6 +51,12 @@ pane_id: usize,
 /// some sort of dual terminal implementation.)"
 viewer_terminal: ?*terminal.Terminal,
 
+/// Pointer to the viewer-owned pane for this surface. Used to register
+/// the child surface's renderer mutex back to the pane during
+/// `threadEnter`, enabling the viewer to acquire the correct mutex when
+/// writing to the shared terminal.
+viewer_pane: ?*terminal.tmux.Viewer.Pane,
+
 /// The current grid size, tracked locally so we can issue resize
 /// commands when the surface dimensions change.
 grid_size: renderer.GridSize,
@@ -213,6 +219,11 @@ pub const Config = struct {
     /// the child surface's renderer will read from this terminal instead
     /// of the Termio's internal terminal. See `Tmux.viewer_terminal`.
     viewer_terminal: ?*terminal.Terminal = null,
+
+    /// Pointer to the viewer-owned pane. When non-null, the child surface
+    /// registers its renderer mutex to the pane during `threadEnter`.
+    /// See `Tmux.viewer_pane`.
+    viewer_pane: ?*terminal.tmux.Viewer.Pane = null,
 };
 
 /// Initialize the tmux backend. This does NOT start any I/O; it only
@@ -221,6 +232,7 @@ pub fn init(cfg: Config) Tmux {
     return .{
         .pane_id = cfg.pane_id,
         .viewer_terminal = cfg.viewer_terminal,
+        .viewer_pane = cfg.viewer_pane,
         .grid_size = .{},
         .screen_size = .{ .width = 0, .height = 0 },
         .control_writer = cfg.control_writer,
@@ -272,6 +284,15 @@ pub fn threadEnter(
         io.renderer_state.terminal = vt;
     }
 
+    // Register this child surface's renderer mutex back to the viewer
+    // pane. The viewer acquires this mutex before writing to the shared
+    // terminal, coordinating with the child's renderer thread. Before
+    // this point, renderer_mutex is null and no locking is needed
+    // because the child renderer hasn't started reading yet.
+    if (self.viewer_pane) |pane| {
+        pane.renderer_mutex = io.renderer_state.mutex;
+    }
+
     // Populate the thread data with our (empty) thread state.
     td.backend = .{ .tmux = .{} };
 }
@@ -279,6 +300,12 @@ pub fn threadEnter(
 pub fn threadExit(self: *Tmux, td: *termio.Termio.ThreadData) void {
     assert(td.backend == .tmux);
     log.info("tmux backend thread exit pane_id={}", .{self.pane_id});
+
+    // Clear the renderer mutex registration from the viewer pane so
+    // the viewer stops trying to lock a mutex that's about to be freed.
+    if (self.viewer_pane) |pane| {
+        pane.renderer_mutex = null;
+    }
 }
 
 /// Focus gained/lost notification. No-op for tmux — there is no local

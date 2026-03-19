@@ -512,6 +512,10 @@ pub const TmuxReconcileOp = union(enum) {
         /// terminals ARE the terminals. Null when the viewer terminal is
         /// not yet available (e.g., during tests without a real viewer).
         viewer_terminal: ?*terminal.Terminal = null,
+        /// Pointer to the viewer-owned pane. The child surface registers
+        /// its renderer mutex to this pane during threadEnter, enabling
+        /// the viewer to coordinate terminal writes with the renderer.
+        viewer_pane: ?*terminal.tmux.Viewer.Pane = null,
     },
 
     /// Update the split tree of the given tmux window to match
@@ -620,13 +624,13 @@ pub fn planTmuxReconcile(
         collectPaneIds(window.layout, pane_ids, &pane_idx);
 
         for (pane_ids[pane_start..pane_idx]) |pid| {
+            const pane_entry = if (panes) |p| p.getEntry(pid) else null;
+            const pane_ptr: ?*terminal.tmux.Viewer.Pane = if (pane_entry) |e| e.value_ptr.* else null;
             ops[op_idx] = .{ .ensure_pane = .{
                 .tmux_window_id = window.id,
                 .pane_id = pid,
-                .viewer_terminal = if (panes) |p| vt: {
-                    const entry = p.getEntry(pid) orelse break :vt null;
-                    break :vt &entry.value_ptr.*.terminal;
-                } else null,
+                .viewer_terminal = if (pane_ptr) |pp| &pp.terminal else null,
+                .viewer_pane = pane_ptr,
             } };
             op_idx += 1;
         }
