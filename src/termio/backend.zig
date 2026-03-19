@@ -117,6 +117,15 @@ pub const Backend = union(Kind) {
             ),
         }
     }
+
+    /// Forward a raw command to the tmux control mode connection.
+    /// No-op for the exec backend.
+    pub fn tmuxCommand(self: *Backend, cmd: []const u8) void {
+        switch (self.*) {
+            .exec => {},
+            .tmux => |*tmux| tmux.tmuxCommand(cmd),
+        }
+    }
 };
 
 /// Termio thread data. See termio.ThreadData for docs.

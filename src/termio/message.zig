@@ -82,6 +82,13 @@ pub const Message = union(enum) {
     /// Write where the data is allocated and must be freed.
     write_alloc: WriteReq.Alloc,
 
+    /// Send a raw command to the tmux control mode connection, bypassing
+    /// the `send-keys` wrapping used by the normal write path. This is
+    /// used for structural commands like `split-window`, `kill-pane`, etc.
+    /// that originate from user keybindings on a tmux-backed surface.
+    /// No-op for non-tmux backends.
+    tmux_command: WriteReq.Small,
+
     /// Return a write request for the given data. This will use
     /// write_small if it fits or write_alloc otherwise. This should NOT
     /// be used for stable pointers which can be manually set to write_stable.
