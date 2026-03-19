@@ -767,7 +767,6 @@ pub const Application = extern struct {
             .search_selected => Action.searchSelected(target, value),
 
             .tmux_reconcile => Action.tmuxReconcile(target, value),
-            .tmux_pane_output => Action.tmuxPaneOutput(target, value),
 
             // Unimplemented
             .secure_input,
@@ -2905,34 +2904,10 @@ const Action = struct {
                         continue;
                     };
 
-                    // Replay any output that was buffered before this pane
-                    // surface existed. Drain chunks in insertion order and
-                    // then remove the buffer entry.
-                    const buf_map = window.tmuxPaneOutputBuffers();
-                    if (buf_map.getPtr(ep.pane_id)) |buf| {
-                        if (pane_surface.core()) |child_core| {
-                            log.debug("tmux reconcile: replaying buffered output pane={} chunks={} bytes={}", .{
-                                ep.pane_id,
-                                buf.chunks.items.len,
-                                buf.total_bytes,
-                            });
-                            for (buf.chunks.items) |chunk| {
-                                child_core.io.processOutput(chunk);
-                            }
-                            buf.deinit(alloc);
-                            _ = buf_map.remove(ep.pane_id);
-                        } else {
-                            // Surface not yet realized (core() returns null).
-                            // Leave the buffer in the map — prune_absent will
-                            // clean it up if the pane disappears, or a future
-                            // reconcile cycle will retry when the surface is
-                            // realized.
-                            log.debug("tmux reconcile: deferring buffered output replay (no core): pane={} bytes={}", .{
-                                ep.pane_id,
-                                buf.total_bytes,
-                            });
-                        }
-                    }
+                    // If the child surface has a tmux backend with a
+                    // viewer_terminal set, its renderer already reads
+                    // directly from the viewer's pane terminal. No
+                    // output replay needed.
                 },
 
                 .set_layout => |sl| {
@@ -3001,7 +2976,6 @@ const Action = struct {
                     log.debug("tmux reconcile: prune_absent windows={} panes={}", .{ pa.window_ids.len, pa.pane_ids.len });
 
                     const tab_view = window.getTabView();
-                    const buf_map = window.tmuxPaneOutputBuffers();
 
                     // Collect-then-remove pattern: std hash map iterators are
                     // invalidated by any map modification. Collect keys during
@@ -3033,28 +3007,6 @@ const Action = struct {
                         _ = pane_map.remove(pane_id);
                     }
 
-                    // Prune output buffers for absent panes.
-                    var bufs_to_remove: std.ArrayListUnmanaged(usize) = .empty;
-                    defer bufs_to_remove.deinit(alloc);
-                    {
-                        var buf_iter = buf_map.iterator();
-                        while (buf_iter.next()) |entry| {
-                            if (std.sort.binarySearch(usize, entry.key_ptr.*, pa.pane_ids, {}, struct {
-                                fn cmp(_: void, needle: usize, probe: usize) std.math.Order {
-                                    return std.math.order(needle, probe);
-                                }
-                            }.cmp) == null) {
-                                entry.value_ptr.deinit(alloc);
-                                bufs_to_remove.append(alloc, entry.key_ptr.*) catch |err| {
-                                    log.warn("prune_absent buf key alloc failed: {}", .{err});
-                                };
-                            }
-                        }
-                    }
-                    for (bufs_to_remove.items) |buf_id| {
-                        _ = buf_map.remove(buf_id);
-                    }
-
                     // Prune tabs whose window IDs are not in the keep-set.
                     var wins_to_remove: std.ArrayListUnmanaged(usize) = .empty;
                     defer wins_to_remove.deinit(alloc);
@@ -3084,70 +3036,6 @@ const Action = struct {
                     log.debug("tmux reconcile: sync_windows_end", .{});
                 },
             }
-        }
-    }
-
-    /// Route tmux pane output to the correct child surface. Resolves
-    /// the pane_id to a child surface via the window's pane map and
-    /// calls processOutput on its Termio. If the pane is not yet
-    /// created, the output is buffered (up to 1 MiB per pane) for
-    /// replay when ensure_pane creates the surface.
-    pub fn tmuxPaneOutput(target: apprt.Target, value: apprt.Action.Value(.tmux_pane_output)) void {
-        const surface = switch (target) {
-            .app => {
-                log.warn("tmux_pane_output action to app is unexpected", .{});
-                return;
-            },
-            .surface => |core| core.rt_surface.surface,
-        };
-
-        const window = ext.getAncestor(Window, surface.as(gtk.Widget)) orelse {
-            log.warn("tmux_pane_output: surface has no ancestor window", .{});
-            return;
-        };
-
-        const pane_map = window.tmuxPaneMap();
-
-        // If the pane surface already exists and is realized, route
-        // immediately. If the surface exists but core() is null (not
-        // yet realized), fall through to buffer the output for replay
-        // once the surface is ready.
-        if (pane_map.get(value.pane_id)) |entry| {
-            if (entry.surface.core()) |child_core| {
-                // processOutput is mutex-protected and safe to call from the
-                // app thread. This is the same cross-thread pattern used by the
-                // exec backend's read thread (Exec.zig:1326).
-                child_core.io.processOutput(value.data[0..value.data_len]);
-                return;
-            }
-        }
-
-        // Pane not yet created — buffer the output for replay on ensure_pane.
-        if (value.data_len == 0) return;
-        const alloc = Application.default().allocator();
-        const buf_map = window.tmuxPaneOutputBuffers();
-        const gop = buf_map.getOrPut(alloc, value.pane_id) catch {
-            log.warn("tmux pane output dropped (alloc failed): pane_id={} bytes={}", .{
-                value.pane_id,
-                value.data_len,
-            });
-            return;
-        };
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{};
-        }
-        if (gop.value_ptr.append(alloc, value.data[0..value.data_len])) {
-            log.debug("tmux pane output buffered: pane_id={} bytes={} total={}", .{
-                value.pane_id,
-                value.data_len,
-                gop.value_ptr.total_bytes,
-            });
-        } else {
-            log.debug("tmux pane output dropped (buffer full): pane_id={} bytes={} capacity={}", .{
-                value.pane_id,
-                value.data_len,
-                Window.PaneOutputBuffer.max_bytes,
-            });
         }
     }
 };

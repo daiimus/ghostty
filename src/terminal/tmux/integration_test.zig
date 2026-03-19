@@ -13,6 +13,7 @@ const testing = std.testing;
 const posix = std.posix;
 const control = @import("control.zig");
 const Viewer = @import("viewer.zig").Viewer;
+const Screen = @import("../Screen.zig");
 
 const log = std.log.scoped(.terminal_tmux_integration);
 
@@ -218,7 +219,7 @@ test "integration: connect and discover windows" {
 
 test "integration: output routing" {
     // Validates that %output notifications from tmux are correctly
-    // parsed and routed to the correct pane ID.
+    // parsed and processed into the viewer's pane terminal.
     var harness = TmuxHarness.init(testing.allocator, "ghostty_test_output") catch |err| {
         if (err == error.TmuxNotAvailable) return error.SkipZigTest;
         return err;
@@ -231,11 +232,10 @@ test "integration: output routing" {
     // Send a command to tmux that will produce output
     try harness.sendCommand("send-keys 'echo GHOSTTY_TEST_MARKER' Enter\n");
 
-    // Drive until we see output
+    // Drive until we see the marker in a pane terminal
     const deadline = std.time.milliTimestamp() + 5_000;
     var buf: [4096]u8 = undefined;
-    var saw_output = false;
-    var output_pane_id: ?usize = null;
+    var found_marker = false;
 
     while (std.time.milliTimestamp() < deadline) {
         const remaining_ms: u32 = @intCast(@max(1, deadline - std.time.milliTimestamp()));
@@ -250,26 +250,31 @@ test "integration: output routing" {
             for (actions) |action| {
                 switch (action) {
                     .command => |cmd| try harness.sendCommand(cmd),
-                    .output => |out| {
-                        saw_output = true;
-                        output_pane_id = out.pane_id;
-                        // The output should contain our marker string
-                        if (std.mem.indexOf(u8, out.data, "GHOSTTY_TEST_MARKER") != null) {
-                            // Found our marker in the output
-                        }
-                    },
                     else => {},
                 }
             }
         }
 
-        if (saw_output) break;
+        // Check all pane terminals for the marker string
+        var pane_iter = harness.viewer.panes.iterator();
+        while (pane_iter.next()) |entry| {
+            const pane: *Viewer.Pane = entry.value_ptr.*;
+            const screen: *Screen = pane.terminal.screens.active;
+            const str = screen.dumpStringAlloc(
+                testing.allocator,
+                .{ .active = .{} },
+            ) catch continue;
+            defer testing.allocator.free(str);
+            if (std.mem.indexOf(u8, str, "GHOSTTY_TEST_MARKER") != null) {
+                found_marker = true;
+                break;
+            }
+        }
+
+        if (found_marker) break;
     }
 
-    try testing.expect(saw_output);
-    // The output should be from a known pane
-    try testing.expect(output_pane_id != null);
-    try testing.expect(harness.viewer.panes.contains(output_pane_id.?));
+    try testing.expect(found_marker);
 }
 
 test "integration: topology change on split" {

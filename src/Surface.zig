@@ -1524,27 +1524,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             self.queueIo(io_msg, .unlocked);
         },
 
-        .tmux_pane_output => |po| {
-            // A tmux %output notification arrived for a specific pane.
-            // Dispatch to the apprt so it can resolve the pane_id to a
-            // child surface and call processOutput on it.
-            //
-            // The WriteReq may hold heap-allocated data (alloc variant)
-            // for output larger than 255 bytes. Free it after the
-            // synchronous performAction call consumes the slice.
-            defer po.data.deinit();
-            const data = po.data.slice();
-            _ = try self.rt_app.performAction(
-                .{ .surface = self },
-                .tmux_pane_output,
-                .{
-                    .pane_id = po.pane_id,
-                    .data = data.ptr,
-                    .data_len = data.len,
-                },
-            );
-        },
-
         .tmux_focus_changed => |fc| {
             // A tmux %window-pane-changed notification arrived.
             // Build a minimal reconcile payload with a single

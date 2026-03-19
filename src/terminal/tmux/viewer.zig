@@ -216,15 +216,6 @@ pub const Viewer = struct {
         /// never reuses window IDs within a server process lifetime.
         windows: []const Window,
 
-        /// Raw output from a tmux pane. The caller is responsible for
-        /// routing this data to the correct child surface's terminal.
-        /// The data slice is valid only for the duration of the action
-        /// iteration (it points into the control parser's buffer).
-        output: struct {
-            pane_id: usize,
-            data: []const u8,
-        },
-
         /// The active pane changed in tmux. The caller should update
         /// focus to the specified window and pane. This is emitted in
         /// response to `%window-pane-changed` notifications from tmux.
@@ -245,18 +236,10 @@ pub const Viewer = struct {
 
                 inline for (info.fields) |u_field| {
                     if (self == @field(TagType, u_field.name)) {
-                        if (comptime std.mem.eql(u8, u_field.name, "output")) {
-                            // Suppress raw pane bytes: log only the pane ID
-                            // and byte count to avoid dumping arbitrary VT
-                            // data into logs on every %output notification.
-                            const out = @field(self, "output");
-                            try writer.print("pane_id={} bytes={}", .{ out.pane_id, out.data.len });
-                        } else {
-                            const value = @field(self, u_field.name);
-                            switch (u_field.type) {
-                                []const u8 => try writer.print("\"{s}\"", .{std.mem.trim(u8, value, " \t\r\n")}),
-                                else => try writer.print("{any}", .{value}),
-                            }
+                        const value = @field(self, u_field.name);
+                        switch (u_field.type) {
+                            []const u8 => try writer.print("\"{s}\"", .{std.mem.trim(u8, value, " \t\r\n")}),
+                            else => try writer.print("{any}", .{value}),
                         }
                     }
                 }
@@ -495,16 +478,6 @@ pub const Viewer = struct {
                         "failed to process output for pane id={}: {}",
                         .{ out.pane_id, err },
                     );
-                };
-
-                // Forward output to the caller so it can route the data
-                // to the correct child surface's terminal.
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                actions.append(arena.allocator(), .{
-                    .output = .{ .pane_id = out.pane_id, .data = out.data },
-                }) catch {
-                    log.warn("failed to queue output action for pane id={}", .{out.pane_id});
                 };
             },
 
@@ -1899,12 +1872,10 @@ test "initial flow" {
             .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = "new output" } } },
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    // Output action forwarded to caller for routing.
-                    try testing.expectEqual(1, actions.len);
-                    try testing.expect(actions[0] == .output);
-                    try testing.expectEqual(0, actions[0].output.pane_id);
-                    try testing.expectEqualStrings("new output", actions[0].output.data);
-                    // Viewer also processes output into its own pane terminal.
+                    // No output action forwarded — the viewer's pane terminal
+                    // is now authoritative (single-terminal architecture).
+                    try testing.expectEqual(0, actions.len);
+                    // Viewer processes output into its own pane terminal.
                     const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     const str = try screen.dumpStringAlloc(
@@ -1920,12 +1891,9 @@ test "initial flow" {
             .input = .{ .tmux = .{ .output = .{ .pane_id = 999, .data = "ignored" } } },
             .check = (struct {
                 fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    // Output for untracked pane is still forwarded to caller
-                    // (caller decides to drop/route). Viewer logs and skips
-                    // internal processing.
-                    try testing.expectEqual(1, actions.len);
-                    try testing.expect(actions[0] == .output);
-                    try testing.expectEqual(999, actions[0].output.pane_id);
+                    // Output for untracked pane is silently dropped.
+                    // No action produced.
+                    try testing.expectEqual(0, actions.len);
                 }
             }).check,
         },
@@ -2510,27 +2478,6 @@ test "layout change preserves other windows on shared arena" {
     });
 }
 
-test "Action.format suppresses raw bytes for output action" {
-    // Validates that formatting an .output action does NOT dump
-    // raw pane bytes but instead shows pane_id and byte count.
-    const action: Viewer.Action = .{ .output = .{
-        .pane_id = 42,
-        .data = "\x1b[31mhello\x1b[0m",
-    } };
-
-    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer builder.deinit();
-    try action.format(&builder.writer);
-    const result = builder.writer.buffered();
-
-    // Must contain pane_id and byte count, not raw VT bytes
-    try testing.expect(std.mem.indexOf(u8, result, "pane_id=42") != null);
-    try testing.expect(std.mem.indexOf(u8, result, "bytes=14") != null);
-    // Must NOT contain raw escape sequences
-    try testing.expect(std.mem.indexOf(u8, result, "\x1b[31m") == null);
-    try testing.expect(std.mem.indexOf(u8, result, "hello") == null);
-}
-
 test "Action.format preserves normal formatting for command action" {
     // Regression guard: non-output actions should still format
     // their payload contents normally.
@@ -2554,23 +2501,6 @@ test "Action.format handles exit action" {
     const result = builder.writer.buffered();
 
     try testing.expect(std.mem.indexOf(u8, result, "exit") != null);
-}
-
-test "Action.format output with empty data" {
-    // Edge case: .output with zero-length data should still format
-    // without crashing, showing bytes=0.
-    const action: Viewer.Action = .{ .output = .{
-        .pane_id = 0,
-        .data = "",
-    } };
-
-    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer builder.deinit();
-    try action.format(&builder.writer);
-    const result = builder.writer.buffered();
-
-    try testing.expect(std.mem.indexOf(u8, result, "pane_id=0") != null);
-    try testing.expect(std.mem.indexOf(u8, result, "bytes=0") != null);
 }
 
 test "window_pane_changed produces focus action" {

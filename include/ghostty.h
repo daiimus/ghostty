@@ -854,13 +854,6 @@ typedef struct {
   uint64_t len;
 } ghostty_action_scrollbar_s;
 
-// apprt.action.TmuxPaneOutput
-typedef struct {
-  uintptr_t pane_id;
-  const uint8_t* data;
-  uintptr_t data_len;
-} ghostty_action_tmux_pane_output_s;
-
 // apprt.Action.Key
 typedef enum {
   GHOSTTY_ACTION_QUIT,
@@ -929,7 +922,6 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_TMUX_RECONCILE,
-  GHOSTTY_ACTION_TMUX_PANE_OUTPUT,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -972,7 +964,6 @@ typedef union {
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
   void* tmux_reconcile;
-  ghostty_action_tmux_pane_output_s tmux_pane_output;
 } ghostty_action_u;
 
 typedef struct {

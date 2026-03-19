@@ -230,43 +230,6 @@ pub const Window = extern struct {
     /// replayed once ensure_pane creates the surface. Overflow follows a
     /// drop-newest policy: new chunks are rejected when the buffer is at
     /// capacity (1 MiB, matching the tmux control parser cap).
-    pub const PaneOutputBuffer = struct {
-        /// Maximum bytes buffered per pane before dropping new output.
-        const max_bytes: usize = 1024 * 1024;
-
-        /// Buffered output chunks in insertion order. Each chunk is a
-        /// heap-allocated copy of the data that was received.
-        chunks: std.ArrayListUnmanaged([]const u8) = .{},
-
-        /// Total bytes currently buffered across all chunks.
-        total_bytes: usize = 0,
-
-        /// Append a copy of `data` to the buffer. Returns false if the
-        /// buffer is at capacity (drop-newest policy). The caller must
-        /// provide the allocator used for all buffer operations.
-        pub fn append(self: *PaneOutputBuffer, alloc: std.mem.Allocator, data: []const u8) bool {
-            if (data.len == 0) return true;
-            if (self.total_bytes + data.len > max_bytes) return false;
-
-            const copy = alloc.dupe(u8, data) catch return false;
-            self.chunks.append(alloc, copy) catch {
-                alloc.free(copy);
-                return false;
-            };
-            self.total_bytes += data.len;
-            return true;
-        }
-
-        /// Release all buffered data and the chunk list itself.
-        pub fn deinit(self: *PaneOutputBuffer, alloc: std.mem.Allocator) void {
-            for (self.chunks.items) |chunk| {
-                alloc.free(chunk);
-            }
-            self.chunks.deinit(alloc);
-            self.total_bytes = 0;
-        }
-    };
-
     const Private = struct {
         /// Whether this window is a quick terminal. If it is then it
         /// behaves slightly differently under certain scenarios.
@@ -317,13 +280,6 @@ pub const Window = extern struct {
         /// and its relay writer. Populated by ensure_pane, pruned by
         /// prune_absent. Keyed by tmux pane ID (usize).
         tmux_pane_to_surface: std.AutoHashMapUnmanaged(usize, TmuxPaneEntry) = .{},
-
-        /// Tmux pre-pane output buffers: holds output that arrived for
-        /// pane IDs before ensure_pane created their surfaces. Keyed by
-        /// tmux pane ID (usize). Entries are created on first buffered
-        /// output, drained on ensure_pane replay, and freed on
-        /// prune_absent or window finalize.
-        tmux_pane_output_buffers: std.AutoHashMapUnmanaged(usize, PaneOutputBuffer) = .{},
 
         // Template bindings
         tab_overview: *adw.TabOverview,
@@ -496,12 +452,6 @@ pub const Window = extern struct {
     /// for any map mutations.
     pub fn tmuxPaneMap(self: *Self) *std.AutoHashMapUnmanaged(usize, TmuxPaneEntry) {
         return &self.private().tmux_pane_to_surface;
-    }
-
-    /// Returns a mutable pointer to the tmux pane output buffer map.
-    /// Used by tmuxPaneOutput (to buffer) and tmuxReconcile (to replay/prune).
-    pub fn tmuxPaneOutputBuffers(self: *Self) *std.AutoHashMapUnmanaged(usize, PaneOutputBuffer) {
-        return &self.private().tmux_pane_output_buffers;
     }
 
     fn newTabPage(
@@ -1354,14 +1304,6 @@ pub const Window = extern struct {
             entry.value_ptr.surface.unref();
             alloc.destroy(entry.value_ptr.relay_writer);
         }
-
-        // Free any remaining tmux pane output buffers (e.g. panes that
-        // never got created before the window was destroyed).
-        var buf_iter = priv.tmux_pane_output_buffers.iterator();
-        while (buf_iter.next()) |entry| {
-            entry.value_ptr.deinit(alloc);
-        }
-        priv.tmux_pane_output_buffers.deinit(alloc);
 
         priv.tmux_window_to_tab.deinit(alloc);
         priv.tmux_pane_to_surface.deinit(alloc);
@@ -2239,98 +2181,3 @@ pub const Window = extern struct {
         pub const bindTemplateCallback = C.Class.bindTemplateCallback;
     };
 };
-
-const testing = std.testing;
-
-test "PaneOutputBuffer: append and drain chunks in order" {
-    var buf: Window.PaneOutputBuffer = .{};
-    defer buf.deinit(testing.allocator);
-
-    try testing.expect(buf.append(testing.allocator, "hello"));
-    try testing.expect(buf.append(testing.allocator, " world"));
-
-    try testing.expectEqual(@as(usize, 2), buf.chunks.items.len);
-    try testing.expectEqual(@as(usize, 11), buf.total_bytes);
-    try testing.expectEqualStrings("hello", buf.chunks.items[0]);
-    try testing.expectEqualStrings(" world", buf.chunks.items[1]);
-}
-
-test "PaneOutputBuffer: empty append succeeds" {
-    var buf: Window.PaneOutputBuffer = .{};
-    defer buf.deinit(testing.allocator);
-
-    try testing.expect(buf.append(testing.allocator, ""));
-    try testing.expectEqual(@as(usize, 0), buf.chunks.items.len);
-    try testing.expectEqual(@as(usize, 0), buf.total_bytes);
-}
-
-test "PaneOutputBuffer: overflow drops newest" {
-    var buf: Window.PaneOutputBuffer = .{};
-    defer buf.deinit(testing.allocator);
-
-    // Fill buffer to just under capacity.
-    const fill_size = Window.PaneOutputBuffer.max_bytes - 1;
-    const fill_data = try testing.allocator.alloc(u8, fill_size);
-    defer testing.allocator.free(fill_data);
-    @memset(fill_data, 'A');
-
-    try testing.expect(buf.append(testing.allocator, fill_data));
-    try testing.expectEqual(fill_size, buf.total_bytes);
-
-    // One more byte fits.
-    try testing.expect(buf.append(testing.allocator, "B"));
-    try testing.expectEqual(Window.PaneOutputBuffer.max_bytes, buf.total_bytes);
-
-    // Any additional data must be rejected (drop-newest).
-    try testing.expect(!buf.append(testing.allocator, "C"));
-    try testing.expectEqual(Window.PaneOutputBuffer.max_bytes, buf.total_bytes);
-    try testing.expectEqual(@as(usize, 2), buf.chunks.items.len);
-}
-
-test "PaneOutputBuffer: deinit resets state" {
-    var buf: Window.PaneOutputBuffer = .{};
-
-    try testing.expect(buf.append(testing.allocator, "data"));
-    try testing.expectEqual(@as(usize, 4), buf.total_bytes);
-
-    buf.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 0), buf.total_bytes);
-    try testing.expectEqual(@as(usize, 0), buf.chunks.items.len);
-}
-
-test "PaneOutputBuffer: multiple chunks replay order" {
-    var buf: Window.PaneOutputBuffer = .{};
-    defer buf.deinit(testing.allocator);
-
-    const chunks = [_][]const u8{ "first", "second", "third" };
-    for (&chunks) |chunk| {
-        try testing.expect(buf.append(testing.allocator, chunk));
-    }
-
-    try testing.expectEqual(@as(usize, 3), buf.chunks.items.len);
-
-    // Verify chunks are in insertion order.
-    for (buf.chunks.items, 0..) |chunk, i| {
-        try testing.expectEqualStrings(chunks[i], chunk);
-    }
-
-    // Verify total_bytes is sum of all chunks.
-    try testing.expectEqual(@as(usize, 5 + 6 + 5), buf.total_bytes);
-}
-
-test "PaneOutputBuffer: capacity boundary exact fit" {
-    var buf: Window.PaneOutputBuffer = .{};
-    defer buf.deinit(testing.allocator);
-
-    // Fill buffer to exactly capacity.
-    const fill_data = try testing.allocator.alloc(u8, Window.PaneOutputBuffer.max_bytes);
-    defer testing.allocator.free(fill_data);
-    @memset(fill_data, 'X');
-
-    try testing.expect(buf.append(testing.allocator, fill_data));
-    try testing.expectEqual(Window.PaneOutputBuffer.max_bytes, buf.total_bytes);
-
-    // Next append of any size must fail.
-    try testing.expect(!buf.append(testing.allocator, "Y"));
-    try testing.expectEqual(@as(usize, 1), buf.chunks.items.len);
-}

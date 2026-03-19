@@ -520,7 +520,6 @@ fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !vo
     switch (msg) {
         .tmux_topology_changed => |snapshot| snapshot.deinit(),
         .tmux_write_command => |w| w.deinit(),
-        .tmux_pane_output => |po| po.data.deinit(),
         else => {},
     }
 }

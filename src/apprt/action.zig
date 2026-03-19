@@ -356,8 +356,6 @@ pub const Action = union(Key) {
     ///
     /// The data pointer is valid only for the duration of the action
     /// handler (it points into the surface message's WriteReq buffer).
-    tmux_pane_output: TmuxPaneOutput,
-
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -426,7 +424,6 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         tmux_reconcile,
-        tmux_pane_output,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -1032,19 +1029,6 @@ pub const TmuxReconcile = struct {
             .payload = self.payload,
         };
     }
-};
-
-/// Value for the `tmux_pane_output` action. Carries the pane identifier
-/// and a borrowed slice of output data. The data pointer is valid only
-/// for the duration of the action handler call (it references memory
-/// owned by the surface message's WriteReq buffer).
-///
-/// This is a simple extern struct so it is directly C ABI compatible
-/// without needing a separate C type conversion.
-pub const TmuxPaneOutput = extern struct {
-    pane_id: usize,
-    data: [*]const u8,
-    data_len: usize,
 };
 
 test {

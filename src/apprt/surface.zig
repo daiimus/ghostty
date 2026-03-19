@@ -124,13 +124,6 @@ pub const Message = union(enum) {
     /// directly to the parent's mailbox.
     tmux_write_command: WriteReq,
 
-    /// Pane output from the tmux control mode stream (`%output`
-    /// notification). The parent surface's stream handler constructs
-    /// this message targeting the parent surface's own mailbox.
-    /// `handleMessage` dispatches it as a `tmux_pane_output` action
-    /// so the apprt can route the data to the correct child surface.
-    tmux_pane_output: TmuxPaneOutput,
-
     /// The active pane changed in tmux (`%window-pane-changed`
     /// notification). The parent surface's stream handler constructs
     /// this message so the app thread can update focus to the correct
@@ -160,14 +153,6 @@ pub const Message = union(enum) {
 
             .none => void,
         };
-    };
-
-    /// Carries a tmux pane's output data with its pane identifier.
-    /// Follows the `clipboard_write` pattern: a struct wrapping
-    /// `WriteReq` with metadata (pane_id instead of clipboard_type).
-    pub const TmuxPaneOutput = struct {
-        pane_id: usize,
-        data: WriteReq,
     };
 
     /// Carries the window and pane IDs from a tmux
