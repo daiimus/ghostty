@@ -219,6 +219,16 @@ pub const Viewer = struct {
         /// The active pane changed in tmux. The caller should update
         /// focus to the specified window and pane. This is emitted in
         /// response to `%window-pane-changed` notifications from tmux.
+        ///
+        /// Rationale for tmux→Ghostty focus sync: Mitchell's upstream
+        /// viewer ignores `%window-pane-changed` because "we handle our
+        /// own focus." However, in multi-client scenarios (SSH pair
+        /// programming, automation scripts, `tmux select-pane` from
+        /// another terminal), the active pane can change externally.
+        /// Without this sync, Ghostty's visible focus would diverge
+        /// from tmux's actual active pane. We keep bidirectional focus
+        /// sync (Ghostty→tmux via `select-pane`, tmux→Ghostty via
+        /// this action) to stay consistent in these real-world cases.
         focus: struct {
             window_id: usize,
             pane_id: usize,
