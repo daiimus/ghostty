@@ -6087,7 +6087,32 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             },
         ),
 
-        .close_surface => self.close(),
+        .close_surface => {
+            // For tmux-backed surfaces, ask tmux to kill the pane rather
+            // than closing the Ghostty surface directly. tmux will respond
+            // with %layout-change (or %window-close for the last pane),
+            // which flows through the reconciler to destroy the surface.
+            switch (self.io.backend) {
+                .tmux => |tmux_backend| {
+                    var buf: [termio.Message.WriteReq.Small.Max]u8 = undefined;
+                    const cmd = std.fmt.bufPrint(&buf, "kill-pane -t %{d}\n", .{
+                        tmux_backend.pane_id,
+                    }) catch {
+                        log.warn("kill-pane command too large for buffer", .{});
+                        return false;
+                    };
+
+                    var small: termio.Message.WriteReq.Small = .{};
+                    @memcpy(small.data[0..cmd.len], cmd);
+                    small.len = @intCast(cmd.len);
+                    self.queueIo(.{ .tmux_command = small }, .unlocked);
+                    return true;
+                },
+                .exec => {},
+            }
+
+            self.close();
+        },
 
         .close_window => return try self.rt_app.performAction(
             .{ .surface = self },
