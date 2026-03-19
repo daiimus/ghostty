@@ -17,8 +17,6 @@ const log = std.log.scoped(.terminal_tmux_viewer);
 // TODO: A list of TODOs as I think about them.
 // - We need to make startup more robust so session and block can happen
 //   out of order.
-// - We need to ignore `output` for panes that aren't yet initialized
-//   (until capture-panes are complete).
 // - We should note what the active window pane is on the tmux side;
 //   we can use this at least for initial focus.
 
@@ -285,6 +283,12 @@ pub const Viewer = struct {
         /// renderer thread.
         renderer_mutex: ?*std.Thread.Mutex = null,
 
+        /// Whether this pane has been fully initialized with captured
+        /// content and terminal state from tmux. Output notifications
+        /// are suppressed until this is true to avoid displaying
+        /// partial/stale data before the capture-pane sequence completes.
+        initialized: bool = false,
+
         pub fn deinit(self: *Pane, alloc: Allocator) void {
             self.terminal.deinit(alloc);
         }
@@ -480,15 +484,30 @@ pub const Viewer = struct {
             },
 
             .output => |out| {
-                self.receivedOutput(
-                    out.pane_id,
-                    out.data,
-                ) catch |err| {
-                    log.warn(
-                        "failed to process output for pane id={}: {}",
-                        .{ out.pane_id, err },
+                // Suppress output for panes that haven't completed their
+                // capture-pane initialization sequence. Processing output
+                // before capture completes would corrupt the terminal
+                // state being built up by receivedPaneHistory/Visible.
+                const pane = if (self.panes.getEntry(out.pane_id)) |entry|
+                    entry.value_ptr.*
+                else
+                    null;
+                if (pane != null and !pane.?.initialized) {
+                    log.info(
+                        "suppressing output for uninitialized pane id={}",
+                        .{out.pane_id},
                     );
-                };
+                } else {
+                    self.receivedOutput(
+                        out.pane_id,
+                        out.data,
+                    ) catch |err| {
+                        log.warn(
+                            "failed to process output for pane id={}: {}",
+                            .{ out.pane_id, err },
+                        );
+                    };
+                }
             },
 
             // Session changed means we switched to a different tmux session.
@@ -869,7 +888,17 @@ pub const Viewer = struct {
         switch (command) {
             .user => {},
 
-            .pane_state => try self.receivedPaneState(content),
+            .pane_state => {
+                try self.receivedPaneState(content);
+
+                // The pane_state command is the last in the capture
+                // sequence. Mark all panes as initialized so they
+                // can start receiving live output notifications.
+                var panes_it = self.panes.iterator();
+                while (panes_it.next()) |kv| {
+                    kv.value_ptr.*.initialized = true;
+                }
+            },
 
             .list_windows => try self.receivedListWindows(
                 arena_alloc,
@@ -1877,6 +1906,21 @@ test "initial flow" {
         },
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
+            // Completes pane_visible(1, alternate), triggers pane_state
+            .contains_command = "list-panes",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            // pane_state response completes initialization
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // All panes should now be marked as initialized
+                    var it = v.panes.iterator();
+                    while (it.next()) |kv| {
+                        try testing.expect(kv.value_ptr.*.initialized);
+                    }
+                }
+            }).check,
         },
         .{
             .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = "new output" } } },
@@ -2595,4 +2639,95 @@ test "Action.format handles focus action" {
     const result = builder.writer.buffered();
 
     try testing.expect(std.mem.indexOf(u8, result, "focus") != null);
+}
+
+test "output suppressed for uninitialized panes" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Receive window with single pane
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Pane should exist but not be initialized
+                    const pane = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expect(!pane.initialized);
+                }
+            }).check,
+        },
+        // Output arrives during capture-pane sequence — should be suppressed
+        .{
+            .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = "premature output" } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // No actions should be emitted — output is suppressed
+                    try testing.expectEqual(0, actions.len);
+                    // Viewer's terminal should NOT have the premature output
+                    const pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.*.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    try testing.expectEqualStrings("", str);
+                }
+            }).check,
+        },
+        // Complete capture-pane sequence: 4 captures + pane_state
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            // pane_state completes — pane should now be initialized
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expect(pane.initialized);
+                }
+            }).check,
+        },
+        // Output after initialization — should be processed by viewer
+        .{
+            .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = "real output" } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // No actions emitted — viewer processes output
+                    // internally into the pane terminal.
+                    try testing.expectEqual(0, actions.len);
+                    // Viewer's terminal should have the output
+                    const pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.*.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    try testing.expect(std.mem.containsAtLeast(u8, str, 1, "real output"));
+                }
+            }).check,
+        },
+    });
 }
