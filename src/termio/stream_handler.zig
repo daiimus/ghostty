@@ -56,6 +56,9 @@ pub const StreamHandler = struct {
     /// The clipboard write access configuration.
     clipboard_write: configpkg.ClipboardAccess,
 
+    /// Whether tmux control mode is enabled at runtime.
+    tmux_control_mode: bool = true,
+
     //---------------------------------------------------------------
     // Internal state
 
@@ -110,6 +113,7 @@ pub const StreamHandler = struct {
         self.osc_color_report_format = config.osc_color_report_format;
         self.clipboard_write = config.clipboard_write;
         self.enquiry_response = config.enquiry_response;
+        self.tmux_control_mode = config.tmux_control_mode;
         self.default_cursor_style = config.cursor_style;
         self.default_cursor_blink = config.cursor_blink;
 
@@ -390,6 +394,11 @@ pub const StreamHandler = struct {
                 // If tmux control mode is disabled at the build level,
                 // then this whole block shouldn't be analyzed.
                 if (comptime !tmux_enabled) break :tmux;
+
+                // Runtime config gate: the user can disable tmux control
+                // mode even when compiled in.
+                if (!self.tmux_control_mode) break :tmux;
+
                 log.info("tmux control mode event cmd={f}", .{tmux});
 
                 switch (tmux) {
