@@ -167,6 +167,8 @@ pub const Variable = enum {
     /// encodes pane dimensions as `WxH,X,Y[,ID]` with `{...}` for horizontal
     /// splits and `[...]` for vertical splits.
     window_layout,
+    /// Name of window.
+    window_name,
     /// Pane wrap flag.
     wrap_flag,
 
@@ -217,6 +219,7 @@ pub const Variable = enum {
             .pane_tabs,
             .version,
             .window_layout,
+            .window_name,
             => value,
         };
     }
@@ -258,6 +261,7 @@ pub const Variable = enum {
             .pane_tabs,
             .version,
             .window_layout,
+            .window_name,
             => []const u8,
         };
     }

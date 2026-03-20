@@ -133,6 +133,14 @@ pub const Message = union(enum) {
     /// carries only two IDs.
     tmux_focus_changed: TmuxFocusChanged,
 
+    /// A tmux title changed — either a window rename (tab title) or
+    /// a session rename (Ghostty window title). The parent surface's
+    /// stream handler constructs this message so the app thread can
+    /// update the displayed title.
+    ///
+    /// Lightweight value type — fixed-size buffer, no heap allocation.
+    tmux_title_changed: TmuxTitleChanged,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
@@ -160,6 +168,33 @@ pub const Message = union(enum) {
     pub const TmuxFocusChanged = struct {
         window_id: usize,
         pane_id: usize,
+    };
+
+    /// Carries a title change from a tmux `%window-renamed` or
+    /// `%session-renamed` notification. Fixed-size buffer following
+    /// the `set_title: [256]u8` pattern.
+    pub const TmuxTitleChanged = struct {
+        /// For tab title (window rename): the tmux window ID.
+        /// For window title (session rename): null.
+        tmux_window_id: ?usize,
+
+        /// Title string. Stored inline in a fixed buffer.
+        title_buf: [256]u8 = undefined,
+        title_len: u8 = 0,
+
+        pub fn init(tmux_window_id: ?usize, name: []const u8) TmuxTitleChanged {
+            var result: TmuxTitleChanged = .{
+                .tmux_window_id = tmux_window_id,
+            };
+            const len: u8 = @intCast(@min(name.len, result.title_buf.len - 1));
+            @memcpy(result.title_buf[0..len], name[0..len]);
+            result.title_len = len;
+            return result;
+        }
+
+        pub fn title(self: *const TmuxTitleChanged) []const u8 {
+            return self.title_buf[0..self.title_len];
+        }
     };
 
     /// A deep-copy snapshot of the tmux viewer's window topology. Owns
@@ -209,6 +244,7 @@ pub const Message = union(enum) {
                     .width = window.width,
                     .height = window.height,
                     .layout = try window.layout.clone(arena_alloc),
+                    .name = try arena_alloc.dupe(u8, window.name),
                 };
             }
 
@@ -436,4 +472,22 @@ test "TmuxTopologySnapshot deinit frees owned arena" {
     // If any memory leaks, the testing allocator will report it.
     try std.testing.expectEqual(@as(usize, 1), snapshot.windows.len);
     snapshot.deinit();
+}
+
+test "TmuxTitleChanged stores and retrieves title" {
+    const tc = Message.TmuxTitleChanged.init(42, "my-window");
+    try std.testing.expectEqual(@as(?usize, 42), tc.tmux_window_id);
+    try std.testing.expectEqualStrings("my-window", tc.title());
+}
+
+test "TmuxTitleChanged with null window id for session title" {
+    const tc = Message.TmuxTitleChanged.init(null, "my-session");
+    try std.testing.expectEqual(@as(?usize, null), tc.tmux_window_id);
+    try std.testing.expectEqualStrings("my-session", tc.title());
+}
+
+test "TmuxTitleChanged truncates long titles" {
+    const long_name = "a" ** 300;
+    const tc = Message.TmuxTitleChanged.init(0, long_name);
+    try std.testing.expectEqual(@as(usize, 255), tc.title().len);
 }

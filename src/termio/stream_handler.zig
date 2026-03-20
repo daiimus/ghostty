@@ -522,6 +522,28 @@ pub const StreamHandler = struct {
                                 },
                             });
                         },
+
+                        .title => |t| {
+                            // Forward window rename to the app thread so it
+                            // can update the tab title.
+                            self.surfaceMessageWriter(.{
+                                .tmux_title_changed = apprt.surface.Message.TmuxTitleChanged.init(
+                                    t.window_id,
+                                    t.name,
+                                ),
+                            });
+                        },
+
+                        .session_title => |st| {
+                            // Forward session rename to the app thread so it
+                            // can update the Ghostty window title.
+                            self.surfaceMessageWriter(.{
+                                .tmux_title_changed = apprt.surface.Message.TmuxTitleChanged.init(
+                                    null,
+                                    st.name,
+                                ),
+                            });
+                        },
                     }
                 }
             },
