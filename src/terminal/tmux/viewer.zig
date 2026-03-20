@@ -527,6 +527,19 @@ pub const Viewer = struct {
                 return self.defunct();
             },
 
+            // The active window changed in the session. Refresh the
+            // window list so that layout reconciliation can update
+            // the active window/pane focus. Only react if this
+            // notification is for our current session.
+            .session_window_changed => |info| {
+                if (info.session_id == self.session_id) {
+                    self.sessionWindowChanged(info.window_id) catch {
+                        log.warn("failed to handle session window change, becoming defunct", .{});
+                        return self.defunct();
+                    };
+                }
+            },
+
             // The active pane changed in tmux. Forward to the caller
             // so it can update focus to the correct window and pane.
             .window_pane_changed => |info| {
@@ -683,6 +696,18 @@ pub const Viewer = struct {
     /// When a window is added to the session, we need to refresh our window
     /// list to get the new window's information.
     fn windowAdd(
+        self: *Viewer,
+        window_id: usize,
+    ) !void {
+        _ = window_id; // We refresh all windows via list-windows
+
+        // Queue list-windows to get the updated window list
+        try self.queueCommands(&.{.list_windows});
+    }
+
+    /// When the active window changes in the session, refresh the window
+    /// list so that layout reconciliation picks up the new active state.
+    fn sessionWindowChanged(
         self: *Viewer,
         window_id: usize,
     ) !void {
@@ -2312,6 +2337,119 @@ test "window_add queues list_windows when queue not empty" {
                         try testing.expect(action != .command);
                     }
                     // But list_windows should be in the queue
+                    try testing.expect(!v.command_queue.empty());
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "session_window_changed queues list_windows when queue empty" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        // Receive version response, which triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Receive initial window layout with one pane
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete all capture-pane commands for pane 0
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Queue should now be empty
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+        // Now send session_window_changed - should trigger list-windows command
+        .{
+            .input = .{ .tmux = .{ .session_window_changed = .{ .session_id = 1, .window_id = 2 } } },
+            .contains_command = "list-windows",
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(!v.command_queue.empty());
+                    try testing.expectEqual(1, v.command_queue.len());
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "session_window_changed queues list_windows when queue not empty" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        // Receive version response, which triggers list-windows
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Receive initial window layout with one pane
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(!v.command_queue.empty());
+                }
+            }).check,
+        },
+        // Do NOT complete capture-pane commands - queue still has commands.
+        // Send session_window_changed - should queue list-windows but NOT return command action
+        .{
+            .input = .{ .tmux = .{ .session_window_changed = .{ .session_id = 1, .window_id = 2 } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| {
+                        try testing.expect(action != .command);
+                    }
                     try testing.expect(!v.command_queue.empty());
                 }
             }).check,
