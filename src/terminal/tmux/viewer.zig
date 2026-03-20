@@ -891,7 +891,15 @@ pub const Viewer = struct {
 
         // Get our list of added panes and setup our command queue
         // to populate them.
-        // TODO: errdefer cleanup
+        //
+        // If queueCommands fails partway through (OOM), some capture-pane
+        // commands may already be queued for panes that won't be added
+        // (because the panes errdefer above cleans up the new pane map).
+        // This is safe: receivedPaneHistory and receivedPaneVisible both
+        // check panes.getEntry() and gracefully skip untracked pane IDs.
+        // CircBuf has no deleteNewest operation, and snapshotting head/full
+        // is unsafe across potential resize+rotate, so we rely on the
+        // response handlers' existing resilience rather than rolling back.
         {
             var panes_it = panes.iterator();
             var added: bool = false;
@@ -1443,6 +1451,15 @@ pub const Viewer = struct {
                 if (gop.found_existing) break :pane;
                 errdefer _ = panes_new.swapRemove(gop.key_ptr.*);
 
+                const cols: size.CellCountInt = std.math.cast(size.CellCountInt, layout.width) orelse {
+                    log.info("pane {} width {} overflows CellCountInt, skipping", .{ id, layout.width });
+                    break :pane;
+                };
+                const rows: size.CellCountInt = std.math.cast(size.CellCountInt, layout.height) orelse {
+                    log.info("pane {} height {} overflows CellCountInt, skipping", .{ id, layout.height });
+                    break :pane;
+                };
+
                 // If we already have this pane, it is already initialized
                 // so just copy it over (and resize if the layout changed).
                 if (panes_old.getEntry(id)) |entry| {
@@ -1455,18 +1472,15 @@ pub const Viewer = struct {
                     // dimensions already match.
                     try gop.value_ptr.*.terminal.resize(
                         gpa_alloc,
-                        @intCast(layout.width),
-                        @intCast(layout.height),
+                        cols,
+                        rows,
                     );
                     break :pane;
                 }
 
-                // TODO: We need to gracefully handle overflow of our
-                // max cols/width here. In practice we shouldn't hit this
-                // so we cast but its not safe.
                 var t: Terminal = try .init(gpa_alloc, .{
-                    .cols = @intCast(layout.width),
-                    .rows = @intCast(layout.height),
+                    .cols = cols,
+                    .rows = rows,
                 });
                 errdefer t.deinit(gpa_alloc);
 
