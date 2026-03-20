@@ -405,7 +405,21 @@ pub const StreamHandler = struct {
                     },
 
                     .exit => {
-                        // Free our viewer state if we have one
+                        // Send an empty topology snapshot so the reconciler
+                        // prunes all tmux windows/panes. This closes all
+                        // child surfaces created for the tmux session.
+                        if (self.tmux_viewer != null) {
+                            if (apprt.surface.Message.TmuxTopologySnapshot.initFromWindows(
+                                self.alloc,
+                                &.{},
+                            )) |snapshot| {
+                                self.surfaceMessageWriter(.{ .tmux_topology_changed = snapshot });
+                            } else |err| {
+                                log.warn("failed to create exit topology snapshot: {}", .{err});
+                            }
+                        }
+
+                        // Free our viewer state if we have one.
                         if (self.tmux_viewer) |viewer| {
                             viewer.deinit();
                             self.alloc.destroy(viewer);
@@ -438,10 +452,19 @@ pub const StreamHandler = struct {
                     log.debug("tmux viewer action={f}", .{action});
                     switch (action) {
                         .exit => {
-                            // We ignore this because we will fully exit when
-                            // our DCS connection ends. We may want to handle
-                            // this in the future to notify our GUI we're
-                            // disconnected though.
+                            // The viewer has gone defunct (e.g. broken control
+                            // stream). Send an empty topology snapshot to close
+                            // all child tmux surfaces. The DCS unhook path also
+                            // sends this, but the viewer may go defunct before
+                            // the DCS session formally ends.
+                            if (apprt.surface.Message.TmuxTopologySnapshot.initFromWindows(
+                                self.alloc,
+                                &.{},
+                            )) |snapshot| {
+                                self.surfaceMessageWriter(.{ .tmux_topology_changed = snapshot });
+                            } else |err| {
+                                log.warn("failed to create exit topology snapshot: {}", .{err});
+                            }
                         },
 
                         .command => |command| {

@@ -7362,3 +7362,30 @@ test "focusTmuxReconcile repeated calls produce identical payloads" {
     try testing.expectEqual(sf1.tmux_window_id, sf2.tmux_window_id);
     try testing.expectEqual(sf1.pane_id, sf2.pane_id);
 }
+
+test "planTmuxReconcile empty windows produces prune-all" {
+    const testing = @import("std").testing;
+    const alloc = testing.allocator;
+
+    // Empty window list — simulates tmux exit where all windows should be pruned.
+    const payload = try planTmuxReconcile(alloc, &.{});
+    defer payload.deinit();
+
+    // Expected: begin, prune_absent (empty sets), end = 3 ops
+    try testing.expectEqual(@as(usize, 3), payload.ops.len);
+
+    // Op 0: sync_windows_begin
+    try testing.expect(payload.ops[0] == .sync_windows_begin);
+
+    // Op 1: prune_absent with empty keep-sets
+    switch (payload.ops[1]) {
+        .prune_absent => |pa| {
+            try testing.expectEqual(@as(usize, 0), pa.window_ids.len);
+            try testing.expectEqual(@as(usize, 0), pa.pane_ids.len);
+        },
+        else => return error.UnexpectedOp,
+    }
+
+    // Op 2: sync_windows_end
+    try testing.expect(payload.ops[2] == .sync_windows_end);
+}
