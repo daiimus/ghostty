@@ -156,6 +156,8 @@ pub const Variable = enum {
     session_id,
     /// Server version (e.g., `3.5a`).
     version,
+    /// 1 if window is the current window in the session.
+    window_active,
     /// Unique window ID prefixed with `@` (e.g., `@0`, `@42`).
     window_id,
     /// Width of window.
@@ -191,6 +193,7 @@ pub const Variable = enum {
             .mouse_standard_flag,
             .mouse_utf8_flag,
             .origin_flag,
+            .window_active,
             .wrap_flag,
             => std.mem.eql(u8, value, "1"),
             .alternate_saved_x,
@@ -242,6 +245,7 @@ pub const Variable = enum {
             .mouse_standard_flag,
             .mouse_utf8_flag,
             .origin_flag,
+            .window_active,
             .wrap_flag,
             => bool,
             .alternate_saved_x,

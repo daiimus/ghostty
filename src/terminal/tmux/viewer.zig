@@ -17,8 +17,6 @@ const log = std.log.scoped(.terminal_tmux_viewer);
 // TODO: A list of TODOs as I think about them.
 // - We need to make startup more robust so session and block can happen
 //   out of order.
-// - We should note what the active window pane is on the tmux side;
-//   we can use this at least for initial focus.
 
 // NOTE: There is some fragility here that can possibly break if tmux
 // changes their implementation. In particular, the order of notifications
@@ -1108,6 +1106,10 @@ pub const Viewer = struct {
         var windows: std.ArrayList(Window) = .empty;
         defer windows.deinit(self.alloc);
 
+        // Track the active window's ID and its active pane for initial focus.
+        var active_window_id: ?usize = null;
+        var active_pane_id: ?usize = null;
+
         // Parse all our windows
         var it = std.mem.splitScalar(u8, content, '\n');
         while (it.next()) |line_raw| {
@@ -1134,6 +1136,12 @@ pub const Viewer = struct {
                 continue;
             };
 
+            // Record the active window and its current pane
+            if (data.window_active) {
+                active_window_id = data.window_id;
+                active_pane_id = data.pane_id;
+            }
+
             try windows.append(self.alloc, .{
                 .id = data.window_id,
                 .width = data.window_width,
@@ -1156,6 +1164,22 @@ pub const Viewer = struct {
         // window changes. Uses self.windows.items (persistent) to
         // match the layoutChanged pattern.
         try actions.append(arena_alloc, .{ .windows = self.windows.items });
+
+        // Emit a focus action for the active window/pane so the caller
+        // can set initial focus (or re-focus after a window change).
+        // In list-windows context, pane_id is the active pane of each
+        // window, so the combination of window_active + pane_id gives
+        // us the session's currently focused window and pane.
+        if (active_window_id) |win_id| {
+            if (active_pane_id) |pane_id| {
+                try actions.append(arena_alloc, .{
+                    .focus = .{
+                        .window_id = win_id,
+                        .pane_id = pane_id,
+                    },
+                });
+            }
+        }
     }
 
     fn receivedPaneState(
@@ -1689,6 +1713,8 @@ const Format = struct {
         .vars = &.{
             .session_id,
             .window_id,
+            .window_active,
+            .pane_id,
             .window_width,
             .window_height,
             .window_layout,
@@ -1830,7 +1856,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$1 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] bash
+                \\$1 @0 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -1877,7 +1903,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$2 @1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] bash
+                \\$2 @1 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -1929,7 +1955,7 @@ test "initial flow" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] bash
+                \\$0 @0 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2138,7 +2164,7 @@ test "layout change" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2221,7 +2247,7 @@ test "layout change resizes existing pane without structural change" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2290,7 +2316,7 @@ test "layout_change does not return command when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2351,7 +2377,7 @@ test "layout_change returns command when queue was empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2418,7 +2444,7 @@ test "window_add queues list_windows when queue empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2479,7 +2505,7 @@ test "window_add queues list_windows when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2535,7 +2561,7 @@ test "session_window_changed queues list_windows when queue empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2595,7 +2621,7 @@ test "session_window_changed queues list_windows when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2648,7 +2674,7 @@ test "window_close queues list_windows when queue empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2709,7 +2735,7 @@ test "window_close queues list_windows when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2771,7 +2797,7 @@ test "two pane flow with pane state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 165 79 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4] bash
+                \\$0 @0 1 %0 165 79 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4] bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2947,8 +2973,8 @@ test "layout change preserves other windows on shared arena" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 80 24 b25d,80x24,0,0,0 bash
-                \\$0 @1 80 24 b25e,80x24,0,0,1 vim
+                \\$0 @0 1 %0 80 24 b25d,80x24,0,0,0 bash
+                \\$0 @1 0 %1 80 24 b25e,80x24,0,0,1 vim
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3048,7 +3074,7 @@ test "window_pane_changed produces focus action" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] bash
+                \\$0 @0 1 %0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3131,7 +3157,7 @@ test "output suppressed for uninitialized panes" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3222,7 +3248,7 @@ test "window_renamed produces title action" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3290,7 +3316,7 @@ test "session_renamed produces session_title action" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3355,7 +3381,7 @@ test "list_windows stores window name" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0 htop
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 htop
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3363,6 +3389,94 @@ test "list_windows stores window name" {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(1, v.windows.items.len);
                     try testing.expectEqualStrings("htop", v.windows.items[0].name);
+                }
+            }).check,
+        },
+    });
+}
+
+test "list_windows emits focus action for active window" {
+    // Verifies that receivedListWindows emits a .focus action targeting
+    // the active window and its current pane from the list-windows output.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .focus },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    var found = false;
+                    for (actions) |action| {
+                        if (action == .focus) {
+                            try testing.expectEqual(0, action.focus.window_id);
+                            try testing.expectEqual(0, action.focus.pane_id);
+                            found = true;
+                        }
+                    }
+                    try testing.expect(found);
+                }
+            }).check,
+        },
+    });
+}
+
+test "list_windows emits focus for active window in multi-window session" {
+    // With two windows, only @0 is active. The focus action should
+    // target @0 and its current pane %0, not the inactive @1.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 %0 80 24 b25d,80x24,0,0,0 bash
+                \\$0 @1 0 %1 80 24 b25e,80x24,0,0,1 vim
+                ,
+            } },
+            .contains_tags = &.{ .windows, .focus },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    var found = false;
+                    for (actions) |action| {
+                        if (action == .focus) {
+                            // Active window is @0 with current pane %0
+                            try testing.expectEqual(0, action.focus.window_id);
+                            try testing.expectEqual(0, action.focus.pane_id);
+                            found = true;
+                        }
+                    }
+                    try testing.expect(found);
                 }
             }).check,
         },
