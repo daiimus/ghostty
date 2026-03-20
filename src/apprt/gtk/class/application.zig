@@ -3034,6 +3034,32 @@ const Action = struct {
                 .sync_windows_end => {
                     log.debug("tmux reconcile: sync_windows_end", .{});
                 },
+
+                .set_tab_title => |st| {
+                    log.debug("tmux reconcile: set_tab_title window={} title=\"{s}\"", .{ st.tmux_window_id, st.title });
+
+                    if (window_map.get(st.tmux_window_id)) |tab| {
+                        const title_z = alloc.dupeZ(u8, st.title) catch {
+                            log.warn("tmux reconcile: failed to dupe tab title", .{});
+                            continue;
+                        };
+                        defer alloc.free(title_z);
+                        tab.setTitleOverride(if (title_z.len == 0) null else title_z);
+                    } else {
+                        log.warn("tmux reconcile: set_tab_title for unknown window {}", .{st.tmux_window_id});
+                    }
+                },
+
+                .set_window_title => |swt| {
+                    log.debug("tmux reconcile: set_window_title title=\"{s}\"", .{swt.title});
+
+                    const title_z = alloc.dupeZ(u8, swt.title) catch {
+                        log.warn("tmux reconcile: failed to dupe window title", .{});
+                        continue;
+                    };
+                    defer alloc.free(title_z);
+                    window.as(gtk.Window).setTitle(title_z);
+                },
             }
         }
     }

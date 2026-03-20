@@ -162,6 +162,12 @@ pub const Viewer = struct {
     /// The current session ID we're attached to.
     session_id: usize,
 
+    /// The current session name. Stored on the windows arena and
+    /// valid until the next list-windows refresh. Empty if not yet
+    /// known (session name is set from `%session-changed` on attach
+    /// and updated via `%session-renamed`).
+    session_name: []const u8,
+
     /// The tmux server version string (e.g., "3.5a"). We capture this
     /// on startup because it will allow us to change behavior between
     /// versions as necessary.
@@ -232,6 +238,23 @@ pub const Viewer = struct {
             pane_id: usize,
         },
 
+        /// A tmux window was renamed. The caller should update the
+        /// tab title for the given window ID.
+        title: struct {
+            window_id: usize,
+            /// Window name, stored on the viewer's windows arena.
+            /// Valid until the next list-windows refresh.
+            name: []const u8,
+        },
+
+        /// The tmux session was renamed. The caller should update the
+        /// Ghostty window title.
+        session_title: struct {
+            /// Session name, stored on the viewer's windows arena.
+            /// Valid until the next list-windows refresh.
+            name: []const u8,
+        },
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -267,6 +290,10 @@ pub const Viewer = struct {
         width: usize,
         height: usize,
         layout: Layout,
+        /// Window name from tmux (e.g., "bash", "vim"). Stored on the
+        /// shared windows arena and valid until the next list-windows
+        /// refresh. Empty slice if not yet known.
+        name: []const u8 = "",
     };
 
     pub const Pane = struct {
@@ -310,6 +337,7 @@ pub const Viewer = struct {
             // until we receive a session-changed notification which will
             // set this to a real value.
             .session_id = 0,
+            .session_name = "",
             .tmux_version = "",
             .command_queue = command_queue,
             .windows = .empty,
@@ -419,6 +447,13 @@ pub const Viewer = struct {
 
             .session_changed => |info| {
                 self.session_id = info.id;
+                // Store the session name on the windows arena so it
+                // can be surfaced to the caller for window title.
+                {
+                    var win_arena = self.windows_arena.promote(self.alloc);
+                    defer self.windows_arena = win_arena.state;
+                    self.session_name = win_arena.allocator().dupe(u8, info.name) catch "";
+                }
 
                 var arena = self.action_arena.promote(self.alloc);
                 defer self.action_arena = arena.state;
@@ -517,6 +552,7 @@ pub const Viewer = struct {
                 self.sessionChanged(
                     &actions,
                     info.id,
+                    info.name,
                 ) catch {
                     log.warn("failed to handle session change, becoming defunct", .{});
                     return self.defunct();
@@ -589,14 +625,60 @@ pub const Viewer = struct {
             // care.
             .sessions_changed => {},
 
-            // We don't use window names for anything, currently.
-            .window_renamed => {},
+            // Update the window name and notify the caller so it can
+            // update the tab title.
+            .window_renamed => |info| {
+                var win_arena = self.windows_arena.promote(self.alloc);
+                defer self.windows_arena = win_arena.state;
+                const win_alloc = win_arena.allocator();
+
+                for (self.windows.items) |*window| {
+                    if (window.id == info.id) {
+                        // Dupe the new name onto the windows arena. The old
+                        // name is also on the arena and will be freed on the
+                        // next full reset (list-windows refresh).
+                        window.name = win_alloc.dupe(u8, info.name) catch {
+                            log.warn("failed to dupe window name for rename", .{});
+                            break;
+                        };
+                        var act_arena = self.action_arena.promote(self.alloc);
+                        defer self.action_arena = act_arena.state;
+                        actions.append(act_arena.allocator(), .{ .title = .{
+                            .window_id = info.id,
+                            .name = window.name,
+                        } }) catch {
+                            log.warn("failed to queue title action", .{});
+                            return actions.items;
+                        };
+                        return actions.items;
+                    }
+                }
+            },
 
             // We don't track pane modes (copy mode, etc.) currently.
             .pane_mode_changed => {},
 
-            // We don't use the session name for anything, currently.
-            .session_renamed => {},
+            // Update the session name and notify the caller so it can
+            // update the Ghostty window title.
+            .session_renamed => |info| {
+                var win_arena = self.windows_arena.promote(self.alloc);
+                defer self.windows_arena = win_arena.state;
+                const win_alloc = win_arena.allocator();
+
+                self.session_name = win_alloc.dupe(u8, info.name) catch {
+                    log.warn("failed to dupe session name for rename", .{});
+                    return actions.items;
+                };
+                var act_arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = act_arena.state;
+                actions.append(act_arena.allocator(), .{ .session_title = .{
+                    .name = self.session_name,
+                } }) catch {
+                    log.warn("failed to queue session_title action", .{});
+                    return actions.items;
+                };
+                return actions.items;
+            },
 
             // Pause/continue relate to refresh-client -A pause-after
             // functionality. We don't handle pane pausing currently.
@@ -868,6 +950,7 @@ pub const Viewer = struct {
         self: *Viewer,
         actions: *std.ArrayList(Action),
         session_id: usize,
+        session_name: []const u8,
     ) (Allocator.Error || std.Io.Writer.Error)!void {
         // Build up a new viewer. Its the easiest way to reset ourselves.
         var replacement: Viewer = try .init(self.alloc);
@@ -898,8 +981,13 @@ pub const Viewer = struct {
         self.deinit();
         self.* = replacement;
 
-        // Set our session ID and jump directly to the list
+        // Set our session ID and name, jump directly to the list
         self.session_id = session_id;
+        {
+            var win_arena = self.windows_arena.promote(self.alloc);
+            defer self.windows_arena = win_arena.state;
+            self.session_name = win_arena.allocator().dupe(u8, session_name) catch "";
+        }
 
         assert(self.state == .command_queue);
     }
@@ -1051,6 +1139,7 @@ pub const Viewer = struct {
                 .width = data.window_width,
                 .height = data.window_height,
                 .layout = layout,
+                .name = try win_alloc.dupe(u8, data.window_name),
             });
         }
 
@@ -1603,6 +1692,7 @@ const Format = struct {
             .window_width,
             .window_height,
             .window_layout,
+            .window_name,
         },
     };
 
@@ -1740,7 +1830,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$1 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$1 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -1787,7 +1877,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$2 @1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$2 @1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -1839,7 +1929,7 @@ test "initial flow" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2048,7 +2138,7 @@ test "layout change" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2131,7 +2221,7 @@ test "layout change resizes existing pane without structural change" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2200,7 +2290,7 @@ test "layout_change does not return command when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2261,7 +2351,7 @@ test "layout_change returns command when queue was empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2328,7 +2418,7 @@ test "window_add queues list_windows when queue empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2389,7 +2479,7 @@ test "window_add queues list_windows when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2445,7 +2535,7 @@ test "session_window_changed queues list_windows when queue empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2505,7 +2595,7 @@ test "session_window_changed queues list_windows when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2558,7 +2648,7 @@ test "window_close queues list_windows when queue empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2619,7 +2709,7 @@ test "window_close queues list_windows when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2681,7 +2771,7 @@ test "two pane flow with pane state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 165 79 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4]
+                \\$0 @0 165 79 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4] bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2857,8 +2947,8 @@ test "layout change preserves other windows on shared arena" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 80 24 b25d,80x24,0,0,0
-                \\$0 @1 80 24 b25e,80x24,0,0,1
+                \\$0 @0 80 24 b25d,80x24,0,0,0 bash
+                \\$0 @1 80 24 b25e,80x24,0,0,1 vim
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2958,7 +3048,7 @@ test "window_pane_changed produces focus action" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3041,7 +3131,7 @@ test "output suppressed for uninitialized panes" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3104,6 +3194,175 @@ test "output suppressed for uninitialized panes" {
                     );
                     defer testing.allocator.free(str);
                     try testing.expect(std.mem.containsAtLeast(u8, str, 1, "real output"));
+                }
+            }).check,
+        },
+    });
+}
+
+test "window_renamed produces title action" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Receive initial window layout with single pane
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture-pane sequence (4 captures + pane_state)
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Queue should now be empty
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+        // Rename window — should produce .title action
+        .{
+            .input = .{ .tmux = .{ .window_renamed = .{
+                .id = 0,
+                .name = "vim",
+            } } },
+            .contains_tags = &.{.title},
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    var found = false;
+                    for (actions) |action| {
+                        if (action == .title) {
+                            try testing.expectEqual(@as(usize, 0), action.title.window_id);
+                            try testing.expectEqualStrings("vim", action.title.name);
+                            found = true;
+                        }
+                    }
+                    try testing.expect(found);
+                    // Window name in viewer state should also be updated
+                    try testing.expectEqualStrings("vim", v.windows.items[0].name);
+                }
+            }).check,
+        },
+    });
+}
+
+test "session_renamed produces session_title action" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "original",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Receive initial window layout
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture-pane sequence
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Queue should now be empty
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+        // Rename session — should produce .session_title action
+        .{
+            .input = .{ .tmux = .{ .session_renamed = .{
+                .name = "renamed-session",
+            } } },
+            .contains_tags = &.{.session_title},
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    var found = false;
+                    for (actions) |action| {
+                        if (action == .session_title) {
+                            try testing.expectEqualStrings("renamed-session", action.session_title.name);
+                            found = true;
+                        }
+                    }
+                    try testing.expect(found);
+                    // Session name in viewer state should be updated
+                    try testing.expectEqualStrings("renamed-session", v.session_name);
+                }
+            }).check,
+        },
+    });
+}
+
+test "list_windows stores window name" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Receive list-windows with a named window
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 b7dd,83x44,0,0,0 htop
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(1, v.windows.items.len);
+                    try testing.expectEqualStrings("htop", v.windows.items[0].name);
                 }
             }).check,
         },

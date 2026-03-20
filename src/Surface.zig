@@ -543,6 +543,19 @@ pub const TmuxReconcileOp = union(enum) {
     /// End the atomic reconcile transaction. The apprt should
     /// commit any deferred visual updates and restore stable focus.
     sync_windows_end,
+
+    /// Set the tab title for a specific tmux window. Emitted in
+    /// response to `%window-renamed` notifications.
+    set_tab_title: struct {
+        tmux_window_id: usize,
+        title: []const u8,
+    },
+
+    /// Set the Ghostty window title from the tmux session name.
+    /// Emitted in response to `%session-renamed` notifications.
+    set_window_title: struct {
+        title: []const u8,
+    },
 };
 
 /// Payload for the `tmux_reconcile` action. Contains an ordered list
@@ -588,13 +601,13 @@ pub fn planTmuxReconcile(
     errdefer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    // Pre-count ops: 1 begin + per-window(1 ensure_window + N panes + 1 set_layout) +
-    // 1 prune_absent + 1 end = 3 + sum(1 + pane_count + 1)
+    // Pre-count ops: 1 begin + per-window(1 ensure_window + N panes + 1 set_layout + 1 set_tab_title) +
+    // 1 prune_absent + 1 end = 3 + sum(1 + pane_count + 1 + 1)
     var total_panes: usize = 0;
     for (windows) |window| {
         total_panes += countPanesInLayout(window.layout);
     }
-    const op_count = 3 + windows.len * 2 + total_panes;
+    const op_count = 3 + windows.len * 3 + total_panes;
     const ops = try arena_alloc.alloc(TmuxReconcileOp, op_count);
 
     // Collect all window and pane IDs for the prune set
@@ -642,6 +655,14 @@ pub fn planTmuxReconcile(
         ops[op_idx] = .{ .set_layout = .{
             .tmux_window_id = window.id,
             .layout = layout_ptr,
+        } };
+        op_idx += 1;
+
+        // set_tab_title — set the tab title from the tmux window name
+        const name_copy = try arena_alloc.dupe(u8, window.name);
+        ops[op_idx] = .{ .set_tab_title = .{
+            .tmux_window_id = window.id,
+            .title = name_copy,
         } };
         op_idx += 1;
     }
@@ -724,6 +745,44 @@ pub fn focusTmuxReconcile(
         .tmux_window_id = window_id,
         .pane_id = pane_id,
     } };
+
+    const payload = try alloc.create(TmuxReconcilePayload);
+    payload.* = .{
+        .alloc = alloc,
+        .arena = arena,
+        .ops = ops,
+    };
+    return payload;
+}
+
+/// Build a minimal reconcile payload containing a single title op.
+/// Used for `%window-renamed` (tab title, `window_id` set) and
+/// `%session-renamed` (window title, `window_id` null).
+///
+/// The title string is copied into the payload's arena so the caller
+/// can discard the source after this returns.
+pub fn titleTmuxReconcile(
+    alloc: Allocator,
+    tmux_window_id: ?usize,
+    title: []const u8,
+) Allocator.Error!*TmuxReconcilePayload {
+    var arena: ArenaAllocator = .init(alloc);
+    errdefer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const title_copy = try arena_alloc.dupe(u8, title);
+    const ops = try arena_alloc.alloc(TmuxReconcileOp, 1);
+
+    if (tmux_window_id) |wid| {
+        ops[0] = .{ .set_tab_title = .{
+            .tmux_window_id = wid,
+            .title = title_copy,
+        } };
+    } else {
+        ops[0] = .{ .set_window_title = .{
+            .title = title_copy,
+        } };
+    }
 
     const payload = try alloc.create(TmuxReconcilePayload);
     payload.* = .{
@@ -1537,6 +1596,27 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 fc.pane_id,
             ) catch |err| {
                 log.warn("tmux focus reconcile failed: {}", .{err});
+                return;
+            };
+            errdefer payload.deinit();
+
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_reconcile,
+                .{ .payload = payload },
+            );
+        },
+
+        .tmux_title_changed => |tc| {
+            // A tmux %window-renamed or %session-renamed notification
+            // arrived. Build a minimal reconcile payload with a single
+            // set_tab_title or set_window_title op.
+            const payload = titleTmuxReconcile(
+                self.alloc,
+                tc.tmux_window_id,
+                tc.title(),
+            ) catch |err| {
+                log.warn("tmux title reconcile failed: {}", .{err});
                 return;
             };
             errdefer payload.deinit();
@@ -7235,8 +7315,8 @@ test "planTmuxReconcile single window single pane" {
     const payload = try planTmuxReconcile(alloc, &windows, null);
     defer payload.deinit();
 
-    // Expected: begin, ensure_window, ensure_pane, set_layout, prune, end = 6 ops
-    try testing.expectEqual(@as(usize, 6), payload.ops.len);
+    // Expected: begin, ensure_window, ensure_pane, set_layout, set_tab_title, prune, end = 7 ops
+    try testing.expectEqual(@as(usize, 7), payload.ops.len);
 
     // Op 0: sync_windows_begin
     try testing.expect(payload.ops[0] == .sync_windows_begin);
@@ -7273,8 +7353,11 @@ test "planTmuxReconcile single window single pane" {
         else => return error.UnexpectedOp,
     }
 
-    // Op 4: prune_absent
-    switch (payload.ops[4]) {
+    // Op 4: set_tab_title(window=0)
+    try testing.expect(payload.ops[4] == .set_tab_title);
+
+    // Op 5: prune_absent
+    switch (payload.ops[5]) {
         .prune_absent => |pa| {
             try testing.expectEqual(@as(usize, 1), pa.window_ids.len);
             try testing.expectEqual(@as(usize, 0), pa.window_ids[0]);
@@ -7284,8 +7367,8 @@ test "planTmuxReconcile single window single pane" {
         else => return error.UnexpectedOp,
     }
 
-    // Op 5: sync_windows_end
-    try testing.expect(payload.ops[5] == .sync_windows_end);
+    // Op 6: sync_windows_end
+    try testing.expect(payload.ops[6] == .sync_windows_end);
 }
 
 test "planTmuxReconcile multi window multi pane stable ordering" {
@@ -7342,10 +7425,10 @@ test "planTmuxReconcile multi window multi pane stable ordering" {
     const payload = try planTmuxReconcile(alloc, &windows, null);
     defer payload.deinit();
 
-    // Expected: begin + (ensure_window + 2 ensure_pane + set_layout) +
-    //           (ensure_window + 1 ensure_pane + set_layout) + prune + end
-    // = 1 + 4 + 3 + 1 + 1 = 10
-    try testing.expectEqual(@as(usize, 10), payload.ops.len);
+    // Expected: begin + (ensure_window + 2 ensure_pane + set_layout + set_tab_title) +
+    //           (ensure_window + 1 ensure_pane + set_layout + set_tab_title) + prune + end
+    // = 1 + 5 + 4 + 1 + 1 = 12
+    try testing.expectEqual(@as(usize, 12), payload.ops.len);
 
     // Window order preserved: first window @1, then window @0
     switch (payload.ops[1]) {
@@ -7375,14 +7458,17 @@ test "planTmuxReconcile multi window multi pane stable ordering" {
         else => return error.UnexpectedOp,
     }
 
+    // set_tab_title for window @1
+    try testing.expect(payload.ops[5] == .set_tab_title);
+
     // Window @0 ops follow
-    switch (payload.ops[5]) {
+    switch (payload.ops[6]) {
         .ensure_window => |ew| try testing.expectEqual(@as(usize, 0), ew.tmux_window_id),
         else => return error.UnexpectedOp,
     }
 
     // prune_absent: sorted IDs
-    switch (payload.ops[8]) {
+    switch (payload.ops[10]) {
         .prune_absent => |pa| {
             // Window IDs sorted: [0, 1]
             try testing.expectEqual(@as(usize, 0), pa.window_ids[0]);
@@ -7457,6 +7543,11 @@ test "planTmuxReconcile repeated identical snapshot yields same ops" {
                 try testing.expectEqual(sf1.tmux_window_id, sf2.tmux_window_id);
                 try testing.expectEqual(sf1.pane_id, sf2.pane_id);
             },
+            .set_tab_title => |st1| {
+                const st2 = op2.set_tab_title;
+                try testing.expectEqual(st1.tmux_window_id, st2.tmux_window_id);
+            },
+            .set_window_title => {},
         }
     }
 }
@@ -7522,4 +7613,33 @@ test "planTmuxReconcile empty windows produces prune-all" {
 
     // Op 2: sync_windows_end
     try testing.expect(payload.ops[2] == .sync_windows_end);
+}
+
+test "titleTmuxReconcile with window_id builds set_tab_title op" {
+    const testing = @import("std").testing;
+    const alloc = testing.allocator;
+
+    const payload = try titleTmuxReconcile(alloc, 5, "my-window");
+    defer payload.deinit();
+
+    // Exactly one op: set_tab_title
+    try testing.expectEqual(@as(usize, 1), payload.ops.len);
+    switch (payload.ops[0]) {
+        .set_tab_title => |st| {
+            try testing.expectEqual(@as(usize, 5), st.tmux_window_id);
+        },
+        else => return error.UnexpectedOp,
+    }
+}
+
+test "titleTmuxReconcile with null window_id builds set_window_title op" {
+    const testing = @import("std").testing;
+    const alloc = testing.allocator;
+
+    const payload = try titleTmuxReconcile(alloc, null, "my-session");
+    defer payload.deinit();
+
+    // Exactly one op: set_window_title
+    try testing.expectEqual(@as(usize, 1), payload.ops.len);
+    try testing.expect(payload.ops[0] == .set_window_title);
 }
