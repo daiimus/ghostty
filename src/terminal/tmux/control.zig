@@ -711,6 +711,65 @@ pub const Parser = struct {
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .@"continue" = .{ .pane_id = pane_id } };
+        } else if (std.mem.eql(u8, cmd, "%exit")) {
+            // The tmux server is exiting or has detached. The optional reason
+            // string is dropped (see Notification.exit comment).
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .exit = {} };
+        } else if (std.mem.eql(u8, cmd, "%extended-output")) cmd: {
+            // Extended output: sent instead of %output when pause-after is
+            // enabled. Format: %extended-output %<pane_id> <age_ms> : <data>
+            var re = oni.Regex.init(
+                "^%extended-output %([0-9]+) ([0-9]+) : (.+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const pane_id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+            const age_ms = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[2])..@intCast(ends[2])],
+                10,
+            ) catch unreachable;
+            const raw_data = line[@intCast(starts[3])..@intCast(ends[3])];
+
+            // Important: do not clear buffer here since raw_data points to it
+            self.state = .idle;
+            return .{ .extended_output = .{
+                .pane_id = pane_id,
+                .age_ms = age_ms,
+                .data = raw_data,
+            } };
+        } else if (std.mem.eql(u8, cmd, "%unlinked-window-add") or
+            std.mem.eql(u8, cmd, "%unlinked-window-close") or
+            std.mem.eql(u8, cmd, "%unlinked-window-renamed") or
+            std.mem.eql(u8, cmd, "%paste-buffer-changed") or
+            std.mem.eql(u8, cmd, "%paste-buffer-deleted") or
+            std.mem.eql(u8, cmd, "%subscription-changed"))
+        {
+            // Recognized but intentionally ignored notifications. These relate
+            // to other sessions' windows, clipboard buffers, or format
+            // subscriptions that we do not currently use.
+            log.info("ignoring tmux notification: {s}", .{cmd});
         } else {
             // Unknown notification, log it and return to idle state.
             log.warn("unknown tmux control mode notification={s}", .{cmd});
@@ -840,6 +899,15 @@ pub const Notification = union(enum) {
     /// The pane has been continued after being paused.
     @"continue": struct {
         pane_id: usize,
+    },
+
+    /// Extended output from a pane. Sent instead of `%output` when the
+    /// `pause-after` flag is set on the client. Contains an age in
+    /// milliseconds since the output was produced.
+    extended_output: struct {
+        pane_id: usize,
+        age_ms: usize,
+        data: []const u8, // unescaped
     },
 
     pub fn format(self: Notification, writer: *std.Io.Writer) !void {
@@ -1254,4 +1322,67 @@ test "tmux block begin malformed tokens" {
     for ("%end 1578922740 269 1") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expect(n == .block_end);
+}
+
+test "tmux exit notification" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%exit") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .exit);
+}
+
+test "tmux exit notification with reason" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    // %exit can have an optional reason string which we drop
+    for ("%exit server exited") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .exit);
+}
+
+test "tmux extended-output" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%extended-output %5 1234 : hello\\033[m") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .extended_output);
+    try testing.expectEqual(5, n.extended_output.pane_id);
+    try testing.expectEqual(1234, n.extended_output.age_ms);
+    try testing.expectEqualStrings("hello\\033[m", n.extended_output.data);
+}
+
+test "tmux ignored notifications suppressed" {
+    // Recognized-but-ignored notifications should not produce any
+    // notification (null return) and should not log as "unknown".
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const ignored_lines = [_][]const u8{
+        "%unlinked-window-add @1",
+        "%unlinked-window-close @2",
+        "%unlinked-window-renamed @3 newname",
+        "%paste-buffer-changed buf0",
+        "%paste-buffer-deleted buf1",
+        "%subscription-changed myvar $1 @2 3 %4 : value",
+    };
+
+    for (ignored_lines) |line| {
+        var c: Parser = .{ .buffer = .init(alloc) };
+        defer c.deinit();
+        for (line) |byte| try testing.expect(try c.put(byte) == null);
+        // Should return null (ignored), not a notification
+        try testing.expect(try c.put('\n') == null);
+        // Parser should return to idle, not broken
+        try testing.expect(c.state == .idle);
+    }
 }

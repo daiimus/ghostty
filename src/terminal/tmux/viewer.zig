@@ -580,6 +580,32 @@ pub const Viewer = struct {
                 }
             },
 
+            // Extended output: sent instead of %output when pause-after
+            // flow control is enabled. Treated identically to %output;
+            // the age_ms field is informational for flow control timing.
+            .extended_output => |out| {
+                const pane = if (self.panes.getEntry(out.pane_id)) |entry|
+                    entry.value_ptr.*
+                else
+                    null;
+                if (pane != null and !pane.?.initialized) {
+                    log.info(
+                        "suppressing extended output for uninitialized pane id={}",
+                        .{out.pane_id},
+                    );
+                } else {
+                    self.receivedOutput(
+                        out.pane_id,
+                        out.data,
+                    ) catch |err| {
+                        log.warn(
+                            "failed to process extended output for pane id={}: {}",
+                            .{ out.pane_id, err },
+                        );
+                    };
+                }
+            },
+
             // Session changed means we switched to a different tmux session.
             // We need to reset our state and start fresh with list-windows.
             // This completely replaces the viewer, so treat it like a fresh start.
