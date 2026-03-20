@@ -225,11 +225,6 @@ pub const Window = extern struct {
         relay_writer: *termio.Tmux.SurfaceRelayWriter,
     };
 
-    /// Bounded buffer for tmux pane output that arrives before the pane
-    /// surface has been created. Output chunks are appended in order and
-    /// replayed once ensure_pane creates the surface. Overflow follows a
-    /// drop-newest policy: new chunks are rejected when the buffer is at
-    /// capacity (1 MiB, matching the tmux control parser cap).
     const Private = struct {
         /// Whether this window is a quick terminal. If it is then it
         /// behaves slightly differently under certain scenarios.

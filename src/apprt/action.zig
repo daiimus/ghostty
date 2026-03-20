@@ -349,13 +349,6 @@ pub const Action = union(Key) {
     /// `deinit` on the payload after processing.
     tmux_reconcile: TmuxReconcile,
 
-    /// Route tmux pane output to the correct child surface. The parent
-    /// surface receives `%output` notifications from the tmux control
-    /// mode stream and dispatches this action so the apprt can resolve
-    /// the pane_id to a child surface and call `processOutput`.
-    ///
-    /// The data pointer is valid only for the duration of the action
-    /// handler (it points into the surface message's WriteReq buffer).
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
