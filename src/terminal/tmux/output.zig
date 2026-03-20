@@ -143,6 +143,9 @@ pub const Variable = enum {
     mouse_utf8_flag,
     /// Pane origin flag.
     origin_flag,
+    /// Pane mode. Empty string when in normal mode, otherwise the mode
+    /// name (e.g., "copy-mode", "view-mode").
+    pane_mode,
     /// Unique pane ID prefixed with `%` (e.g., `%0`, `%42`).
     pane_id,
     /// Pane tab positions as a comma-separated list of 0-indexed column
@@ -219,6 +222,7 @@ pub const Variable = enum {
             .window_height => try std.fmt.parseInt(usize, value, 10),
             .cursor_colour,
             .cursor_shape,
+            .pane_mode,
             .pane_tabs,
             .version,
             .window_layout,
@@ -262,6 +266,7 @@ pub const Variable = enum {
             => usize,
             .cursor_colour,
             .cursor_shape,
+            .pane_mode,
             .pane_tabs,
             .version,
             .window_layout,
@@ -463,6 +468,12 @@ test "parse origin_flag" {
     try testing.expectEqual(false, try Variable.parse(.origin_flag, "0"));
     try testing.expectEqual(false, try Variable.parse(.origin_flag, ""));
     try testing.expectEqual(false, try Variable.parse(.origin_flag, "true"));
+}
+
+test "parse pane_mode" {
+    try testing.expectEqualStrings("copy-mode", try Variable.parse(.pane_mode, "copy-mode"));
+    try testing.expectEqualStrings("view-mode", try Variable.parse(.pane_mode, "view-mode"));
+    try testing.expectEqualStrings("", try Variable.parse(.pane_mode, ""));
 }
 
 test "parse pane_id" {

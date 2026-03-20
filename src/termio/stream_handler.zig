@@ -563,6 +563,16 @@ pub const StreamHandler = struct {
                                 if (pp.paused) "paused" else "continued",
                             });
                         },
+
+                        .pane_mode_changed => |pm| {
+                            // Log the mode change. Visual indicators
+                            // (e.g., copy mode overlay) will be added in
+                            // a follow-up PR.
+                            log.info("tmux pane {} mode changed to {s}", .{
+                                pm.pane_id,
+                                @tagName(pm.mode),
+                            });
+                        },
                     }
                 }
             },
