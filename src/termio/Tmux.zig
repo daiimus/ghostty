@@ -20,8 +20,8 @@
 //! The ControlWriter is invoked on the IO thread of the child surface.
 //! The `ParentWriter` implementation posts write requests to the parent's
 //! SPSC termio mailbox. See `ParentWriter` doc comments for the full
-//! threading contract. `SurfaceRelayWriter` provides the cross-thread
-//! relay path through the app mailbox.
+//! threading contract. `apprt.surface.SurfaceRelayWriter` provides the
+//! cross-thread relay path through the app mailbox.
 const Tmux = @This();
 
 const std = @import("std");
@@ -70,31 +70,9 @@ screen_size: renderer.ScreenSize,
 /// terminal.
 control_writer: ControlWriter,
 
-/// A writer interface for sending commands to a tmux control mode
-/// connection. Implementations include `ParentWriter` (routes through
-/// the parent terminal's termio mailbox) and test mocks.
-pub const ControlWriter = struct {
-    /// Opaque context pointer, passed to writeFn on each call.
-    context: *anyopaque,
-
-    /// Write a pre-formatted tmux command (including trailing newline)
-    /// to the control mode connection. The data must not be retained
-    /// past the call — implementations must copy if needed.
-    writeFn: *const fn (context: *anyopaque, data: []const u8) WriteError!void,
-
-    pub const WriteError = error{
-        /// The control connection has been closed or is unavailable.
-        ConnectionClosed,
-
-        /// A transient write failure occurred.
-        WriteFailed,
-    };
-
-    /// Send a command to tmux via the control connection.
-    pub fn write(self: ControlWriter, data: []const u8) WriteError!void {
-        return self.writeFn(self.context, data);
-    }
-};
+/// Re-exported from `terminal.tmux` for convenience — the canonical
+/// definition lives in the core layer (`terminal/tmux/control_writer.zig`).
+pub const ControlWriter = terminal.tmux.ControlWriter;
 
 /// A ControlWriter implementation that routes tmux commands through
 /// the parent terminal's termio mailbox. This posts a write request
@@ -146,64 +124,6 @@ pub const ParentWriter = struct {
         const msg = termio.Message.writeReq(self.alloc, data) catch
             return error.WriteFailed;
         self.mailbox.send(msg, self.mutex);
-    }
-};
-
-/// A ControlWriter implementation that routes tmux commands through
-/// the app mailbox to the parent surface. When a child tmux pane runs
-/// on its own IO thread, it cannot safely write directly into the
-/// parent's SPSC termio mailbox.
-///
-/// Instead, command bytes are wrapped in an `apprt.surface.Message`
-/// (.tmux_write_command) and pushed to the parent surface's mailbox.
-/// The app mailbox is MPSC-safe, so any thread can push. The app
-/// thread delivers the message to the parent surface's `handleMessage`,
-/// which forwards the command bytes into the parent's termio mailbox
-/// via `queueIo` — preserving the SPSC invariant.
-///
-/// ## Relay Path
-///
-///   Child IO thread: SurfaceRelayWriter.writeFn()
-///     → constructs WriteReq from command bytes
-///     → pushes .tmux_write_command to parent surface mailbox
-///     → (app mailbox MPSC push, safe from any thread)
-///   App thread: drainMailbox → parent Surface.handleMessage
-///     → .tmux_write_command → queueIo(.write_small/.write_alloc)
-///     → parent termio mailbox (SPSC: app thread is single producer)
-///
-/// ## Lifetime
-///
-/// The `parent_mailbox` must remain valid for the lifetime of this
-/// writer. In practice, the parent surface outlives all child surfaces
-/// it creates.
-pub const SurfaceRelayWriter = struct {
-    parent_mailbox: apprt.surface.Mailbox,
-    alloc: Allocator,
-
-    pub fn controlWriter(self: *SurfaceRelayWriter) ControlWriter {
-        return .{
-            .context = @ptrCast(self),
-            .writeFn = &writeFn,
-        };
-    }
-
-    fn writeFn(context: *anyopaque, data: []const u8) ControlWriter.WriteError!void {
-        const self: *SurfaceRelayWriter = @ptrCast(@alignCast(context));
-
-        // Construct a surface-level WriteReq from the command bytes.
-        // Surface WriteReq (MessageData(u8, 255)) can hold up to 255
-        // bytes inline; larger commands are heap-allocated.
-        const SurfaceWriteReq = apprt.surface.Message.WriteReq;
-        const req = SurfaceWriteReq.init(self.alloc, data) catch
-            return error.WriteFailed;
-
-        // Push to the parent surface's mailbox. This goes through the
-        // app mailbox (MPSC-safe). Use .forever since we don't hold
-        // any mutex that could deadlock with the app thread.
-        _ = self.parent_mailbox.push(
-            .{ .tmux_write_command = req },
-            .{ .forever = {} },
-        );
     }
 };
 
@@ -987,7 +907,7 @@ test "ParentWriter used as backend ControlWriter" {
     }
 }
 
-test "SurfaceRelayWriter WriteReq fits small tmux commands inline" {
+test "tmux relay: WriteReq fits small tmux commands inline" {
     // Verify that typical tmux commands (< 255 bytes) produce a
     // WriteReq.small variant, confirming the surface-level WriteReq
     // handles them without allocation.
@@ -1001,7 +921,7 @@ test "SurfaceRelayWriter WriteReq fits small tmux commands inline" {
     try testing.expectEqualStrings(cmd, req.slice());
 }
 
-test "SurfaceRelayWriter WriteReq allocates for large commands" {
+test "tmux relay: WriteReq allocates for large commands" {
     // Verify that commands exceeding 255 bytes (surface WriteReq.Small
     // capacity) use the alloc variant.
     const alloc = testing.allocator;
@@ -1015,7 +935,7 @@ test "SurfaceRelayWriter WriteReq allocates for large commands" {
     try testing.expectEqualStrings(large_cmd, req.slice());
 }
 
-test "SurfaceRelayWriter relay conversion preserves data across WriteReq size boundaries" {
+test "tmux relay: conversion preserves data across WriteReq size boundaries" {
     // Verify the full relay conversion: surface WriteReq.small (up to
     // 255 bytes) -> termio.Message.writeReq -> write_small (<=38) or
     // write_alloc (>38). This tests the size mismatch handling in the

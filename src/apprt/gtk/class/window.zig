@@ -14,7 +14,6 @@ const configpkg = @import("../../../config.zig");
 const TitlebarStyle = configpkg.Config.GtkTitlebarStyle;
 const input = @import("../../../input.zig");
 const CoreSurface = @import("../../../Surface.zig");
-const termio = @import("../../../termio.zig");
 const ext = @import("../ext.zig");
 const gtk_version = @import("../gtk_version.zig");
 const adw_version = @import("../adw_version.zig");
@@ -222,7 +221,7 @@ pub const Window = extern struct {
     /// because the ControlWriter holds a pointer to it.
     pub const TmuxPaneEntry = struct {
         surface: *Surface,
-        relay_writer: *termio.Tmux.SurfaceRelayWriter,
+        relay_writer: *apprt.surface.SurfaceRelayWriter,
     };
 
     const Private = struct {
