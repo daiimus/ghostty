@@ -615,58 +615,12 @@ pub const Viewer = struct {
                 command_consumed = true;
             },
 
-            .output => |out| {
-                // Suppress output for panes that haven't completed their
-                // capture-pane initialization sequence. Processing output
-                // before capture completes would corrupt the terminal
-                // state being built up by receivedPaneHistory/Visible.
-                const pane = if (self.panes.getEntry(out.pane_id)) |entry|
-                    entry.value_ptr.*
-                else
-                    null;
-                if (pane != null and !pane.?.initialized) {
-                    log.debug(
-                        "suppressing output for uninitialized pane id={}",
-                        .{out.pane_id},
-                    );
-                } else {
-                    self.receivedOutput(
-                        out.pane_id,
-                        out.data,
-                    ) catch |err| {
-                        log.warn(
-                            "failed to process output for pane id={}: {}",
-                            .{ out.pane_id, err },
-                        );
-                    };
-                }
-            },
+            .output => |out| self.handlePaneOutput(out.pane_id, out.data),
 
             // Extended output: sent instead of %output when pause-after
             // flow control is enabled. Treated identically to %output;
             // the age_ms field is informational for flow control timing.
-            .extended_output => |out| {
-                const pane = if (self.panes.getEntry(out.pane_id)) |entry|
-                    entry.value_ptr.*
-                else
-                    null;
-                if (pane != null and !pane.?.initialized) {
-                    log.info(
-                        "suppressing extended output for uninitialized pane id={}",
-                        .{out.pane_id},
-                    );
-                } else {
-                    self.receivedOutput(
-                        out.pane_id,
-                        out.data,
-                    ) catch |err| {
-                        log.warn(
-                            "failed to process extended output for pane id={}: {}",
-                            .{ out.pane_id, err },
-                        );
-                    };
-                }
-            },
+            .extended_output => |out| self.handlePaneOutput(out.pane_id, out.data),
 
             // Session changed means we switched to a different tmux session.
             // We need to reset our state and start fresh with list-windows.
@@ -700,7 +654,7 @@ pub const Viewer = struct {
             },
 
             // A window was added to this session.
-            .window_add => |info| self.windowAdd(info.id) catch {
+            .window_add => |_| self.refreshWindowList() catch {
                 log.warn("failed to handle window add, becoming defunct", .{});
                 return self.defunct();
             },
@@ -711,7 +665,7 @@ pub const Viewer = struct {
             // notification is for our current session.
             .session_window_changed => |info| {
                 if (info.session_id == self.session_id) {
-                    self.sessionWindowChanged(info.window_id) catch {
+                    self.refreshWindowList() catch {
                         log.warn("failed to handle session window change, becoming defunct", .{});
                         return self.defunct();
                     };
@@ -719,7 +673,7 @@ pub const Viewer = struct {
             },
 
             // A window was closed in this session.
-            .window_close => |info| self.windowClose(info.id) catch {
+            .window_close => |_| self.refreshWindowList() catch {
                 log.warn("failed to handle window close, becoming defunct", .{});
                 return self.defunct();
             },
@@ -987,40 +941,29 @@ pub const Viewer = struct {
         try self.syncLayouts(self.windows.items);
     }
 
-    /// When a window is added to the session, we need to refresh our window
-    /// list to get the new window's information.
-    fn windowAdd(
-        self: *Viewer,
-        window_id: usize,
-    ) !void {
-        _ = window_id; // We refresh all windows via list-windows
-
-        // Queue list-windows to get the updated window list
+    /// Refresh the full window list from tmux. Used by window add, close,
+    /// and session-window-changed notifications — all of which discard the
+    /// individual window ID and do a full list-windows query instead.
+    fn refreshWindowList(self: *Viewer) !void {
         try self.queueCommands(&.{.list_windows});
     }
 
-    /// When the active window changes in the session, refresh the window
-    /// list so that layout reconciliation picks up the new active state.
-    fn sessionWindowChanged(
-        self: *Viewer,
-        window_id: usize,
-    ) !void {
-        _ = window_id; // We refresh all windows via list-windows
-
-        // Queue list-windows to get the updated window list
-        try self.queueCommands(&.{.list_windows});
-    }
-
-    /// When a window is closed in the session, we refresh the window list
-    /// so that layout reconciliation can prune the removed window.
-    fn windowClose(
-        self: *Viewer,
-        window_id: usize,
-    ) !void {
-        _ = window_id; // We refresh all windows via list-windows
-
-        // Queue list-windows to get the updated window list
-        try self.queueCommands(&.{.list_windows});
+    /// Handle output (or extended output) for a pane. Suppresses data for
+    /// panes that haven't completed their capture-pane initialization
+    /// sequence — processing output before capture completes would corrupt
+    /// the terminal state being built up by receivedPaneHistory/Visible.
+    fn handlePaneOutput(self: *Viewer, pane_id: usize, data: []const u8) void {
+        const pane = if (self.panes.getEntry(pane_id)) |entry|
+            entry.value_ptr.*
+        else
+            null;
+        if (pane != null and !pane.?.initialized) {
+            log.debug("suppressing output for uninitialized pane id={}", .{pane_id});
+        } else {
+            self.receivedOutput(pane_id, data) catch |err| {
+                log.warn("failed to process output for pane id={}: {}", .{ pane_id, err });
+            };
+        }
     }
 
     fn syncLayouts(
