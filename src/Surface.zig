@@ -5949,7 +5949,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .close_tab => |v| {
             // For tmux-backed surfaces with "this" mode, ask tmux to kill
             // the window containing this pane. tmux resolves the pane ID
-            // to its containing window automatically.
+            // to its containing window automatically. Bypasses close
+            // confirmation (see close_surface comment for rationale).
             switch (self.io.backend) {
                 .tmux => |tmux_backend| {
                     switch (v) {
@@ -6224,6 +6225,15 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // than closing the Ghostty surface directly. tmux will respond
             // with %layout-change (or %window-close for the last pane),
             // which flows through the reconciler to destroy the surface.
+            //
+            // Note: this bypasses confirm_close_surface. The confirmation
+            // dialog flow (show dialog -> user confirms -> close) requires
+            // the runtime confirmation callback to route back through the
+            // IO thread to issue kill-pane, which is inverted from the
+            // normal exec path where closing the surface kills the PTY.
+            // In tmux mode, the pane process continues server-side
+            // regardless, so skipping confirmation is intentional — the
+            // user can reattach to recover.
             switch (self.io.backend) {
                 .tmux => |tmux_backend| {
                     var buf: [termio.Message.WriteReq.Small.Max]u8 = undefined;
