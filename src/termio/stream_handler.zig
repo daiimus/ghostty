@@ -407,7 +407,11 @@ pub const StreamHandler = struct {
                         assert(self.tmux_viewer == null);
                         const viewer = try self.alloc.create(terminal.tmux.Viewer);
                         errdefer self.alloc.destroy(viewer);
-                        viewer.* = try .init(self.alloc);
+                        viewer.* = try .init(
+                            self.alloc,
+                            self.terminal.cols,
+                            self.terminal.rows,
+                        );
                         errdefer viewer.deinit();
                         self.tmux_viewer = viewer;
                         break :tmux;

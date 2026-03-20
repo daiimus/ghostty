@@ -518,6 +518,17 @@ pub fn resize(
     // Mail the renderer so that it can update the GPU and re-render
     _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
     self.renderer_wakeup.notify() catch {};
+
+    // If tmux control mode is active, update the viewer's stored
+    // dimensions. The viewer queues a `refresh-client -C WxH` command
+    // that will be sent on the next notification cycle. This goes
+    // through the command queue (not fire-and-forget) to preserve
+    // response ordering.
+    if (comptime StreamHandler.tmux_enabled) {
+        if (self.terminal_stream.handler.tmux_viewer) |viewer| {
+            viewer.setClientSize(grid_size.columns, grid_size.rows);
+        }
+    }
 }
 
 /// Make a size report.
