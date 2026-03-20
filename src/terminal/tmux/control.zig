@@ -29,6 +29,19 @@ pub const Parser = struct {
     /// exited and future data dropped).
     max_bytes: usize = 1024 * 1024,
 
+    /// Tokens from the most recent %begin line, used to validate that
+    /// the corresponding %end/%error matches. Null if %begin could not
+    /// be parsed (validation is skipped in that case).
+    block_begin: ?BlockInfo = null,
+
+    /// Parsed tokens from a %begin, %end, or %error guard line.
+    /// tmux guarantees these match between begin and end/error.
+    const BlockInfo = struct {
+        time: usize,
+        command_id: usize,
+        flags: usize,
+    };
+
     const State = enum {
         /// Outside of any active notifications. This should drop any output
         /// unless it is '%' on the first byte of a line. The buffer will be
@@ -116,7 +129,27 @@ pub const Parser = struct {
                 )) |v| v + 1 else 0;
                 const line = written[idx..];
 
-                if (parseBlockTerminator(line)) |terminator| {
+                if (parseBlockTerminator(line)) |result| {
+                    // Validate that end/error tokens match the begin tokens.
+                    // tmux guarantees these match, so a mismatch indicates
+                    // a protocol error or interleaving bug. We log but still
+                    // process the block (per Ghostty error resilience convention).
+                    if (self.block_begin) |begin| {
+                        if (begin.time != result.info.time or
+                            begin.command_id != result.info.command_id or
+                            begin.flags != result.info.flags)
+                        {
+                            log.warn(
+                                "block begin/end mismatch: begin=({},{},{}) end=({},{},{})",
+                                .{
+                                    begin.time,       begin.command_id,       begin.flags,
+                                    result.info.time, result.info.command_id, result.info.flags,
+                                },
+                            );
+                        }
+                    }
+                    self.block_begin = null;
+
                     const output = std.mem.trimRight(
                         u8,
                         written[0..idx],
@@ -126,7 +159,7 @@ pub const Parser = struct {
                     // Important: do not clear buffer since the notification
                     // contains it.
                     self.state = .idle;
-                    switch (terminator) {
+                    switch (result.terminator) {
                         .end => return .{ .block_end = output },
                         .err => {
                             log.warn("tmux control mode error={s}", .{output});
@@ -150,9 +183,14 @@ pub const Parser = struct {
 
     const BlockTerminator = enum { end, err };
 
+    const BlockTerminatorResult = struct {
+        terminator: BlockTerminator,
+        info: BlockInfo,
+    };
+
     /// Block payload is raw data, so a line only terminates a block if it
     /// exactly matches tmux's `%end`/`%error` guard-line shape.
-    fn parseBlockTerminator(line_raw: []const u8) ?BlockTerminator {
+    fn parseBlockTerminator(line_raw: []const u8) ?BlockTerminatorResult {
         var line = line_raw;
         if (line.len > 0 and line[line.len - 1] == '\r') {
             line = line[0 .. line.len - 1];
@@ -167,20 +205,38 @@ pub const Parser = struct {
         else
             return null;
 
-        const time = fields.next() orelse return null;
-        const command_id = fields.next() orelse return null;
-        const flags = fields.next() orelse return null;
+        const time_str = fields.next() orelse return null;
+        const command_id_str = fields.next() orelse return null;
+        const flags_str = fields.next() orelse return null;
         const extra = fields.next();
 
-        // In the future, we should compare these to the %begin block
-        // because the tmux source guarantees that these always match and
-        // that is a more robust way to match.
-        _ = std.fmt.parseInt(usize, time, 10) catch return null;
-        _ = std.fmt.parseInt(usize, command_id, 10) catch return null;
-        _ = std.fmt.parseInt(usize, flags, 10) catch return null;
+        const time = std.fmt.parseInt(usize, time_str, 10) catch return null;
+        const command_id = std.fmt.parseInt(usize, command_id_str, 10) catch return null;
+        const flags = std.fmt.parseInt(usize, flags_str, 10) catch return null;
         if (extra != null) return null;
 
-        return terminator;
+        return .{
+            .terminator = terminator,
+            .info = .{ .time = time, .command_id = command_id, .flags = flags },
+        };
+    }
+
+    /// Parse BlockInfo from a %begin line. Format: %begin <time> <command_id> <flags>
+    fn parseBeginInfo(line: []const u8) ?BlockInfo {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const cmd = fields.next() orelse return null;
+        if (!std.mem.eql(u8, cmd, "%begin")) return null;
+
+        const time_str = fields.next() orelse return null;
+        const command_id_str = fields.next() orelse return null;
+        const flags_str = fields.next() orelse return null;
+        if (fields.next() != null) return null; // unexpected extra fields
+
+        return .{
+            .time = std.fmt.parseInt(usize, time_str, 10) catch return null,
+            .command_id = std.fmt.parseInt(usize, command_id_str, 10) catch return null,
+            .flags = std.fmt.parseInt(usize, flags_str, 10) catch return null,
+        };
     }
 
     fn parseNotification(self: *Parser) ParseError!?Notification {
@@ -199,11 +255,12 @@ pub const Parser = struct {
         // The notification MUST exist because we guard entering the notification
         // state on seeing at least a '%'.
         if (std.mem.eql(u8, cmd, "%begin")) {
-            // We don't use the rest of the tokens for now because tmux
-            // claims to guarantee that begin/end are always in order and
-            // never intermixed. In the future, we should probably validate
-            // this.
-            // TODO(tmuxcc): do this before merge?
+            // Parse the begin tokens so we can validate the matching
+            // end/error. The format is: %begin <time> <command_id> <flags>
+            self.block_begin = parseBeginInfo(line);
+            if (self.block_begin == null) {
+                log.info("failed to parse %begin tokens: {s}", .{line});
+            }
 
             // Move to block state because we expect a corresponding end/error
             // and want to accumulate the data.
@@ -1136,4 +1193,65 @@ test "tmux continue" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .@"continue");
     try testing.expectEqual(3, n.@"continue".pane_id);
+}
+
+test "tmux block begin/end mismatch still processes" {
+    // Mismatched command_id between %begin and %end should log a warning
+    // but still return the block_end notification (resilient processing).
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%begin 1578922740 269 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    // block_begin should be set after %begin
+    try testing.expect(c.block_begin != null);
+    try testing.expectEqual(269, c.block_begin.?.command_id);
+
+    for ("some data\n") |byte| try testing.expect(try c.put(byte) == null);
+    // Mismatched command_id (999 instead of 269)
+    for ("%end 1578922740 999 1") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    // Block should still be processed despite mismatch
+    try testing.expect(n == .block_end);
+    try testing.expectEqualStrings("some data", n.block_end);
+    // block_begin should be cleared
+    try testing.expect(c.block_begin == null);
+}
+
+test "tmux block begin tokens parsed" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%begin 42 100 0\n") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expect(c.block_begin != null);
+    try testing.expectEqual(42, c.block_begin.?.time);
+    try testing.expectEqual(100, c.block_begin.?.command_id);
+    try testing.expectEqual(0, c.block_begin.?.flags);
+
+    for ("%end 42 100 0") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_end);
+    try testing.expect(c.block_begin == null);
+}
+
+test "tmux block begin malformed tokens" {
+    // If %begin tokens can't be parsed, block_begin is null but
+    // block processing still works (validation is skipped).
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    // Malformed: non-numeric time
+    for ("%begin abc 269 1\n") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expect(c.block_begin == null);
+    // Block state should still be entered
+    try testing.expect(c.state == .block);
+
+    for ("%end 1578922740 269 1") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .block_end);
 }
