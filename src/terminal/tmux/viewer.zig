@@ -673,7 +673,7 @@ pub const Viewer = struct {
             var check_arena: ArenaAllocator = .init(self.alloc);
             defer check_arena.deinit();
             _ = Layout.parseWithChecksum(check_arena.allocator(), layout_str) catch {
-                log.warn(
+                log.info(
                     "failed to parse window layout id={} layout={s}",
                     .{ window_id, layout_str },
                 );
@@ -989,7 +989,7 @@ pub const Viewer = struct {
             line,
             Format.tmux_version.delim,
         ) catch {
-            log.warn("failed to parse tmux version: {s}", .{line});
+            log.info("failed to parse tmux version: {s}", .{line});
             return;
         };
 
@@ -1030,7 +1030,7 @@ pub const Viewer = struct {
                 line,
                 Format.list_windows.delim,
             ) catch {
-                log.warn("failed to parse list-windows line: {s}", .{line});
+                log.info("failed to parse list-windows line: {s}", .{line});
                 continue;
             };
 
@@ -1039,7 +1039,7 @@ pub const Viewer = struct {
                 win_alloc,
                 data.window_layout,
             ) catch {
-                log.warn(
+                log.info(
                     "failed to parse window layout id={} layout={s}",
                     .{ data.window_id, data.window_layout },
                 );
@@ -1083,7 +1083,7 @@ pub const Viewer = struct {
                 line,
                 Format.list_panes.delim,
             ) catch {
-                log.warn("failed to parse list-panes line: {s}", .{line});
+                log.info("failed to parse list-panes line: {s}", .{line});
                 continue;
             };
 
