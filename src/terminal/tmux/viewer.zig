@@ -293,6 +293,13 @@ pub const Viewer = struct {
             mode: PaneMode,
         },
 
+        /// A message from the tmux server (via `display-message` or
+        /// server-level informational/error messages). The runtime can
+        /// surface this in a status bar, toast, or log view.
+        message: struct {
+            text: []const u8,
+        },
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -807,6 +814,26 @@ pub const Viewer = struct {
                         log.warn("failed to queue pane_paused action for pane={}", .{info.pane_id});
                     };
                 }
+            },
+
+            // A message from the tmux server. Forward as an action so
+            // the runtime can surface it (status bar, toast, etc.).
+            .message => |info| {
+                var act_arena = self.action_arena.promote(self.alloc);
+                defer self.action_arena = act_arena.state;
+                const act_alloc = act_arena.allocator();
+
+                const text = act_alloc.dupe(u8, info.text) catch {
+                    log.warn("failed to dupe message text", .{});
+                    return actions.items;
+                };
+                actions.append(act_alloc, .{ .message = .{
+                    .text = text,
+                } }) catch {
+                    log.warn("failed to queue message action", .{});
+                    return actions.items;
+                };
+                return actions.items;
             },
 
             // This is for other clients, which we don't do anything about.
@@ -2178,8 +2205,73 @@ test "startup sends client_size with pause-after before version query" {
             .contains_command = "display-message",
         },
         .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "message notification produces message action" {
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "0",
+            } } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "display-message",
+        },
+        .{
             .input = .{ .tmux = .{ .block_end = "3.5a" } },
             .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 %0 80 24 b25d,80x24,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture-pane + pane_state
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Send a %message notification
+        .{
+            .input = .{ .tmux = .{ .message = .{
+                .text = "Session created session 1",
+            } } },
+            .contains_tags = &.{.message},
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    var found = false;
+                    for (actions) |action| {
+                        if (action == .message) {
+                            try testing.expectEqualStrings(
+                                "Session created session 1",
+                                action.message.text,
+                            );
+                            found = true;
+                        }
+                    }
+                    try testing.expect(found);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
         },
     });
 }

@@ -593,6 +593,13 @@ pub const StreamHandler = struct {
                                 @tagName(pm.mode),
                             });
                         },
+
+                        .message => |msg| {
+                            // Log the tmux server message. Runtime visual
+                            // feedback (toast, status bar) will be added in
+                            // a follow-up PR.
+                            log.info("tmux message: {s}", .{msg.text});
+                        },
                     }
                 }
             },
