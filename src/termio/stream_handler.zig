@@ -474,9 +474,11 @@ pub const StreamHandler = struct {
                 assert(tmux != .exit);
 
                 const viewer = self.tmux_viewer orelse {
-                    // This can only really happen if we failed to
-                    // initialize the viewer on enter.
-                    log.info(
+                    // This can happen if we failed to initialize the
+                    // viewer on enter, or if tmux_control_mode was
+                    // disabled mid-session while the server continues
+                    // sending notifications.
+                    log.debug(
                         "received tmux control mode command without viewer: {f}",
                         .{tmux},
                     );
