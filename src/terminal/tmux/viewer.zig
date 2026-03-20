@@ -942,8 +942,18 @@ pub const Viewer = struct {
         // Window count is small so this is cheap.
         var win_arena = self.windows_arena.promote(self.alloc);
         defer self.windows_arena = win_arena.state;
+
+        // Save session_name to the stack before resetting, since it
+        // lives on this arena and the reset invalidates the pointer.
+        var saved_name_buf: [256]u8 = undefined;
+        const saved_name_len = @min(self.session_name.len, saved_name_buf.len);
+        @memcpy(saved_name_buf[0..saved_name_len], self.session_name[0..saved_name_len]);
+
         _ = win_arena.reset(.retain_capacity);
         const win_alloc = win_arena.allocator();
+
+        // Re-dupe session_name from the stack copy onto the fresh arena.
+        self.session_name = win_alloc.dupe(u8, saved_name_buf[0..saved_name_len]) catch "";
 
         // Parse the layout. Validation above confirmed the string is
         // well-formed, so only allocation failure is possible here.
@@ -1307,10 +1317,20 @@ pub const Viewer = struct {
         // Reset the shared windows arena so all layout allocations start
         // fresh. This is safe because every Window's layout data lives on
         // this arena and we are about to rebuild all of them.
+        //
+        // Save session_name to the stack first since it also lives on
+        // this arena and the reset frees the underlying pages.
+        var saved_name_buf: [256]u8 = undefined;
+        const saved_name_len = @min(self.session_name.len, saved_name_buf.len);
+        @memcpy(saved_name_buf[0..saved_name_len], self.session_name[0..saved_name_len]);
+
         var win_arena = self.windows_arena.promote(self.alloc);
         errdefer self.windows_arena = win_arena.state;
         _ = win_arena.reset(.free_all);
         const win_alloc = win_arena.allocator();
+
+        // Re-dupe session_name from the stack copy onto the fresh arena.
+        self.session_name = win_alloc.dupe(u8, saved_name_buf[0..saved_name_len]) catch "";
 
         // This stores our new window state from this list-windows output.
         var windows: std.ArrayList(Window) = .empty;
@@ -1649,10 +1669,8 @@ pub const Viewer = struct {
 
             // A leaf! Initialize.
             .pane => |id| pane: {
-                const gop = try panes_new.getOrPut(gpa_alloc, id);
-                if (gop.found_existing) break :pane;
-                errdefer _ = panes_new.swapRemove(gop.key_ptr.*);
-
+                // Validate dimensions before inserting into the map to
+                // avoid leaving an uninitialized entry on overflow.
                 const cols: size.CellCountInt = std.math.cast(size.CellCountInt, layout.width) orelse {
                     log.info("pane {} width {} overflows CellCountInt, skipping", .{ id, layout.width });
                     break :pane;
@@ -1661,6 +1679,10 @@ pub const Viewer = struct {
                     log.info("pane {} height {} overflows CellCountInt, skipping", .{ id, layout.height });
                     break :pane;
                 };
+
+                const gop = try panes_new.getOrPut(gpa_alloc, id);
+                if (gop.found_existing) break :pane;
+                errdefer _ = panes_new.swapRemove(gop.key_ptr.*);
 
                 // If we already have this pane, it is already initialized
                 // so just copy it over (and resize if the layout changed).
