@@ -792,6 +792,10 @@ pub const Parser = struct {
 /// Possible notification types from tmux control mode. These are documented
 /// in tmux(1). A lot of the simple documentation was copied from that man
 /// page here.
+///
+/// Lifetime: all slice fields (`[]const u8`) within a notification point
+/// into the parser's internal buffer and are valid only until the next
+/// call to `next()`.
 pub const Notification = union(enum) {
     /// Entering tmux control mode. This isn't an actual event sent by
     /// tmux but is one sent by us to indicate that we have detected that
@@ -816,7 +820,7 @@ pub const Notification = union(enum) {
     /// Raw output from a pane.
     output: struct {
         pane_id: usize,
-        data: []const u8, // unescaped
+        data: []const u8, // raw from protocol (octal-escaped by tmux)
     },
 
     /// The client is now attached to the session with ID session-id, which is
@@ -907,7 +911,7 @@ pub const Notification = union(enum) {
     extended_output: struct {
         pane_id: usize,
         age_ms: usize,
-        data: []const u8, // unescaped
+        data: []const u8, // raw from protocol (octal-escaped by tmux)
     },
 
     pub fn format(self: Notification, writer: *std.Io.Writer) !void {
