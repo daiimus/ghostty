@@ -49,6 +49,30 @@ const PAUSE_AFTER_BYTES = 200;
 /// This struct helps move through a state machine of connecting to a tmux
 /// session, negotiating capabilities, listing window state, etc.
 ///
+/// ## Threading Model
+///
+/// The Viewer is **single-threaded**: all methods are called exclusively
+/// from the parent surface's I/O thread (the termio thread that owns the
+/// control mode connection). There are no internal mutexes or atomics.
+///
+/// Cross-thread coordination occurs at one point: each `Pane` holds an
+/// optional `renderer_mutex` that, when non-null, points to the child
+/// surface's `renderer_state.mutex`. The viewer acquires this mutex in
+/// all terminal-write paths (`receivedOutput`, `receivedPaneHistory`,
+/// `receivedPaneVisible`, `receivedPaneState`) to coordinate with the
+/// child's renderer thread, which reads from the same `Terminal` under
+/// this mutex.
+///
+/// The `renderer_mutex` lifecycle is managed externally by `Tmux.zig`:
+/// - Set during `threadEnter` (child surface's I/O thread has started,
+///   renderer is about to begin reading the terminal).
+/// - Cleared during `threadExit` (child is shutting down, renderer will
+///   no longer read).
+///
+/// When `renderer_mutex` is null (before a child surface attaches or
+/// after it detaches), no locking is needed because no other thread
+/// is reading the terminal.
+///
 /// ## Viewer Lifecycle
 ///
 /// The viewer progresses through several states from initial connection
