@@ -942,8 +942,18 @@ pub const Viewer = struct {
         // Window count is small so this is cheap.
         var win_arena = self.windows_arena.promote(self.alloc);
         defer self.windows_arena = win_arena.state;
+
+        // Save session_name to the stack before resetting, since it
+        // lives on this arena and the reset invalidates the pointer.
+        var saved_name_buf: [256]u8 = undefined;
+        const saved_name_len = @min(self.session_name.len, saved_name_buf.len);
+        @memcpy(saved_name_buf[0..saved_name_len], self.session_name[0..saved_name_len]);
+
         _ = win_arena.reset(.retain_capacity);
         const win_alloc = win_arena.allocator();
+
+        // Re-dupe session_name from the stack copy onto the fresh arena.
+        self.session_name = win_alloc.dupe(u8, saved_name_buf[0..saved_name_len]) catch "";
 
         // Parse the layout. Validation above confirmed the string is
         // well-formed, so only allocation failure is possible here.
@@ -1307,10 +1317,20 @@ pub const Viewer = struct {
         // Reset the shared windows arena so all layout allocations start
         // fresh. This is safe because every Window's layout data lives on
         // this arena and we are about to rebuild all of them.
+        //
+        // Save session_name to the stack first since it also lives on
+        // this arena and the reset frees the underlying pages.
+        var saved_name_buf: [256]u8 = undefined;
+        const saved_name_len = @min(self.session_name.len, saved_name_buf.len);
+        @memcpy(saved_name_buf[0..saved_name_len], self.session_name[0..saved_name_len]);
+
         var win_arena = self.windows_arena.promote(self.alloc);
         errdefer self.windows_arena = win_arena.state;
         _ = win_arena.reset(.free_all);
         const win_alloc = win_arena.allocator();
+
+        // Re-dupe session_name from the stack copy onto the fresh arena.
+        self.session_name = win_alloc.dupe(u8, saved_name_buf[0..saved_name_len]) catch "";
 
         // This stores our new window state from this list-windows output.
         var windows: std.ArrayList(Window) = .empty;
