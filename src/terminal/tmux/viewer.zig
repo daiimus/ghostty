@@ -263,6 +263,15 @@ pub const Viewer = struct {
             paused: bool,
         },
 
+        /// A pane's mode changed in tmux. This is emitted in response
+        /// to `%pane-mode-changed` notifications after querying the
+        /// actual mode via `display-message`. The caller can use this
+        /// to show visual indicators (e.g., copy mode overlay).
+        pane_mode_changed: struct {
+            pane_id: usize,
+            mode: PaneMode,
+        },
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -330,8 +339,33 @@ pub const Viewer = struct {
         /// cleared by `%continue`.
         paused: bool = false,
 
+        /// The current mode of this pane as reported by tmux. Updated
+        /// via `display-message -p '#{pane_mode}'` queries triggered by
+        /// `%pane-mode-changed` notifications.
+        mode: PaneMode = .normal,
+
         pub fn deinit(self: *Pane, alloc: Allocator) void {
             self.terminal.deinit(alloc);
+        }
+    };
+
+    pub const PaneMode = enum {
+        /// Normal terminal mode (no special mode active).
+        normal,
+        /// Copy mode — tmux's scrollback/selection mode.
+        copy,
+        /// View mode — read-only copy mode (e.g., from `capture-pane -e`).
+        view,
+
+        /// Parse a tmux `#{pane_mode}` string into this enum.
+        /// Empty string = normal, "copy-mode" = copy, "view-mode" = view.
+        /// Unknown mode names are logged and treated as normal.
+        pub fn fromString(s: []const u8) PaneMode {
+            if (s.len == 0) return .normal;
+            if (std.mem.eql(u8, s, "copy-mode")) return .copy;
+            if (std.mem.eql(u8, s, "view-mode")) return .view;
+            log.info("unknown pane mode: {s}", .{s});
+            return .normal;
         }
     };
 
@@ -656,8 +690,18 @@ pub const Viewer = struct {
                 }
             },
 
-            // We don't track pane modes (copy mode, etc.) currently.
-            .pane_mode_changed => {},
+            // A pane's mode changed (e.g., entered/exited copy mode).
+            // Query the actual mode since the notification only provides
+            // the pane ID, not the mode name.
+            .pane_mode_changed => |info| {
+                if (self.panes.contains(info.pane_id)) {
+                    self.queueCommands(&.{
+                        .{ .pane_mode_query = info.pane_id },
+                    }) catch {
+                        log.warn("failed to queue pane mode query for pane={}", .{info.pane_id});
+                    };
+                }
+            },
 
             // Update the session name and notify the caller so it can
             // update the Ghostty window title.
@@ -1097,6 +1141,13 @@ pub const Viewer = struct {
             ),
 
             .tmux_version => try self.receivedTmuxVersion(content),
+
+            .pane_mode_query => |pane_id| try self.receivedPaneMode(
+                arena_alloc,
+                actions,
+                pane_id,
+                content,
+            ),
         }
     }
 
@@ -1120,6 +1171,39 @@ pub const Viewer = struct {
             self.alloc.free(self.tmux_version);
         }
         self.tmux_version = try self.alloc.dupe(u8, data.version);
+    }
+
+    fn receivedPaneMode(
+        self: *Viewer,
+        arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
+        pane_id: usize,
+        content: []const u8,
+    ) !void {
+        const line = std.mem.trim(u8, content, " \t\r\n");
+
+        // Parse the response — a single pane_mode field.
+        const data = output.parseFormatStruct(
+            Format.pane_mode.Struct(),
+            line,
+            Format.pane_mode.delim,
+        ) catch {
+            log.info("failed to parse pane mode response: {s}", .{line});
+            return;
+        };
+
+        const entry = self.panes.getEntry(pane_id) orelse {
+            log.info("pane mode response for unknown pane={}", .{pane_id});
+            return;
+        };
+
+        const mode = PaneMode.fromString(data.pane_mode);
+        entry.value_ptr.*.mode = mode;
+
+        try actions.append(arena_alloc, .{ .pane_mode_changed = .{
+            .pane_id = pane_id,
+            .mode = mode,
+        } });
     }
 
     fn receivedListWindows(
@@ -1621,6 +1705,10 @@ const Command = union(enum) {
     /// Get the tmux server version.
     tmux_version,
 
+    /// Query the current mode of a specific pane via display-message.
+    /// Used to determine whether a pane is in copy-mode, view-mode, etc.
+    pane_mode_query: usize,
+
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
@@ -1637,6 +1725,7 @@ const Command = union(enum) {
             .pane_visible,
             .pane_state,
             .tmux_version,
+            .pane_mode_query,
             => {},
             .user => |v| alloc.free(v),
         };
@@ -1694,6 +1783,11 @@ const Command = union(enum) {
                 "display-message -p '{s}'\n",
                 .{comptime Format.tmux_version.comptimeFormat()},
             )),
+
+            .pane_mode_query => |pane_id| try writer.print(
+                "display-message -p -t %{d} '{s}'\n",
+                .{ pane_id, comptime Format.pane_mode.comptimeFormat() },
+            ),
 
             .user => |v| try writer.writeAll(v),
         }
@@ -1765,6 +1859,11 @@ const Format = struct {
     const tmux_version: Format = .{
         .delim = ' ',
         .vars = &.{.version},
+    };
+
+    const pane_mode: Format = .{
+        .delim = ' ',
+        .vars = &.{.pane_mode},
     };
 
     /// The format string, available at comptime.
@@ -3693,6 +3792,193 @@ test "pause for unknown pane is ignored" {
                             return error.UnexpectedAction;
                         }
                     }
+                }
+            }).check,
+        },
+    });
+}
+
+test "pane_mode_changed queues query and updates state on response" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture-pane sequence (4 captures + pane_state)
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Pane mode changed notification — should queue display-message query
+        .{
+            .input = .{ .tmux = .{ .pane_mode_changed = .{ .pane_id = 0 } } },
+            .contains_command = "display-message",
+        },
+        // Response with copy-mode — should update state and emit action
+        .{
+            .input = .{ .tmux = .{ .block_end = "copy-mode" } },
+            .contains_tags = &.{.pane_mode_changed},
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // Pane mode should be updated to copy
+                    const pane = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expectEqual(Viewer.PaneMode.copy, pane.mode);
+                    // Action should report the mode change
+                    var found = false;
+                    for (actions) |action| {
+                        if (action == .pane_mode_changed) {
+                            try testing.expectEqual(@as(usize, 0), action.pane_mode_changed.pane_id);
+                            try testing.expectEqual(Viewer.PaneMode.copy, action.pane_mode_changed.mode);
+                            found = true;
+                        }
+                    }
+                    try testing.expect(found);
+                }
+            }).check,
+        },
+    });
+}
+
+test "pane_mode_changed for unknown pane is ignored" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture-pane sequence
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Pane mode changed for unknown pane 99 — should not queue a command
+        .{
+            .input = .{ .tmux = .{ .pane_mode_changed = .{ .pane_id = 99 } } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // No command should be queued (no display-message)
+                    for (actions) |action| {
+                        if (action == .command) {
+                            return error.UnexpectedCommand;
+                        }
+                    }
+                }
+            }).check,
+        },
+    });
+}
+
+test "pane_mode_changed empty response means normal mode" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture-pane sequence
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // First, enter copy mode so we have a non-normal state
+        .{
+            .input = .{ .tmux = .{ .pane_mode_changed = .{ .pane_id = 0 } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "copy-mode" } },
+            .contains_tags = &.{.pane_mode_changed},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expectEqual(Viewer.PaneMode.copy, pane.mode);
+                }
+            }).check,
+        },
+        // Now exit copy mode — empty response means normal
+        .{
+            .input = .{ .tmux = .{ .pane_mode_changed = .{ .pane_id = 0 } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_tags = &.{.pane_mode_changed},
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // Pane mode should be back to normal
+                    const pane = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expectEqual(Viewer.PaneMode.normal, pane.mode);
+                    // Action should report normal mode
+                    var found = false;
+                    for (actions) |action| {
+                        if (action == .pane_mode_changed) {
+                            try testing.expectEqual(@as(usize, 0), action.pane_mode_changed.pane_id);
+                            try testing.expectEqual(Viewer.PaneMode.normal, action.pane_mode_changed.mode);
+                            found = true;
+                        }
+                    }
+                    try testing.expect(found);
                 }
             }).check,
         },
