@@ -553,6 +553,16 @@ pub const StreamHandler = struct {
                                 ),
                             });
                         },
+
+                        .pane_paused => |pp| {
+                            // Log the pause state change. The runtime
+                            // integration (auto-continue on focus, visual
+                            // indicator) will be added in a follow-up PR.
+                            log.info("tmux pane {} {s}", .{
+                                pp.pane_id,
+                                if (pp.paused) "paused" else "continued",
+                            });
+                        },
                     }
                 }
             },

@@ -253,6 +253,16 @@ pub const Viewer = struct {
             name: []const u8,
         },
 
+        /// A pane's pause state changed. When `paused` is true, tmux
+        /// has stopped sending `%output` for this pane (output is
+        /// buffered server-side). The caller should send
+        /// `refresh-client -A '%<pane_id>:continue'` to resume, e.g.
+        /// when the user switches focus to the paused pane.
+        pane_paused: struct {
+            pane_id: usize,
+            paused: bool,
+        },
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -313,6 +323,12 @@ pub const Viewer = struct {
         /// are suppressed until this is true to avoid displaying
         /// partial/stale data before the capture-pane sequence completes.
         initialized: bool = false,
+
+        /// Whether this pane is currently paused by tmux. When true,
+        /// tmux is buffering output server-side and not sending
+        /// `%output` for this pane. Set by `%pause` notification,
+        /// cleared by `%continue`.
+        paused: bool = false,
 
         pub fn deinit(self: *Pane, alloc: Allocator) void {
             self.terminal.deinit(alloc);
@@ -666,10 +682,36 @@ pub const Viewer = struct {
             },
 
             // Pause/continue relate to refresh-client -A pause-after
-            // functionality. We don't handle pane pausing currently.
-            .pause,
-            .@"continue",
-            => {},
+            // functionality. When tmux pauses a pane, it stops sending
+            // %output for it (output is buffered server-side). Track
+            // the state and emit an action so the caller can decide
+            // whether to auto-continue (e.g. on pane focus).
+            .pause => |info| {
+                if (self.panes.getEntry(info.pane_id)) |entry| {
+                    entry.value_ptr.*.paused = true;
+                    var act_arena = self.action_arena.promote(self.alloc);
+                    defer self.action_arena = act_arena.state;
+                    actions.append(act_arena.allocator(), .{ .pane_paused = .{
+                        .pane_id = info.pane_id,
+                        .paused = true,
+                    } }) catch {
+                        log.warn("failed to queue pane_paused action for pane={}", .{info.pane_id});
+                    };
+                }
+            },
+            .@"continue" => |info| {
+                if (self.panes.getEntry(info.pane_id)) |entry| {
+                    entry.value_ptr.*.paused = false;
+                    var act_arena = self.action_arena.promote(self.alloc);
+                    defer self.action_arena = act_arena.state;
+                    actions.append(act_arena.allocator(), .{ .pane_paused = .{
+                        .pane_id = info.pane_id,
+                        .paused = false,
+                    } }) catch {
+                        log.warn("failed to queue pane_paused action for pane={}", .{info.pane_id});
+                    };
+                }
+            },
 
             // This is for other clients, which we don't do anything about.
             // For us, we'll get `exit` or `session_changed`, respectively.
@@ -3523,6 +3565,134 @@ test "list_windows emits focus for active window in multi-window session" {
                         }
                     }
                     try testing.expect(found);
+                }
+            }).check,
+        },
+    });
+}
+
+test "pause notification sets pane paused state and emits action" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture-pane sequence (4 captures + pane_state)
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Pause pane 0 — should set paused=true and emit pane_paused
+        .{
+            .input = .{ .tmux = .{ .pause = .{ .pane_id = 0 } } },
+            .contains_tags = &.{.pane_paused},
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // Pane should be marked paused
+                    const pane = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expect(pane.paused);
+                    // Action should indicate paused=true
+                    var found = false;
+                    for (actions) |action| {
+                        if (action == .pane_paused) {
+                            try testing.expectEqual(@as(usize, 0), action.pane_paused.pane_id);
+                            try testing.expect(action.pane_paused.paused);
+                            found = true;
+                        }
+                    }
+                    try testing.expect(found);
+                }
+            }).check,
+        },
+        // Continue pane 0 — should clear paused and emit pane_paused
+        .{
+            .input = .{ .tmux = .{ .@"continue" = .{ .pane_id = 0 } } },
+            .contains_tags = &.{.pane_paused},
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // Pane should no longer be paused
+                    const pane = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expect(!pane.paused);
+                    // Action should indicate paused=false
+                    var found = false;
+                    for (actions) |action| {
+                        if (action == .pane_paused) {
+                            try testing.expectEqual(@as(usize, 0), action.pane_paused.pane_id);
+                            try testing.expect(!action.pane_paused.paused);
+                            found = true;
+                        }
+                    }
+                    try testing.expect(found);
+                }
+            }).check,
+        },
+    });
+}
+
+test "pause for unknown pane is ignored" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture-pane sequence
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Pause for unknown pane 99 — should be silently ignored
+        .{
+            .input = .{ .tmux = .{ .pause = .{ .pane_id = 99 } } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // No pane_paused action should be emitted
+                    for (actions) |action| {
+                        if (action == .pane_paused) {
+                            return error.UnexpectedAction;
+                        }
+                    }
                 }
             }).check,
         },
