@@ -520,20 +520,13 @@ pub fn resize(
     self.renderer_wakeup.notify() catch {};
 
     // If tmux control mode is active, update the viewer's stored
-    // dimensions and send `refresh-client -C WxH` directly to tmux.
-    // This bypasses the viewer command queue (fire-and-forget) because
-    // resize is a unidirectional notification — the response is
-    // meaningless. The startup path still goes through the queue to
-    // ensure ordering before `list-windows`.
+    // dimensions. The viewer queues a `refresh-client -C WxH` command
+    // that will be sent on the next notification cycle. This goes
+    // through the command queue (not fire-and-forget) to preserve
+    // response ordering.
     if (comptime StreamHandler.tmux_enabled) {
         if (self.terminal_stream.handler.tmux_viewer) |viewer| {
             viewer.setClientSize(grid_size.columns, grid_size.rows);
-            var buf: [64]u8 = undefined;
-            const cmd = std.fmt.bufPrint(&buf, "refresh-client -C {d}x{d}\n", .{
-                grid_size.columns,
-                grid_size.rows,
-            }) catch unreachable; // 64 bytes is more than enough for u16xu16
-            self.backend.tmuxCommand(cmd);
         }
     }
 }

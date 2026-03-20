@@ -178,6 +178,14 @@ pub const Viewer = struct {
     client_cols: size.CellCountInt,
     client_rows: size.CellCountInt,
 
+    /// Whether a command has been sent to tmux and we're awaiting its
+    /// `%begin`/`%end` response block. This disambiguates "queue is
+    /// empty because nothing was queued" from "queue has entries but
+    /// the first one was already sent." Without this, externally-queued
+    /// commands (e.g. from `setClientSize`) that land in an empty queue
+    /// would be mistaken for an already-sent in-flight command.
+    command_in_flight: bool,
+
     /// The list of commands we've sent that we want to send and wait
     /// for a response for. We only send one command at a time just
     /// to avoid any possible confusion around ordering.
@@ -398,6 +406,7 @@ pub const Viewer = struct {
             .tmux_version = "",
             .client_cols = client_cols,
             .client_rows = client_rows,
+            .command_in_flight = false,
             .command_queue = command_queue,
             .windows = .empty,
             .windows_arena = .{},
@@ -431,12 +440,12 @@ pub const Viewer = struct {
         self.action_arena.promote(self.alloc).deinit();
     }
 
-    /// Update the stored control client dimensions. The caller is
-    /// responsible for actually sending the `refresh-client -C WxH`
-    /// command to tmux — for runtime resizes this is done directly
-    /// via the backend's `tmuxCommand`, bypassing the viewer command
-    /// queue. During startup the initial size is sent as part of the
-    /// startup command sequence in `tryFinishStartup`.
+    /// Update the stored control client dimensions and queue a
+    /// `refresh-client -C WxH` command if we're in the `command_queue`
+    /// state. The command will be sent to tmux on the next notification
+    /// cycle (pull-based). During startup the initial size is sent as
+    /// part of the startup sequence in `tryFinishStartup`, so calling
+    /// this before entering `command_queue` only stores the dimensions.
     pub fn setClientSize(
         self: *Viewer,
         cols: size.CellCountInt,
@@ -444,6 +453,15 @@ pub const Viewer = struct {
     ) void {
         self.client_cols = cols;
         self.client_rows = rows;
+
+        if (self.state == .command_queue) {
+            self.queueCommands(&.{.{ .client_size = .{
+                .cols = cols,
+                .rows = rows,
+            } }}) catch {
+                log.warn("failed to queue client_size command", .{});
+            };
+        }
     }
 
     /// Send in an input event (such as a tmux protocol notification,
@@ -555,9 +573,10 @@ pub const Viewer = struct {
         var actions: std.ArrayList(Action) = .empty;
 
         // Track whether the in-flight command slot is available. Starts true
-        // if queue is empty (no command in flight). Set to true when a command
-        // completes (block_end/block_err) or the queue is reset (session_changed).
-        var command_consumed = self.command_queue.empty();
+        // if no command is currently awaiting a response. Set to true when a
+        // command completes (block_end/block_err) or the queue is reset
+        // (session_changed).
+        var command_consumed = !self.command_in_flight;
 
         switch (n) {
             .enter => unreachable,
@@ -566,17 +585,23 @@ pub const Viewer = struct {
             inline .block_end,
             .block_err,
             => |content, tag| {
-                self.receivedCommandOutput(
-                    &actions,
-                    content,
-                    tag == .block_err,
-                ) catch {
-                    log.warn("failed to process command output, becoming defunct", .{});
-                    return self.defunct();
-                };
+                if (self.command_in_flight) {
+                    self.receivedCommandOutput(
+                        &actions,
+                        content,
+                        tag == .block_err,
+                    ) catch {
+                        log.warn("failed to process command output, becoming defunct", .{});
+                        return self.defunct();
+                    };
+                    self.command_in_flight = false;
+                } else {
+                    log.info("unexpected block output (no command in flight) err={}", .{tag == .block_err});
+                }
 
-                // Command is consumed since a block end/err is the output
-                // from a command.
+                // Slot is available regardless — an unexpected block
+                // still means tmux finished whatever it was doing and
+                // we can send the next queued command.
                 command_consumed = true;
             },
 
@@ -842,6 +867,7 @@ pub const Viewer = struct {
                     arena_alloc,
                     .{ .command = builder.writer.buffered() },
                 ) catch return self.defunct();
+                self.command_in_flight = true;
             }
         }
 
@@ -1681,6 +1707,7 @@ pub const Viewer = struct {
 
         // Move into the command queue state
         self.state = .command_queue;
+        self.command_in_flight = true;
 
         return self.singleAction(action);
     }
@@ -2011,7 +2038,7 @@ test "client_size command formats refresh-client" {
     try testing.expectEqualStrings("refresh-client -C 120x36\n", result);
 }
 
-test "setClientSize stores dimensions in command_queue state" {
+test "setClientSize queues command in command_queue state" {
     var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
@@ -2050,16 +2077,30 @@ test "setClientSize stores dimensions in command_queue state" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
     });
 
-    // Now in command_queue state with empty queue. Call setClientSize.
-    // The viewer only stores dimensions — the caller (Termio.resize)
-    // is responsible for sending the refresh-client command directly.
+    // Now in command_queue state with empty queue and no command in flight.
     try testing.expectEqual(.command_queue, viewer.state);
+    try testing.expect(!viewer.command_in_flight);
+    try testing.expect(viewer.command_queue.empty());
+
+    // setClientSize should queue a client_size command.
     viewer.setClientSize(132, 43);
     try testing.expectEqual(@as(size.CellCountInt, 132), viewer.client_cols);
     try testing.expectEqual(@as(size.CellCountInt, 43), viewer.client_rows);
+    try testing.expect(!viewer.command_queue.empty());
 
-    // Queue should remain empty — no command was queued.
+    // Next notification should trigger sending the queued command.
+    try testViewer(&viewer, &.{
+        .{
+            .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = "x" } } },
+            .contains_command = "refresh-client -C 132x43",
+        },
+        // Response to the refresh-client command
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+    });
+
+    // Queue should be empty again, no command in flight.
     try testing.expect(viewer.command_queue.empty());
+    try testing.expect(!viewer.command_in_flight);
 }
 
 test "setClientSize stores dimensions but does not queue during startup" {
