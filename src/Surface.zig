@@ -7502,7 +7502,7 @@ test "planTmuxReconcile empty windows produces prune-all" {
     const alloc = testing.allocator;
 
     // Empty window list — simulates tmux exit where all windows should be pruned.
-    const payload = try planTmuxReconcile(alloc, &.{});
+    const payload = try planTmuxReconcile(alloc, &.{}, null);
     defer payload.deinit();
 
     // Expected: begin, prune_absent (empty sets), end = 3 ops

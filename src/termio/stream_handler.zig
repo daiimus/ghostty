@@ -412,6 +412,7 @@ pub const StreamHandler = struct {
                             if (apprt.surface.Message.TmuxTopologySnapshot.initFromWindows(
                                 self.alloc,
                                 &.{},
+                                null,
                             )) |snapshot| {
                                 self.surfaceMessageWriter(.{ .tmux_topology_changed = snapshot });
                             } else |err| {
@@ -460,6 +461,7 @@ pub const StreamHandler = struct {
                             if (apprt.surface.Message.TmuxTopologySnapshot.initFromWindows(
                                 self.alloc,
                                 &.{},
+                                null,
                             )) |snapshot| {
                                 self.surfaceMessageWriter(.{ .tmux_topology_changed = snapshot });
                             } else |err| {
