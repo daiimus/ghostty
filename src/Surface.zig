@@ -5877,20 +5877,67 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .{ .amount = position },
         ),
 
-        .new_split => |direction| return try self.rt_app.performAction(
-            .{ .surface = self },
-            .new_split,
-            switch (direction) {
-                .right => .right,
-                .left => .left,
-                .down => .down,
-                .up => .up,
-                .auto => if (self.size.screen.width > self.size.screen.height)
-                    .right
-                else
-                    .down,
-            },
-        ),
+        .new_split => |direction| {
+            // For tmux-backed surfaces, ask tmux to split rather than
+            // creating a native Ghostty split. tmux will respond with
+            // %layout-change which reconciles the actual surface tree.
+            switch (self.io.backend) {
+                .tmux => |tmux_backend| {
+                    const resolved: enum { right, left, down, up } = switch (direction) {
+                        .right => .right,
+                        .left => .left,
+                        .down => .down,
+                        .up => .up,
+                        .auto => if (self.size.screen.width > self.size.screen.height)
+                            .right
+                        else
+                            .down,
+                    };
+
+                    // Format the split-window command:
+                    //   right → split-window -h -t %N
+                    //   left  → split-window -hb -t %N
+                    //   down  → split-window -t %N
+                    //   up    → split-window -b -t %N
+                    var buf: [termio.Message.WriteReq.Small.Max]u8 = undefined;
+                    const flags: []const u8 = switch (resolved) {
+                        .right => "-h ",
+                        .left => "-hb ",
+                        .down => "",
+                        .up => "-b ",
+                    };
+                    const cmd = std.fmt.bufPrint(&buf, "split-window {s}-t %{d}\n", .{
+                        flags,
+                        tmux_backend.pane_id,
+                    }) catch {
+                        log.warn("split-window command too large for buffer", .{});
+                        return false;
+                    };
+
+                    var small: termio.Message.WriteReq.Small = .{};
+                    @memcpy(small.data[0..cmd.len], cmd);
+                    small.len = @intCast(cmd.len);
+                    self.queueIo(.{ .tmux_command = small }, .unlocked);
+                    return true;
+                },
+                .exec => {},
+            }
+
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_split,
+                switch (direction) {
+                    .right => .right,
+                    .left => .left,
+                    .down => .down,
+                    .up => .up,
+                    .auto => if (self.size.screen.width > self.size.screen.height)
+                        .right
+                    else
+                        .down,
+                },
+            );
+        },
 
         .goto_split => |direction| return try self.rt_app.performAction(
             .{ .surface = self },

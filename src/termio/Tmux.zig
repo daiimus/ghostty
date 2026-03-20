@@ -374,6 +374,17 @@ pub fn resize(
     try self.control_writer.write(cmd);
 }
 
+/// Forward a raw command to the tmux control mode connection.
+/// This is the IO-thread entry point for commands that originate from
+/// user keybindings (split-window, kill-pane, etc.) and are queued via
+/// the `tmux_command` termio message. The command must include a
+/// trailing newline since tmux control mode is line-oriented.
+pub fn tmuxCommand(self: *Tmux, cmd: []const u8) void {
+    self.control_writer.write(cmd) catch |err| {
+        log.warn("failed to send tmux command err={}", .{err});
+    };
+}
+
 /// Write user input to the tmux pane. Input bytes are formatted as a
 /// `send-keys -H` command with hex-encoded key values, targeting this
 /// backend's pane ID.
@@ -1080,4 +1091,20 @@ test "selectPane with large pane_id" {
 
     try testing.expectEqual(@as(usize, 1), writer.commands.items.len);
     try testing.expectEqualStrings("select-pane -t %99999\n", writer.lastCommand().?);
+}
+
+test "tmuxCommand sends raw command to control writer" {
+    const alloc = testing.allocator;
+    var writer = TestControlWriter.init(alloc);
+    defer writer.deinit();
+
+    var tmux = Tmux.init(.{
+        .pane_id = 3,
+        .control_writer = writer.controlWriter(),
+    });
+
+    tmux.tmuxCommand("split-window -h -t %3\n");
+
+    try testing.expectEqual(@as(usize, 1), writer.commands.items.len);
+    try testing.expectEqualStrings("split-window -h -t %3\n", writer.lastCommand().?);
 }

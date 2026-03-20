@@ -351,6 +351,7 @@ fn drainMailbox(
                     self.flags.linefeed_mode,
                 );
             },
+            .tmux_command => |v| io.tmuxCommand(v.data[0..v.len]),
         }
     }
 

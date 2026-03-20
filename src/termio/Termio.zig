@@ -653,6 +653,13 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     try self.backend.focusGained(td, focused);
 }
 
+/// Forward a raw command to the tmux control mode connection. This
+/// bypasses the `send-keys` wrapping used by the normal write path.
+/// No-op for non-tmux backends.
+pub fn tmuxCommand(self: *Termio, cmd: []const u8) void {
+    self.backend.tmuxCommand(cmd);
+}
+
 /// Process output from the pty. This is the manual API that users can
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
