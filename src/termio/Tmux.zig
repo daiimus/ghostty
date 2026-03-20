@@ -305,8 +305,8 @@ pub fn tmuxCommand(self: *Tmux, cmd: []const u8) void {
     };
 }
 
-/// Write user input to the tmux pane. Input bytes are formatted as a
-/// `send-keys -H` command with hex-encoded key values, targeting this
+/// Write user input to the tmux pane. Input bytes are formatted as
+/// `send-keys -H` commands with hex-encoded key values, targeting this
 /// backend's pane ID.
 ///
 /// Format: `send-keys -H -t %{pane_id} {hex bytes...}\n`
@@ -315,9 +315,12 @@ pub fn tmuxCommand(self: *Tmux, cmd: []const u8) void {
 /// values, which is the most reliable way to send arbitrary data
 /// including control characters and escape sequences.
 ///
-/// TODO: Large inputs (e.g. a 10KB paste) produce a single send-keys
-/// command with ~30KB of hex. Evaluate whether tmux imposes a command
-/// length limit that requires chunking into multiple send-keys calls.
+/// Large inputs (e.g. a 10KB paste) are split into multiple send-keys
+/// commands of at most `max_send_keys_bytes` input bytes each. While
+/// modern tmux (3.x) has no hard command-length limit in control mode,
+/// chunking avoids blocking the control channel with a single massive
+/// command (~30KB of hex for 10KB of input) and maintains compatibility
+/// with older tmux versions that crash on commands >1024 bytes.
 pub fn queueWrite(
     self: *Tmux,
     alloc: Allocator,
@@ -354,27 +357,53 @@ pub fn queueWrite(
         alloc.free(effective_data);
     };
 
-    // Calculate the buffer size needed:
-    // "send-keys -H -t %" = 18 chars
-    // + pane_id digits (max ~20 for usize)
-    // + " " separator before hex bytes
-    // + 3 chars per byte ("XX "), last byte only 2 ("XX")
-    // + 1 char for trailing newline
+    // Allocate a reusable buffer large enough for one max-sized chunk.
+    // Per chunk: prefix + id_digits + space + hex(max_send_keys_bytes) + newline
     const prefix = "send-keys -H -t %";
     const id_digits = digitCount(self.pane_id);
-    const hex_len = if (effective_data.len > 0) effective_data.len * 3 - 1 else 0;
-    const total_len = prefix.len + id_digits + 1 + hex_len + 1; // +1 space, +1 newline
+    const max_hex_len = max_send_keys_bytes * 3 - 1; // "XX " per byte, last byte "XX"
+    const max_cmd_len = prefix.len + id_digits + 1 + max_hex_len + 1;
 
-    const buf = try alloc.alloc(u8, total_len);
+    const buf = try alloc.alloc(u8, max_cmd_len);
     defer alloc.free(buf);
 
-    // Write the prefix
+    // Send chunks of effective_data as separate send-keys commands.
+    var offset: usize = 0;
+    while (offset < effective_data.len) {
+        const remaining = effective_data.len - offset;
+        const chunk_len = @min(remaining, max_send_keys_bytes);
+        const chunk = effective_data[offset..][0..chunk_len];
+
+        const cmd_len = writeSendKeysCmd(buf, prefix, self.pane_id, id_digits, chunk);
+        try self.control_writer.write(buf[0..cmd_len]);
+
+        offset += chunk_len;
+    }
+}
+
+/// Maximum number of input bytes per send-keys command. Each input
+/// byte becomes 3 hex characters ("XX "), so 1024 bytes produce a
+/// command of ~3.1KB — well within any practical limit.
+const max_send_keys_bytes = 1024;
+
+/// Format a `send-keys -H -t %<id> <hex>...\n` command into `buf`.
+/// Returns the number of bytes written. The caller must ensure `buf`
+/// is large enough for the given `chunk` (see `queueWrite` allocation).
+fn writeSendKeysCmd(
+    buf: []u8,
+    prefix: []const u8,
+    pane_id: usize,
+    id_digits: usize,
+    chunk: []const u8,
+) usize {
     var pos: usize = 0;
+
+    // Write the prefix
     @memcpy(buf[pos..][0..prefix.len], prefix);
     pos += prefix.len;
 
     // Write the pane ID
-    const id_slice = std.fmt.bufPrint(buf[pos..][0..id_digits], "{d}", .{self.pane_id}) catch unreachable;
+    const id_slice = std.fmt.bufPrint(buf[pos..][0..id_digits], "{d}", .{pane_id}) catch unreachable;
     pos += id_slice.len;
 
     // Space separator
@@ -383,12 +412,12 @@ pub fn queueWrite(
 
     // Write hex-encoded bytes
     const hex_chars = "0123456789ABCDEF";
-    for (effective_data, 0..) |byte, i| {
+    for (chunk, 0..) |byte, i| {
         buf[pos] = hex_chars[byte >> 4];
         pos += 1;
         buf[pos] = hex_chars[byte & 0x0F];
         pos += 1;
-        if (i < effective_data.len - 1) {
+        if (i < chunk.len - 1) {
             buf[pos] = ' ';
             pos += 1;
         }
@@ -398,9 +427,7 @@ pub fn queueWrite(
     buf[pos] = '\n';
     pos += 1;
 
-    std.debug.assert(pos == total_len);
-
-    try self.control_writer.write(buf[0..pos]);
+    return pos;
 }
 
 /// No child process to report on — this is a no-op.
@@ -760,6 +787,106 @@ test "queueWrite large pane_id" {
     try tmux.queueWrite(alloc, &td, "X", false);
 
     try testing.expectEqualStrings("send-keys -H -t %99999 58\n", writer.lastCommand().?);
+}
+
+test "queueWrite chunks large input into multiple commands" {
+    const alloc = testing.allocator;
+    var writer = TestControlWriter.init(alloc);
+    defer writer.deinit();
+
+    var tmux = Tmux.init(.{
+        .pane_id = 5,
+        .control_writer = writer.controlWriter(),
+    });
+
+    // Create input slightly larger than one chunk (max_send_keys_bytes + 1).
+    const input_len = max_send_keys_bytes + 1;
+    const input = try alloc.alloc(u8, input_len);
+    defer alloc.free(input);
+    @memset(input, 'A'); // 0x41
+
+    var td = testThreadData();
+    try tmux.queueWrite(alloc, &td, input, false);
+
+    // Should produce exactly 2 commands: one full chunk + 1 remaining byte.
+    try testing.expectEqual(@as(usize, 2), writer.commands.items.len);
+
+    // First command: max_send_keys_bytes worth of "41" hex values
+    const cmd1 = writer.commands.items[0];
+    try testing.expect(std.mem.startsWith(u8, cmd1, "send-keys -H -t %5 "));
+    try testing.expect(std.mem.endsWith(u8, cmd1, "\n"));
+
+    // Second command: 1 byte
+    const cmd2 = writer.commands.items[1];
+    try testing.expectEqualStrings("send-keys -H -t %5 41\n", cmd2);
+}
+
+test "queueWrite exactly max_send_keys_bytes is single command" {
+    const alloc = testing.allocator;
+    var writer = TestControlWriter.init(alloc);
+    defer writer.deinit();
+
+    var tmux = Tmux.init(.{
+        .pane_id = 0,
+        .control_writer = writer.controlWriter(),
+    });
+
+    const input = try alloc.alloc(u8, max_send_keys_bytes);
+    defer alloc.free(input);
+    @memset(input, 'B'); // 0x42
+
+    var td = testThreadData();
+    try tmux.queueWrite(alloc, &td, input, false);
+
+    // Exactly at the limit — should be a single command.
+    try testing.expectEqual(@as(usize, 1), writer.commands.items.len);
+}
+
+test "queueWrite large input with linefeed mode chunks correctly" {
+    const alloc = testing.allocator;
+    var writer = TestControlWriter.init(alloc);
+    defer writer.deinit();
+
+    var tmux = Tmux.init(.{
+        .pane_id = 1,
+        .control_writer = writer.controlWriter(),
+    });
+
+    // Create input that, after linefeed expansion, exceeds one chunk.
+    // Fill with \r so each byte becomes \r\n (doubles the size).
+    const input_len = max_send_keys_bytes / 2 + 1;
+    const input = try alloc.alloc(u8, input_len);
+    defer alloc.free(input);
+    @memset(input, '\r');
+
+    var td = testThreadData();
+    try tmux.queueWrite(alloc, &td, input, true);
+
+    // After expansion: (max_send_keys_bytes / 2 + 1) * 2 = max_send_keys_bytes + 2
+    // Should produce 2 commands.
+    try testing.expectEqual(@as(usize, 2), writer.commands.items.len);
+}
+
+test "queueWrite multiple full chunks" {
+    const alloc = testing.allocator;
+    var writer = TestControlWriter.init(alloc);
+    defer writer.deinit();
+
+    var tmux = Tmux.init(.{
+        .pane_id = 7,
+        .control_writer = writer.controlWriter(),
+    });
+
+    // 3 full chunks exactly
+    const input_len = max_send_keys_bytes * 3;
+    const input = try alloc.alloc(u8, input_len);
+    defer alloc.free(input);
+    @memset(input, 'C');
+
+    var td = testThreadData();
+    try tmux.queueWrite(alloc, &td, input, false);
+
+    try testing.expectEqual(@as(usize, 3), writer.commands.items.len);
 }
 
 test "deinit resets state" {
