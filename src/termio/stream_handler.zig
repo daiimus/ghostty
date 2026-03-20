@@ -562,7 +562,7 @@ pub const StreamHandler = struct {
                             // Log the pause state change. The runtime
                             // integration (auto-continue on focus, visual
                             // indicator) will be added in a follow-up PR.
-                            log.info("tmux pane {} {s}", .{
+                            log.debug("tmux pane {} {s}", .{
                                 pp.pane_id,
                                 if (pp.paused) "paused" else "continued",
                             });
@@ -572,7 +572,7 @@ pub const StreamHandler = struct {
                             // Log the mode change. Visual indicators
                             // (e.g., copy mode overlay) will be added in
                             // a follow-up PR.
-                            log.info("tmux pane {} mode changed to {s}", .{
+                            log.debug("tmux pane {} mode changed to {s}", .{
                                 pm.pane_id,
                                 @tagName(pm.mode),
                             });
