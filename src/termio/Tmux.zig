@@ -308,16 +308,42 @@ pub fn threadExit(self: *Tmux, td: *termio.Termio.ThreadData) void {
     }
 }
 
-/// Focus gained/lost notification. No-op for tmux — there is no local
-/// termios state to poll.
+/// Focus gained/lost notification. When a Ghostty surface backed by a
+/// tmux pane gains focus, send `select-pane` to tell tmux which pane
+/// is active. This keeps tmux's active pane in sync with Ghostty's
+/// focused surface.
+///
+/// The feedback loop (select-pane → %window-pane-changed → set_focus →
+/// grabFocus → focusCallback) is naturally broken by the deduplication
+/// guard in Surface.focusCallback: if the surface is already focused,
+/// the callback is a no-op.
 pub fn focusGained(
     self: *Tmux,
     td: *termio.Termio.ThreadData,
     focused: bool,
 ) !void {
-    _ = self;
-    _ = focused;
     assert(td.backend == .tmux);
+
+    // Only send select-pane when this surface gains focus.
+    // Losing focus is a no-op — the pane that gains focus will
+    // send its own select-pane.
+    if (!focused) return;
+    self.selectPane();
+}
+
+/// Send a `select-pane` command to tmux targeting this backend's pane.
+fn selectPane(self: *Tmux) void {
+    var buf: [64]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&buf, "select-pane -t %{d}\n", .{
+        self.pane_id,
+    }) catch |err| {
+        log.warn("select-pane command too large for buffer err={}", .{err});
+        return;
+    };
+
+    self.control_writer.write(cmd) catch |err| {
+        log.warn("failed to send select-pane err={}", .{err});
+    };
 }
 
 /// Notify the tmux backend of a terminal resize. This sends a
@@ -1022,4 +1048,36 @@ test "SurfaceRelayWriter relay conversion preserves data across WriteReq size bo
             else => unreachable,
         }
     }
+}
+
+test "selectPane sends select-pane command" {
+    const alloc = testing.allocator;
+    var writer = TestControlWriter.init(alloc);
+    defer writer.deinit();
+
+    var tmux = Tmux.init(.{
+        .pane_id = 7,
+        .control_writer = writer.controlWriter(),
+    });
+
+    tmux.selectPane();
+
+    try testing.expectEqual(@as(usize, 1), writer.commands.items.len);
+    try testing.expectEqualStrings("select-pane -t %7\n", writer.lastCommand().?);
+}
+
+test "selectPane with large pane_id" {
+    const alloc = testing.allocator;
+    var writer = TestControlWriter.init(alloc);
+    defer writer.deinit();
+
+    var tmux = Tmux.init(.{
+        .pane_id = 99999,
+        .control_writer = writer.controlWriter(),
+    });
+
+    tmux.selectPane();
+
+    try testing.expectEqual(@as(usize, 1), writer.commands.items.len);
+    try testing.expectEqualStrings("select-pane -t %99999\n", writer.lastCommand().?);
 }
