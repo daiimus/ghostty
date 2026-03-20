@@ -910,6 +910,13 @@ pub const Action = union(enum) {
     /// Quit Ghostty.
     quit,
 
+    /// Detach from the tmux control mode session, if any. When the focused
+    /// surface is backed by a tmux control mode connection, this sends
+    /// `detach-client` to tmux, which ends the control mode session. For
+    /// non-tmux surfaces, this action has no effect and performable will
+    /// report false.
+    tmux_detach,
+
     /// Crash Ghostty in the desired thread for the focused surface.
     ///
     /// WARNING: This is a hard crash (panic) and data can be lost.
@@ -1370,6 +1377,7 @@ pub const Action = union(enum) {
             .deactivate_all_key_tables,
             .end_key_sequence,
             .crash,
+            .tmux_detach,
             => .surface,
 
             // These are less obvious surface actions. They're surface

@@ -675,6 +675,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Quit the application.",
         }},
 
+        .tmux_detach => comptime &.{.{
+            .action = .tmux_detach,
+            .title = "Detach from tmux Session",
+            .description = "Detach from the tmux control mode session.",
+        }},
+
         .text => comptime &.{.{
             .action = .{ .text = "👻" },
             .title = "Ghostty",
