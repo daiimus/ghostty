@@ -545,6 +545,7 @@ pub const Viewer = struct {
             &.{ .{ .client_size = .{
                 .cols = self.client_cols,
                 .rows = self.client_rows,
+                .enable_pause = true,
             } }, .tmux_version, .list_windows },
         ) catch {
             log.warn("failed to queue command, becoming defunct", .{});
@@ -818,6 +819,11 @@ pub const Viewer = struct {
                         .paused = true,
                     } }) catch {
                         log.warn("failed to queue pane_paused action for pane={}", .{info.pane_id});
+                    };
+                    // Auto-continue: immediately queue a continue command so
+                    // tmux flushes buffered output and resumes the pane.
+                    self.queueCommands(&.{.{ .continue_pane = info.pane_id }}) catch {
+                        log.warn("failed to queue continue_pane for pane={}", .{info.pane_id});
                     };
                 }
             },
@@ -1188,7 +1194,7 @@ pub const Viewer = struct {
 
         // Process our command
         switch (command) {
-            .user, .client_size => {},
+            .user, .client_size, .continue_pane => {},
 
             .pane_state => {
                 try self.receivedPaneState(content);
@@ -1791,11 +1797,17 @@ const Command = union(enum) {
     pane_mode_query: usize,
 
     /// Set the control client size. tmux uses this (along with other
-    /// attached clients) to determine window dimensions.
+    /// attached clients) to determine window dimensions. When
+    /// `enable_pause` is set, the pause-after flow control flag is
+    /// also sent in the same refresh-client command.
     client_size: struct {
         cols: size.CellCountInt,
         rows: size.CellCountInt,
+        enable_pause: bool = false,
     },
+
+    /// Resume a paused pane. Sent as `refresh-client -A %<id>:continue`.
+    continue_pane: usize,
 
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
@@ -1815,6 +1827,7 @@ const Command = union(enum) {
             .tmux_version,
             .pane_mode_query,
             .client_size,
+            .continue_pane,
             => {},
             .user => |v| alloc.free(v),
         };
@@ -1878,9 +1891,17 @@ const Command = union(enum) {
                 .{ pane_id, comptime Format.pane_mode.comptimeFormat() },
             ),
 
-            .client_size => |cs| try writer.print(
-                "refresh-client -C {d}x{d}\n",
-                .{ cs.cols, cs.rows },
+            .client_size => |cs| {
+                try writer.print("refresh-client -C {d}x{d}", .{ cs.cols, cs.rows });
+                if (cs.enable_pause) {
+                    try writer.writeAll(" -f pause-after=200");
+                }
+                try writer.writeAll("\n");
+            },
+
+            .continue_pane => |pane_id| try writer.print(
+                "refresh-client -A '%{d}:continue'\n",
+                .{pane_id},
             ),
 
             .user => |v| try writer.writeAll(v),
@@ -2038,6 +2059,24 @@ test "client_size command formats refresh-client" {
     try testing.expectEqualStrings("refresh-client -C 120x36\n", result);
 }
 
+test "client_size with enable_pause formats pause-after flag" {
+    const cmd: Command = .{ .client_size = .{ .cols = 80, .rows = 24, .enable_pause = true } };
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+    try cmd.formatCommand(&builder.writer);
+    const result = builder.writer.buffered();
+    try testing.expectEqualStrings("refresh-client -C 80x24 -f pause-after=200\n", result);
+}
+
+test "continue_pane command formats refresh-client -A" {
+    const cmd: Command = .{ .continue_pane = 42 };
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+    try cmd.formatCommand(&builder.writer);
+    const result = builder.writer.buffered();
+    try testing.expectEqualStrings("refresh-client -A '%42:continue'\n", result);
+}
+
 test "setClientSize queues command in command_queue state" {
     var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
@@ -2117,7 +2156,7 @@ test "setClientSize stores dimensions but does not queue during startup" {
     try testing.expect(viewer.command_queue.empty());
 }
 
-test "startup sends client_size before version query" {
+test "startup sends client_size with pause-after before version query" {
     var viewer = try Viewer.init(testing.allocator, 132, 43);
     defer viewer.deinit();
 
@@ -2128,12 +2167,13 @@ test "startup sends client_size before version query" {
                 .id = 1,
                 .name = "test",
             } } },
-            // First command should be refresh-client with our init dimensions
+            // First command should be refresh-client with dimensions and pause-after
             .contains_command = "refresh-client",
             .check_command = (struct {
                 fn check(_: *Viewer, cmd: []const u8) anyerror!void {
-                    try testing.expect(
-                        std.mem.startsWith(u8, cmd, "refresh-client -C 132x43\n"),
+                    try testing.expectEqualStrings(
+                        "refresh-client -C 132x43 -f pause-after=200\n",
+                        cmd,
                     );
                 }
             }).check,
@@ -3995,7 +4035,7 @@ test "list_windows emits focus for active window in multi-window session" {
     });
 }
 
-test "pause notification sets pane paused state and emits action" {
+test "pause notification triggers auto-continue and full pause cycle" {
     var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
@@ -4032,29 +4072,39 @@ test "pause notification sets pane paused state and emits action" {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        // Pause pane 0 — should set paused=true and emit pane_paused
+        // Pause pane 0 — should set paused=true, emit pane_paused,
+        // and auto-queue a continue_pane command.
         .{
             .input = .{ .tmux = .{ .pause = .{ .pane_id = 0 } } },
-            .contains_tags = &.{.pane_paused},
+            .contains_tags = &.{ .pane_paused, .command },
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     // Pane should be marked paused
                     const pane = v.panes.getEntry(0).?.value_ptr.*;
                     try testing.expect(pane.paused);
                     // Action should indicate paused=true
-                    var found = false;
+                    var found_paused = false;
+                    var found_continue = false;
                     for (actions) |action| {
                         if (action == .pane_paused) {
                             try testing.expectEqual(@as(usize, 0), action.pane_paused.pane_id);
                             try testing.expect(action.pane_paused.paused);
-                            found = true;
+                            found_paused = true;
+                        }
+                        if (action == .command) {
+                            if (std.mem.startsWith(u8, action.command, "refresh-client -A")) {
+                                found_continue = true;
+                            }
                         }
                     }
-                    try testing.expect(found);
+                    try testing.expect(found_paused);
+                    try testing.expect(found_continue);
                 }
             }).check,
         },
-        // Continue pane 0 — should clear paused and emit pane_paused
+        // Receive continue_pane response (no-op), then %continue
+        // notification clears the paused state.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{
             .input = .{ .tmux = .{ .@"continue" = .{ .pane_id = 0 } } },
             .contains_tags = &.{.pane_paused},
