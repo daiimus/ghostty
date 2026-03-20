@@ -759,6 +759,32 @@ pub const Parser = struct {
                 .age_ms = age_ms,
                 .data = raw_data,
             } };
+        } else if (std.mem.eql(u8, cmd, "%message")) cmd: {
+            var re = oni.Regex.init(
+                "^%message (.+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const text = line[@intCast(starts[1])..@intCast(ends[1])];
+
+            // Important: do not clear buffer here since text points to it
+            self.state = .idle;
+            return .{ .message = .{ .text = text } };
         } else if (std.mem.eql(u8, cmd, "%unlinked-window-add") or
             std.mem.eql(u8, cmd, "%unlinked-window-close") or
             std.mem.eql(u8, cmd, "%unlinked-window-renamed") or
@@ -912,6 +938,12 @@ pub const Notification = union(enum) {
         pane_id: usize,
         age_ms: usize,
         data: []const u8, // raw from protocol (octal-escaped by tmux)
+    },
+
+    /// A message sent with the display-message command, or an
+    /// informational/error message from the tmux server.
+    message: struct {
+        text: []const u8,
     },
 
     pub fn format(self: Notification, writer: *std.Io.Writer) !void {
@@ -1389,4 +1421,16 @@ test "tmux ignored notifications suppressed" {
         // Parser should return to idle, not broken
         try testing.expect(c.state == .idle);
     }
+}
+
+test "tmux message" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%message Session created session 1") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .message);
+    try testing.expectEqualStrings("Session created session 1", n.message.text);
 }
