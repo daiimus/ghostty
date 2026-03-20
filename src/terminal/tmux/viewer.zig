@@ -712,8 +712,11 @@ pub const Viewer = struct {
                 for (self.windows.items) |*window| {
                     if (window.id == info.id) {
                         // Dupe the new name onto the windows arena. The old
-                        // name is also on the arena and will be freed on the
-                        // next full reset (list-windows refresh).
+                        // name leaks on the arena until the next full reset
+                        // (receivedListWindows). This is bounded in practice:
+                        // renames are infrequent, and any topology change
+                        // (add/close/switch) triggers list_windows which
+                        // resets the arena via free_all.
                         window.name = win_alloc.dupe(u8, info.name) catch {
                             log.warn("failed to dupe window name for rename", .{});
                             break;
@@ -746,7 +749,9 @@ pub const Viewer = struct {
             },
 
             // Update the session name and notify the caller so it can
-            // update the Ghostty window title.
+            // update the Ghostty window title. The old name leaks on
+            // windows_arena until the next receivedListWindows reset
+            // (see window_renamed for the same bounded-leak rationale).
             .session_renamed => |info| {
                 var win_arena = self.windows_arena.promote(self.alloc);
                 defer self.windows_arena = win_arena.state;
@@ -944,7 +949,17 @@ pub const Viewer = struct {
     /// Refresh the full window list from tmux. Used by window add, close,
     /// and session-window-changed notifications — all of which discard the
     /// individual window ID and do a full list-windows query instead.
+    ///
+    /// Coalesces duplicate requests: if a `.list_windows` command is already
+    /// queued (or in-flight as the first entry), no additional one is appended.
+    /// Back-to-back add/close/switch notifications during session restructuring
+    /// would otherwise grow the queue with redundant full refreshes.
     fn refreshWindowList(self: *Viewer) !void {
+        // Check whether list_windows is already queued.
+        var it = self.command_queue.iterator(.forward);
+        while (it.next()) |cmd| {
+            if (cmd.* == .list_windows) return;
+        }
         try self.queueCommands(&.{.list_windows});
     }
 
@@ -3244,6 +3259,91 @@ test "window_close queues list_windows when queue not empty" {
                     }
                     // But list_windows should be in the queue
                     try testing.expect(!v.command_queue.empty());
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "refreshWindowList coalesces duplicate list_windows" {
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Receive initial window layout with one pane
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete all capture-pane commands for pane 0
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Queue should now be empty
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+        // Send window_add — queues list_windows
+        .{
+            .input = .{ .tmux = .{ .window_add = .{ .id = 1 } } },
+            .contains_command = "list-windows",
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(1, v.command_queue.len());
+                }
+            }).check,
+        },
+        // Send window_close — should NOT add another list_windows (coalesced)
+        .{
+            .input = .{ .tmux = .{ .window_close = .{ .id = 0 } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Still exactly 1 list_windows in the queue (coalesced)
+                    try testing.expectEqual(1, v.command_queue.len());
+                }
+            }).check,
+        },
+        // Send session_window_changed — should also be coalesced
+        .{
+            .input = .{ .tmux = .{ .session_window_changed = .{
+                .session_id = 1,
+                .window_id = 1,
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Still exactly 1 list_windows in the queue (coalesced)
+                    try testing.expectEqual(1, v.command_queue.len());
                 }
             }).check,
         },
