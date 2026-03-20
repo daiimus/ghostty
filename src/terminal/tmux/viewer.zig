@@ -4463,3 +4463,142 @@ test "pane_mode_changed empty response means normal mode" {
         },
     });
 }
+
+test "layout_change mid-capture suppresses output for uninitialized pane" {
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup: single-pane layout
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Receive initial layout with one pane (%0)
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture sequence for pane 0: 4 capture-pane + 1 pane_state
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                    // Pane 0 should be initialized
+                    const pane0 = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expect(pane0.initialized);
+                }
+            }).check,
+        },
+        // Layout change splits into two panes: %0 and %2.
+        // This queues capture commands for the new pane %2.
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = "e07b,83x44,0,0[83x22,0,0,0,83x21,0,23,2]",
+                .visible_layout = "e07b,83x44,0,0[83x22,0,0,0,83x21,0,23,2]",
+                .raw_flags = "*",
+            } } },
+            .contains_tags = &.{ .windows, .command },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(2, v.panes.count());
+                    // New pane %2 should NOT be initialized yet
+                    const pane2 = v.panes.getEntry(2).?.value_ptr.*;
+                    try testing.expect(!pane2.initialized);
+                    // Existing pane %0 should still be initialized
+                    const pane0 = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expect(pane0.initialized);
+                }
+            }).check,
+        },
+        // Output arrives for pane %2 BEFORE its capture completes.
+        // It should be suppressed (no actions emitted).
+        .{
+            .input = .{ .tmux = .{ .output = .{ .pane_id = 2, .data = "premature output" } } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                }
+            }).check,
+        },
+        // Output for pane %0 (already initialized) should still work.
+        .{
+            .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = "valid output" } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // Viewer processes into its own terminal (no output
+                    // action), but the data should be in the terminal.
+                    try testing.expectEqual(0, actions.len);
+                    const pane0: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
+                    const screen: *Screen = pane0.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    try testing.expect(std.mem.containsAtLeast(u8, str, 1, "valid output"));
+                }
+            }).check,
+        },
+        // Complete the capture sequence for pane %2:
+        // 4 capture-pane responses
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // pane_state response — this marks all panes as initialized
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Pane %2 should now be initialized
+                    const pane2 = v.panes.getEntry(2).?.value_ptr.*;
+                    try testing.expect(pane2.initialized);
+                }
+            }).check,
+        },
+        // Now output for pane %2 should be processed normally.
+        .{
+            .input = .{ .tmux = .{ .output = .{ .pane_id = 2, .data = "post-init output" } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                    const pane2: *Viewer.Pane = v.panes.getEntry(2).?.value_ptr.*;
+                    const screen: *Screen = pane2.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    try testing.expect(std.mem.containsAtLeast(u8, str, 1, "post-init output"));
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}

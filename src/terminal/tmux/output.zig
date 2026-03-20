@@ -485,6 +485,13 @@ test "parse origin_flag" {
     try testing.expectEqual(false, try Variable.parse(.origin_flag, "true"));
 }
 
+test "parse window_active" {
+    try testing.expectEqual(true, try Variable.parse(.window_active, "1"));
+    try testing.expectEqual(false, try Variable.parse(.window_active, "0"));
+    try testing.expectEqual(false, try Variable.parse(.window_active, ""));
+    try testing.expectEqual(false, try Variable.parse(.window_active, "true"));
+}
+
 test "parse pane_mode" {
     try testing.expectEqualStrings("copy-mode", try Variable.parse(.pane_mode, "copy-mode"));
     try testing.expectEqualStrings("view-mode", try Variable.parse(.pane_mode, "view-mode"));
