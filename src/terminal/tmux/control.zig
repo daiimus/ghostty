@@ -538,6 +538,122 @@ pub const Parser = struct {
             // Important: do not clear buffer here since client/name point to it
             self.state = .idle;
             return .{ .client_session_changed = .{ .client = client, .session_id = session_id, .name = name } };
+        } else if (std.mem.eql(u8, cmd, "%pane-mode-changed")) cmd: {
+            var re = oni.Regex.init(
+                "^%pane-mode-changed %([0-9]+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const pane_id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .pane_mode_changed = .{ .pane_id = pane_id } };
+        } else if (std.mem.eql(u8, cmd, "%session-renamed")) cmd: {
+            var re = oni.Regex.init(
+                "^%session-renamed (.+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const name = line[@intCast(starts[1])..@intCast(ends[1])];
+
+            // Important: do not clear buffer here since name points to it
+            self.state = .idle;
+            return .{ .session_renamed = .{ .name = name } };
+        } else if (std.mem.eql(u8, cmd, "%pause")) cmd: {
+            var re = oni.Regex.init(
+                "^%pause %([0-9]+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const pane_id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .pause = .{ .pane_id = pane_id } };
+        } else if (std.mem.eql(u8, cmd, "%continue")) cmd: {
+            var re = oni.Regex.init(
+                "^%continue %([0-9]+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const pane_id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .@"continue" = .{ .pane_id = pane_id } };
         } else {
             // Unknown notification, log it and return to idle state.
             log.warn("unknown tmux control mode notification={s}", .{cmd});
@@ -646,6 +762,27 @@ pub const Notification = union(enum) {
         client: []const u8,
         session_id: usize,
         name: []const u8,
+    },
+
+    /// The pane with ID pane-id has changed mode (e.g. entered/exited
+    /// copy mode).
+    pane_mode_changed: struct {
+        pane_id: usize,
+    },
+
+    /// The current session was renamed to name.
+    session_renamed: struct {
+        name: []const u8,
+    },
+
+    /// The pane has been paused (if the pause-after flag is set).
+    pause: struct {
+        pane_id: usize,
+    },
+
+    /// The pane has been continued after being paused.
+    @"continue": struct {
+        pane_id: usize,
     },
 
     pub fn format(self: Notification, writer: *std.Io.Writer) !void {
@@ -951,4 +1088,52 @@ test "tmux client-session-changed" {
     try testing.expectEqualStrings("/dev/pts/1", n.client_session_changed.client);
     try testing.expectEqual(2, n.client_session_changed.session_id);
     try testing.expectEqualStrings("mysession", n.client_session_changed.name);
+}
+
+test "tmux pane-mode-changed" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%pane-mode-changed %5") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .pane_mode_changed);
+    try testing.expectEqual(5, n.pane_mode_changed.pane_id);
+}
+
+test "tmux session-renamed" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%session-renamed my-session") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .session_renamed);
+    try testing.expectEqualStrings("my-session", n.session_renamed.name);
+}
+
+test "tmux pause" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%pause %3") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .pause);
+    try testing.expectEqual(3, n.pause.pane_id);
+}
+
+test "tmux continue" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%continue %3") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .@"continue");
+    try testing.expectEqual(3, n.@"continue".pane_id);
 }

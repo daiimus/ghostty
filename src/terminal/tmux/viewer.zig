@@ -592,6 +592,18 @@ pub const Viewer = struct {
             // We don't use window names for anything, currently.
             .window_renamed => {},
 
+            // We don't track pane modes (copy mode, etc.) currently.
+            .pane_mode_changed => {},
+
+            // We don't use the session name for anything, currently.
+            .session_renamed => {},
+
+            // Pause/continue relate to refresh-client -A pause-after
+            // functionality. We don't handle pane pausing currently.
+            .pause,
+            .@"continue",
+            => {},
+
             // This is for other clients, which we don't do anything about.
             // For us, we'll get `exit` or `session_changed`, respectively.
             .client_detached,
