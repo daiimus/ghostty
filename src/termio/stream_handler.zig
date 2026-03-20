@@ -113,6 +113,19 @@ pub const StreamHandler = struct {
         self.osc_color_report_format = config.osc_color_report_format;
         self.clipboard_write = config.clipboard_write;
         self.enquiry_response = config.enquiry_response;
+        // If tmux control mode was just disabled and a viewer is active,
+        // proactively tear down the viewer and close child surfaces so
+        // they don't leak until the tmux server sends an exit.
+        if (comptime tmux_enabled) {
+            if (self.tmux_control_mode and !config.tmux_control_mode) {
+                if (self.tmux_viewer) |viewer| {
+                    self.sendEmptyTopologySnapshot();
+                    viewer.deinit();
+                    self.alloc.destroy(viewer);
+                    self.tmux_viewer = null;
+                }
+            }
+        }
         self.tmux_control_mode = config.tmux_control_mode;
         self.default_cursor_style = config.cursor_style;
         self.default_cursor_blink = config.cursor_blink;
@@ -410,14 +423,16 @@ pub const StreamHandler = struct {
                 // then this whole block shouldn't be analyzed.
                 if (comptime !tmux_enabled) break :tmux;
 
-                // Runtime config gate: the user can disable tmux control
-                // mode even when compiled in.
-                if (!self.tmux_control_mode) break :tmux;
-
                 log.info("tmux control mode event cmd={f}", .{tmux});
 
                 switch (tmux) {
                     .enter => {
+                        // Runtime config gate: only block entering tmux
+                        // control mode when disabled. Exit and other events
+                        // must still be processed to tear down an active
+                        // viewer (e.g. config toggled off mid-session).
+                        if (!self.tmux_control_mode) break :tmux;
+
                         // Setup our viewer state
                         assert(self.tmux_viewer == null);
                         const viewer = try self.alloc.create(terminal.tmux.Viewer);
