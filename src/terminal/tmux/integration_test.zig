@@ -62,7 +62,7 @@ const TmuxHarness = struct {
             };
         };
 
-        const viewer = try Viewer.init(alloc);
+        const viewer = try Viewer.init(alloc, 80, 24);
 
         return .{
             .child = child,

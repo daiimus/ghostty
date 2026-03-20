@@ -518,6 +518,24 @@ pub fn resize(
     // Mail the renderer so that it can update the GPU and re-render
     _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
     self.renderer_wakeup.notify() catch {};
+
+    // If tmux control mode is active, update the viewer's stored
+    // dimensions and send `refresh-client -C WxH` directly to tmux.
+    // This bypasses the viewer command queue (fire-and-forget) because
+    // resize is a unidirectional notification — the response is
+    // meaningless. The startup path still goes through the queue to
+    // ensure ordering before `list-windows`.
+    if (comptime StreamHandler.tmux_enabled) {
+        if (self.terminal_stream.handler.tmux_viewer) |viewer| {
+            viewer.setClientSize(grid_size.columns, grid_size.rows);
+            var buf: [64]u8 = undefined;
+            const cmd = std.fmt.bufPrint(&buf, "refresh-client -C {d}x{d}\n", .{
+                grid_size.columns,
+                grid_size.rows,
+            }) catch unreachable; // 64 bytes is more than enough for u16xu16
+            self.backend.tmuxCommand(cmd);
+        }
+    }
 }
 
 /// Make a size report.

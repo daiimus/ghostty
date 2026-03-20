@@ -171,6 +171,13 @@ pub const Viewer = struct {
     /// versions as necessary.
     tmux_version: []const u8,
 
+    /// Current control client size (columns and rows). Sent to tmux
+    /// via `refresh-client -C` on startup so tmux knows our display
+    /// dimensions. Updated externally via `setClientSize` when the
+    /// parent terminal resizes.
+    client_cols: size.CellCountInt,
+    client_rows: size.CellCountInt,
+
     /// The list of commands we've sent that we want to send and wait
     /// for a response for. We only send one command at a time just
     /// to avoid any possible confusion around ordering.
@@ -373,7 +380,7 @@ pub const Viewer = struct {
     ///
     /// The given allocator is used for all internal state. You must
     /// call deinit when you're done with the viewer to free it.
-    pub fn init(alloc: Allocator) Allocator.Error!Viewer {
+    pub fn init(alloc: Allocator, client_cols: size.CellCountInt, client_rows: size.CellCountInt) Allocator.Error!Viewer {
         // Create our initial command queue
         var command_queue: CommandQueue = try .init(alloc, COMMAND_QUEUE_INITIAL);
         errdefer command_queue.deinit(alloc);
@@ -389,6 +396,8 @@ pub const Viewer = struct {
             .session_id = 0,
             .session_name = "",
             .tmux_version = "",
+            .client_cols = client_cols,
+            .client_rows = client_rows,
             .command_queue = command_queue,
             .windows = .empty,
             .windows_arena = .{},
@@ -420,6 +429,21 @@ pub const Viewer = struct {
             self.alloc.free(self.tmux_version);
         }
         self.action_arena.promote(self.alloc).deinit();
+    }
+
+    /// Update the stored control client dimensions. The caller is
+    /// responsible for actually sending the `refresh-client -C WxH`
+    /// command to tmux — for runtime resizes this is done directly
+    /// via the backend's `tmuxCommand`, bypassing the viewer command
+    /// queue. During startup the initial size is sent as part of the
+    /// startup command sequence in `tryFinishStartup`.
+    pub fn setClientSize(
+        self: *Viewer,
+        cols: size.CellCountInt,
+        rows: size.CellCountInt,
+    ) void {
+        self.client_cols = cols;
+        self.client_rows = rows;
     }
 
     /// Send in an input event (such as a tmux protocol notification,
@@ -500,7 +524,10 @@ pub const Viewer = struct {
 
         return self.enterCommandQueue(
             arena.allocator(),
-            &.{ .tmux_version, .list_windows },
+            &.{ .{ .client_size = .{
+                .cols = self.client_cols,
+                .rows = self.client_rows,
+            } }, .tmux_version, .list_windows },
         ) catch {
             log.warn("failed to queue command, becoming defunct", .{});
             return self.defunct();
@@ -1058,7 +1085,8 @@ pub const Viewer = struct {
         session_name: []const u8,
     ) (Allocator.Error || std.Io.Writer.Error)!void {
         // Build up a new viewer. Its the easiest way to reset ourselves.
-        var replacement: Viewer = try .init(self.alloc);
+        // Carry forward the current client size.
+        var replacement: Viewer = try .init(self.alloc, self.client_cols, self.client_rows);
         errdefer replacement.deinit();
 
         // Our actions must start out empty so we don't mix arenas
@@ -1134,7 +1162,7 @@ pub const Viewer = struct {
 
         // Process our command
         switch (command) {
-            .user => {},
+            .user, .client_size => {},
 
             .pane_state => {
                 try self.receivedPaneState(content);
@@ -1735,6 +1763,13 @@ const Command = union(enum) {
     /// Used to determine whether a pane is in copy-mode, view-mode, etc.
     pane_mode_query: usize,
 
+    /// Set the control client size. tmux uses this (along with other
+    /// attached clients) to determine window dimensions.
+    client_size: struct {
+        cols: size.CellCountInt,
+        rows: size.CellCountInt,
+    },
+
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
@@ -1752,6 +1787,7 @@ const Command = union(enum) {
             .pane_state,
             .tmux_version,
             .pane_mode_query,
+            .client_size,
             => {},
             .user => |v| alloc.free(v),
         };
@@ -1813,6 +1849,11 @@ const Command = union(enum) {
             .pane_mode_query => |pane_id| try writer.print(
                 "display-message -p -t %{d} '{s}'\n",
                 .{ pane_id, comptime Format.pane_mode.comptimeFormat() },
+            ),
+
+            .client_size => |cs| try writer.print(
+                "refresh-client -C {d}x{d}\n",
+                .{ cs.cols, cs.rows },
             ),
 
             .user => |v| try writer.writeAll(v),
@@ -1961,6 +2002,113 @@ const TestStep = struct {
     }
 };
 
+test "client_size command formats refresh-client" {
+    const cmd: Command = .{ .client_size = .{ .cols = 120, .rows = 36 } };
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+    try cmd.formatCommand(&builder.writer);
+    const result = builder.writer.buffered();
+    try testing.expectEqualStrings("refresh-client -C 120x36\n", result);
+}
+
+test "setClientSize stores dimensions in command_queue state" {
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 %0 83 44 b7dd,83x44,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Complete capture-pane sequence
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+    });
+
+    // Now in command_queue state with empty queue. Call setClientSize.
+    // The viewer only stores dimensions — the caller (Termio.resize)
+    // is responsible for sending the refresh-client command directly.
+    try testing.expectEqual(.command_queue, viewer.state);
+    viewer.setClientSize(132, 43);
+    try testing.expectEqual(@as(size.CellCountInt, 132), viewer.client_cols);
+    try testing.expectEqual(@as(size.CellCountInt, 43), viewer.client_rows);
+
+    // Queue should remain empty — no command was queued.
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "setClientSize stores dimensions but does not queue during startup" {
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
+    defer viewer.deinit();
+
+    // Viewer is in startup state
+    try testing.expectEqual(.startup, viewer.state);
+    viewer.setClientSize(100, 50);
+    try testing.expectEqual(@as(size.CellCountInt, 100), viewer.client_cols);
+    try testing.expectEqual(@as(size.CellCountInt, 50), viewer.client_rows);
+
+    // Queue should still be empty (no command queued during startup)
+    try testing.expect(viewer.command_queue.empty());
+}
+
+test "startup sends client_size before version query" {
+    var viewer = try Viewer.init(testing.allocator, 132, 43);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            // First command should be refresh-client with our init dimensions
+            .contains_command = "refresh-client",
+            .check_command = (struct {
+                fn check(_: *Viewer, cmd: []const u8) anyerror!void {
+                    try testing.expect(
+                        std.mem.startsWith(u8, cmd, "refresh-client -C 132x43\n"),
+                    );
+                }
+            }).check,
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+    });
+}
+
 /// A helper to run a series of test steps against a viewer and assert
 /// that the expected actions are produced.
 ///
@@ -1979,7 +2127,7 @@ fn testViewer(viewer: *Viewer, steps: []const TestStep) !void {
 }
 
 test "immediate exit" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -1999,7 +2147,7 @@ test "immediate exit" {
 }
 
 test "session changed resets state" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2010,6 +2158,11 @@ test "session changed resets state" {
                 .id = 1,
                 .name = "first",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
@@ -2090,7 +2243,7 @@ test "session changed resets state" {
 }
 
 test "initial flow" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2100,12 +2253,17 @@ test "initial flow" {
                 .id = 42,
                 .name = "main",
             } } },
-            .contains_command = "display-message",
+            .contains_command = "refresh-client",
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(42, v.session_id);
                 }
             }).check,
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
         .{
@@ -2309,7 +2467,7 @@ test "initial flow" {
 test "startup session before block" {
     // Verify that %session-changed arriving before %begin/%end
     // still completes startup correctly.
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2333,7 +2491,7 @@ test "startup session before block" {
         // Block arrives second — this should complete startup
         .{
             .input = .{ .tmux = .{ .block_end = "" } },
-            .contains_command = "display-message",
+            .contains_command = "refresh-client",
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     // Should now be in command_queue state
@@ -2341,6 +2499,11 @@ test "startup session before block" {
                     try testing.expectEqual(7, v.session_id);
                 }
             }).check,
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "display-message",
         },
         // Receive version response
         .{
@@ -2355,7 +2518,7 @@ test "startup session before block" {
 }
 
 test "layout change" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2366,6 +2529,11 @@ test "layout change" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
@@ -2439,7 +2607,7 @@ test "layout change resizes existing pane without structural change" {
     // resized), tmux sends a %layout-change with the same pane
     // structure but different dimensions. The viewer must resize the
     // pane's shadow terminal to match.
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2450,6 +2618,11 @@ test "layout change resizes existing pane without structural change" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
@@ -2507,7 +2680,7 @@ test "layout change resizes existing pane without structural change" {
 }
 
 test "layout_change does not return command when queue not empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2518,6 +2691,11 @@ test "layout_change does not return command when queue not empty" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
@@ -2568,7 +2746,7 @@ test "layout_change does not return command when queue not empty" {
 }
 
 test "layout_change returns command when queue was empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2579,6 +2757,11 @@ test "layout_change returns command when queue was empty" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
@@ -2635,7 +2818,7 @@ test "layout_change returns command when queue was empty" {
 }
 
 test "window_add queues list_windows when queue empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2646,6 +2829,11 @@ test "window_add queues list_windows when queue empty" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
@@ -2696,7 +2884,7 @@ test "window_add queues list_windows when queue empty" {
 }
 
 test "window_add queues list_windows when queue not empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2707,6 +2895,11 @@ test "window_add queues list_windows when queue not empty" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
@@ -2752,7 +2945,7 @@ test "window_add queues list_windows when queue not empty" {
 }
 
 test "session_window_changed queues list_windows when queue empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2763,6 +2956,11 @@ test "session_window_changed queues list_windows when queue empty" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
@@ -2812,7 +3010,7 @@ test "session_window_changed queues list_windows when queue empty" {
 }
 
 test "session_window_changed queues list_windows when queue not empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2823,6 +3021,11 @@ test "session_window_changed queues list_windows when queue not empty" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
@@ -2865,7 +3068,7 @@ test "session_window_changed queues list_windows when queue not empty" {
 }
 
 test "window_close queues list_windows when queue empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2876,6 +3079,11 @@ test "window_close queues list_windows when queue empty" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
@@ -2926,7 +3134,7 @@ test "window_close queues list_windows when queue empty" {
 }
 
 test "window_close queues list_windows when queue not empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2937,6 +3145,11 @@ test "window_close queues list_windows when queue not empty" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
@@ -2982,7 +3195,7 @@ test "window_close queues list_windows when queue not empty" {
 }
 
 test "two pane flow with pane state" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2994,12 +3207,17 @@ test "two pane flow with pane state" {
                 .id = 0,
                 .name = "0",
             } } },
-            .contains_command = "display-message",
+            .contains_command = "refresh-client",
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(0, v.session_id);
                 }
             }).check,
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
         .{
@@ -3165,7 +3383,7 @@ test "two pane flow with pane state" {
 test "layout change preserves other windows on shared arena" {
     // Validates that the shared windows_arena correctly preserves
     // layout data for unchanged windows when layoutChanged rebuilds.
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3176,6 +3394,11 @@ test "layout change preserves other windows on shared arena" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
@@ -3265,7 +3488,7 @@ test "Action.format handles exit action" {
 }
 
 test "window_pane_changed produces focus action" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3276,6 +3499,11 @@ test "window_pane_changed produces focus action" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         // Receive version response, which triggers list-windows
@@ -3349,7 +3577,7 @@ test "Action.format handles focus action" {
 }
 
 test "output suppressed for uninitialized panes" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3360,6 +3588,11 @@ test "output suppressed for uninitialized panes" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
@@ -3440,7 +3673,7 @@ test "output suppressed for uninitialized panes" {
 }
 
 test "window_renamed produces title action" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3451,6 +3684,11 @@ test "window_renamed produces title action" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
@@ -3508,7 +3746,7 @@ test "window_renamed produces title action" {
 }
 
 test "session_renamed produces session_title action" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3519,6 +3757,11 @@ test "session_renamed produces session_title action" {
                 .id = 1,
                 .name = "original",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
@@ -3574,7 +3817,7 @@ test "session_renamed produces session_title action" {
 }
 
 test "list_windows stores window name" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3584,6 +3827,11 @@ test "list_windows stores window name" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
@@ -3611,7 +3859,7 @@ test "list_windows stores window name" {
 test "list_windows emits focus action for active window" {
     // Verifies that receivedListWindows emits a .focus action targeting
     // the active window and its current pane from the list-windows output.
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3621,6 +3869,11 @@ test "list_windows emits focus action for active window" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
@@ -3654,7 +3907,7 @@ test "list_windows emits focus action for active window" {
 test "list_windows emits focus for active window in multi-window session" {
     // With two windows, only @0 is active. The focus action should
     // target @0 and its current pane %0, not the inactive @1.
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3664,6 +3917,11 @@ test "list_windows emits focus for active window in multi-window session" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
@@ -3697,7 +3955,7 @@ test "list_windows emits focus for active window in multi-window session" {
 }
 
 test "pause notification sets pane paused state and emits action" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3708,6 +3966,11 @@ test "pause notification sets pane paused state and emits action" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
@@ -3776,7 +4039,7 @@ test "pause notification sets pane paused state and emits action" {
 }
 
 test "pause for unknown pane is ignored" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3787,6 +4050,11 @@ test "pause for unknown pane is ignored" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
@@ -3825,7 +4093,7 @@ test "pause for unknown pane is ignored" {
 }
 
 test "pane_mode_changed queues query and updates state on response" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3836,6 +4104,11 @@ test "pane_mode_changed queues query and updates state on response" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
@@ -3887,7 +4160,7 @@ test "pane_mode_changed queues query and updates state on response" {
 }
 
 test "pane_mode_changed for unknown pane is ignored" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3898,6 +4171,11 @@ test "pane_mode_changed for unknown pane is ignored" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
@@ -3936,7 +4214,7 @@ test "pane_mode_changed for unknown pane is ignored" {
 }
 
 test "pane_mode_changed empty response means normal mode" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3947,6 +4225,11 @@ test "pane_mode_changed empty response means normal mode" {
                 .id = 1,
                 .name = "test",
             } } },
+            .contains_command = "refresh-client",
+        },
+        // Receive client_size response, which triggers version query
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
             .contains_command = "display-message",
         },
         .{
