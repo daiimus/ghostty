@@ -1246,9 +1246,21 @@ pub const Viewer = struct {
                 if (gop.found_existing) break :pane;
                 errdefer _ = panes_new.swapRemove(gop.key_ptr.*);
 
-                // If we already have this pane, move the pointer over.
+                // If we already have this pane, it is already initialized
+                // so just copy it over (and resize if the layout changed).
                 if (panes_old.getEntry(id)) |entry| {
                     gop.value_ptr.* = entry.value_ptr.*;
+
+                    // Resize the terminal if the pane's grid dimensions
+                    // changed (e.g. after a split or window resize). This
+                    // keeps the viewer's terminal in sync with tmux's
+                    // actual pane size. Terminal.resize no-ops when the
+                    // dimensions already match.
+                    try gop.value_ptr.*.terminal.resize(
+                        gpa_alloc,
+                        @intCast(layout.width),
+                        @intCast(layout.height),
+                    );
                     break :pane;
                 }
 
@@ -1975,6 +1987,87 @@ test "layout change" {
                     try testing.expect(v.panes.contains(2));
                     // Commands should be queued for the new pane (4 capture-pane + 1 pane_state)
                     try testing.expectEqual(5, v.command_queue.len());
+                    // Pane 0 was 83x44 before the split. After the
+                    // layout change it should be resized to 83x22.
+                    const pane0 = v.panes.get(0).?;
+                    try testing.expectEqual(83, pane0.terminal.cols);
+                    try testing.expectEqual(22, pane0.terminal.rows);
+                    // Pane 2 is new — created at 83x21.
+                    const pane2 = v.panes.get(2).?;
+                    try testing.expectEqual(83, pane2.terminal.cols);
+                    try testing.expectEqual(21, pane2.terminal.rows);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "layout change resizes existing pane without structural change" {
+    // When a tmux window is resized (e.g. the terminal emulator is
+    // resized), tmux sends a %layout-change with the same pane
+    // structure but different dimensions. The viewer must resize the
+    // pane's shadow terminal to match.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Initial window: single pane at 83x44
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane0 = v.panes.get(0).?;
+                    try testing.expectEqual(83, pane0.terminal.cols);
+                    try testing.expectEqual(44, pane0.terminal.rows);
+                }
+            }).check,
+        },
+        // Complete capture-pane commands for pane 0
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Window resized to 120x50 — same pane, different dimensions
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = "acfd,120x50,0,0,0",
+                .visible_layout = "acfd,120x50,0,0,0",
+                .raw_flags = "*",
+            } } },
+            .contains_tags = &.{.windows},
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Still one pane, no new captures queued
+                    try testing.expectEqual(1, v.panes.count());
+                    try testing.expect(v.command_queue.empty());
+                    // Terminal dimensions must match the new layout
+                    const pane0 = v.panes.get(0).?;
+                    try testing.expectEqual(120, pane0.terminal.cols);
+                    try testing.expectEqual(50, pane0.terminal.rows);
                 }
             }).check,
         },
