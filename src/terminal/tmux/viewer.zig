@@ -1649,10 +1649,8 @@ pub const Viewer = struct {
 
             // A leaf! Initialize.
             .pane => |id| pane: {
-                const gop = try panes_new.getOrPut(gpa_alloc, id);
-                if (gop.found_existing) break :pane;
-                errdefer _ = panes_new.swapRemove(gop.key_ptr.*);
-
+                // Validate dimensions before inserting into the map to
+                // avoid leaving an uninitialized entry on overflow.
                 const cols: size.CellCountInt = std.math.cast(size.CellCountInt, layout.width) orelse {
                     log.info("pane {} width {} overflows CellCountInt, skipping", .{ id, layout.width });
                     break :pane;
@@ -1661,6 +1659,10 @@ pub const Viewer = struct {
                     log.info("pane {} height {} overflows CellCountInt, skipping", .{ id, layout.height });
                     break :pane;
                 };
+
+                const gop = try panes_new.getOrPut(gpa_alloc, id);
+                if (gop.found_existing) break :pane;
+                errdefer _ = panes_new.swapRemove(gop.key_ptr.*);
 
                 // If we already have this pane, it is already initialized
                 // so just copy it over (and resize if the layout changed).
