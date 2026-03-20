@@ -39,6 +39,11 @@ const log = std.log.scoped(.io_tmux);
 /// (e.g., pane_id 5 corresponds to `%5`).
 pane_id: usize,
 
+/// The tmux window ID this pane belongs to. Used to send `select-window`
+/// when the surface gains focus, keeping tmux's active window in sync
+/// with Ghostty's focused tab.
+window_id: usize,
+
 /// Pointer to the viewer-owned terminal for this pane. When set, the
 /// renderer's terminal pointer is swapped at `threadEnter` to read
 /// directly from the viewer's terminal state rather than the Termio's
@@ -132,6 +137,9 @@ pub const Config = struct {
     /// The tmux pane ID this surface represents.
     pane_id: usize,
 
+    /// The tmux window ID this pane belongs to.
+    window_id: usize,
+
     /// The writer for sending commands to the tmux control connection.
     control_writer: ControlWriter,
 
@@ -151,6 +159,7 @@ pub const Config = struct {
 pub fn init(cfg: Config) Tmux {
     return .{
         .pane_id = cfg.pane_id,
+        .window_id = cfg.window_id,
         .viewer_terminal = cfg.viewer_terminal,
         .viewer_pane = cfg.viewer_pane,
         .grid_size = .{},
@@ -244,10 +253,11 @@ pub fn focusGained(
 ) !void {
     assert(td.backend == .tmux);
 
-    // Only send select-pane when this surface gains focus.
+    // Only send select commands when this surface gains focus.
     // Losing focus is a no-op — the pane that gains focus will
-    // send its own select-pane.
+    // send its own select-pane/select-window.
     if (!focused) return;
+    self.selectWindow();
     self.selectPane();
 }
 
@@ -263,6 +273,24 @@ fn selectPane(self: *Tmux) void {
 
     self.control_writer.write(cmd) catch |err| {
         log.warn("failed to send select-pane err={}", .{err});
+    };
+}
+
+/// Send a `select-window` command to tmux targeting this backend's
+/// window. This ensures tmux's active window matches the Ghostty tab
+/// that received focus, which is necessary for multi-window sessions
+/// where switching tabs must also switch the tmux current window.
+fn selectWindow(self: *Tmux) void {
+    var buf: [64]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&buf, "select-window -t @{d}\n", .{
+        self.window_id,
+    }) catch |err| {
+        log.warn("select-window command too large for buffer err={}", .{err});
+        return;
+    };
+
+    self.control_writer.write(cmd) catch |err| {
+        log.warn("failed to send select-window err={}", .{err});
     };
 }
 
@@ -541,6 +569,7 @@ test "init sets pane_id and initial sizes" {
 
     const tmux = Tmux.init(.{
         .pane_id = 42,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -556,6 +585,7 @@ test "resize sends resize-pane command" {
 
     var tmux = Tmux.init(.{
         .pane_id = 5,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -579,6 +609,7 @@ test "resize with large pane_id" {
 
     var tmux = Tmux.init(.{
         .pane_id = 12345,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -601,6 +632,7 @@ test "resize consecutive calls track latest dimensions" {
 
     var tmux = Tmux.init(.{
         .pane_id = 3,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -639,6 +671,7 @@ test "resize updates state even when control writer fails" {
     // state remains consistent even if the control connection is dead.
     var tmux = Tmux.init(.{
         .pane_id = 99,
+        .window_id = 0,
         .control_writer = FailingControlWriter.controlWriter(),
     });
 
@@ -670,6 +703,7 @@ test "resize tracks screen_size alongside grid_size" {
 
     var tmux = Tmux.init(.{
         .pane_id = 1,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -695,6 +729,7 @@ test "queueWrite formats send-keys with hex encoding" {
 
     var tmux = Tmux.init(.{
         .pane_id = 2,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -713,6 +748,7 @@ test "queueWrite single byte" {
 
     var tmux = Tmux.init(.{
         .pane_id = 0,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -729,6 +765,7 @@ test "queueWrite escape sequence" {
 
     var tmux = Tmux.init(.{
         .pane_id = 10,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -746,6 +783,7 @@ test "queueWrite with linefeed mode" {
 
     var tmux = Tmux.init(.{
         .pane_id = 3,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -764,6 +802,7 @@ test "queueWrite empty data is no-op" {
 
     var tmux = Tmux.init(.{
         .pane_id = 1,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -780,6 +819,7 @@ test "queueWrite large pane_id" {
 
     var tmux = Tmux.init(.{
         .pane_id = 99999,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -796,6 +836,7 @@ test "queueWrite chunks large input into multiple commands" {
 
     var tmux = Tmux.init(.{
         .pane_id = 5,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -828,6 +869,7 @@ test "queueWrite exactly max_send_keys_bytes is single command" {
 
     var tmux = Tmux.init(.{
         .pane_id = 0,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -849,6 +891,7 @@ test "queueWrite large input with linefeed mode chunks correctly" {
 
     var tmux = Tmux.init(.{
         .pane_id = 1,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -874,6 +917,7 @@ test "queueWrite multiple full chunks" {
 
     var tmux = Tmux.init(.{
         .pane_id = 7,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -896,6 +940,7 @@ test "deinit resets state" {
 
     var tmux = Tmux.init(.{
         .pane_id = 7,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -1009,6 +1054,7 @@ test "ParentWriter used as backend ControlWriter" {
 
     var tmux = Tmux.init(.{
         .pane_id = 7,
+        .window_id = 0,
         .control_writer = parent_writer.controlWriter(),
     });
 
@@ -1115,6 +1161,7 @@ test "selectPane sends select-pane command" {
 
     var tmux = Tmux.init(.{
         .pane_id = 7,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -1131,6 +1178,7 @@ test "selectPane with large pane_id" {
 
     var tmux = Tmux.init(.{
         .pane_id = 99999,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 
@@ -1140,6 +1188,40 @@ test "selectPane with large pane_id" {
     try testing.expectEqualStrings("select-pane -t %99999\n", writer.lastCommand().?);
 }
 
+test "selectWindow sends select-window command" {
+    const alloc = testing.allocator;
+    var writer = TestControlWriter.init(alloc);
+    defer writer.deinit();
+
+    var tmux = Tmux.init(.{
+        .pane_id = 3,
+        .window_id = 5,
+        .control_writer = writer.controlWriter(),
+    });
+
+    tmux.selectWindow();
+
+    try testing.expectEqual(@as(usize, 1), writer.commands.items.len);
+    try testing.expectEqualStrings("select-window -t @5\n", writer.lastCommand().?);
+}
+
+test "selectWindow with large window_id" {
+    const alloc = testing.allocator;
+    var writer = TestControlWriter.init(alloc);
+    defer writer.deinit();
+
+    var tmux = Tmux.init(.{
+        .pane_id = 0,
+        .window_id = 99999,
+        .control_writer = writer.controlWriter(),
+    });
+
+    tmux.selectWindow();
+
+    try testing.expectEqual(@as(usize, 1), writer.commands.items.len);
+    try testing.expectEqualStrings("select-window -t @99999\n", writer.lastCommand().?);
+}
+
 test "tmuxCommand sends raw command to control writer" {
     const alloc = testing.allocator;
     var writer = TestControlWriter.init(alloc);
@@ -1147,6 +1229,7 @@ test "tmuxCommand sends raw command to control writer" {
 
     var tmux = Tmux.init(.{
         .pane_id = 3,
+        .window_id = 0,
         .control_writer = writer.controlWriter(),
     });
 

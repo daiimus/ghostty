@@ -7257,6 +7257,7 @@ test "Surface InitOptions default backend is exec" {
 test "Surface InitOptions allows tmux backend config" {
     const tmux_cfg: termio.Tmux.Config = .{
         .pane_id = 42,
+        .window_id = 0,
         .control_writer = .{
             .context = undefined,
             .writeFn = undefined,
@@ -7274,6 +7275,7 @@ test "Surface InitOptions allows tmux backend config" {
 test "Surface BackendConfig produces correct termio Backend variant" {
     const tmux_cfg: termio.Tmux.Config = .{
         .pane_id = 7,
+        .window_id = 0,
         .control_writer = .{
             .context = undefined,
             .writeFn = undefined,
