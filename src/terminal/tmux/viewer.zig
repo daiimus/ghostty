@@ -468,6 +468,9 @@ pub const Viewer = struct {
     /// keyboard input for a pane, etc.) and process it. The returned
     /// list is a set of actions to take as a result of the input prior
     /// to the next input. This list may be empty.
+    ///
+    /// Lifetime: the returned slice and any pointers within the actions
+    /// are valid only until the next call to `next()`.
     pub fn next(self: *Viewer, input: Input) []const Action {
         // Developer note: this function must never return an error. If
         // an error occurs we must go into a defunct state or some other
@@ -1927,7 +1930,6 @@ const Format = struct {
             .cursor_y,
             .cursor_flag,
             .cursor_shape,
-            .cursor_colour,
             .cursor_blinking,
             // Alternate screen
             .alternate_on,
@@ -1940,6 +1942,12 @@ const Format = struct {
             .keypad_cursor_flag,
             .origin_flag,
             // Mouse modes
+            //
+            // tmux variable names differ from xterm mode names:
+            //   mouse_all_flag    -> mouse_event_any    (report all motion)
+            //   mouse_any_flag    -> mouse_event_button (report button-motion)
+            //   mouse_button_flag -> mouse_event_normal (report button press/release)
+            //   mouse_standard_flag -> mouse_event_x10  (legacy X10 compat)
             .mouse_all_flag,
             .mouse_any_flag,
             .mouse_button_flag,
@@ -3417,8 +3425,8 @@ test "two pane flow with pane state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\%0;42;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;39;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160
-                \\%4;10;5;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;37;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160
+                \\%0;42;0;1;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;39;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160
+                \\%4;10;5;1;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;37;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160
                 ,
             } },
             .check = (struct {

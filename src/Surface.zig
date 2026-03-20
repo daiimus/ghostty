@@ -520,7 +520,7 @@ pub const TmuxReconcileOp = union(enum) {
 
     /// Update the split tree of the given tmux window to match
     /// the provided layout shape. The layout is borrowed from
-    /// the snapshot and valid for the duration of the action.
+    /// the payload's arena and valid for the duration of the action.
     set_layout: struct {
         tmux_window_id: usize,
         layout: *const terminal.tmux.Layout,
@@ -584,8 +584,8 @@ pub const TmuxReconcilePayload = struct {
 /// Build an ordered list of reconcile ops from a tmux topology snapshot.
 ///
 /// The planner emits: sync_windows_begin, then for each window
-/// (ensure_window, ensure_pane for each leaf pane, set_layout),
-/// then prune_absent, sync_windows_end.
+/// (ensure_window, ensure_pane for each leaf pane, set_layout,
+/// set_tab_title), then prune_absent, sync_windows_end.
 ///
 /// The returned payload is heap-allocated and owns all referenced data
 /// via its arena. The caller must call `deinit` after processing.

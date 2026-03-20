@@ -108,14 +108,10 @@ pub const ControlWriter = terminal.tmux.ControlWriter;
 ///
 /// - `stream_handler.zig` `.command` handler: uses the same
 ///   `Mailbox.send` path to write viewer commands to the parent pty.
-/// - `mailbox.zig`: SPSC send with renderer mutex handoff.
+/// - `mailbox.zig`: SPSC send.
 pub const ParentWriter = struct {
     mailbox: *termio.Mailbox,
     alloc: Allocator,
-
-    /// The renderer state mutex, required by `Mailbox.send` for the
-    /// backpressure unlock path. See `mailbox.zig:60-91`.
-    mutex: *std.Thread.Mutex,
 
     pub fn controlWriter(self: *ParentWriter) ControlWriter {
         return .{
@@ -128,7 +124,12 @@ pub const ParentWriter = struct {
         const self: *ParentWriter = @ptrCast(@alignCast(context));
         const msg = termio.Message.writeReq(self.alloc, data) catch
             return error.WriteFailed;
-        self.mailbox.send(msg, self.mutex);
+        // Pass null for the mutex: this writer runs on a child IO thread
+        // that does NOT hold the renderer mutex. The slow-path in
+        // Mailbox.send unlocks/relocks the mutex when non-null, which
+        // would be undefined behavior on an unlocked mutex.
+        self.mailbox.send(msg, null);
+        self.mailbox.notify();
     }
 };
 
@@ -967,12 +968,9 @@ test "ParentWriter routes commands through mailbox" {
     var mailbox = try termio.Mailbox.initSPSC(alloc);
     defer mailbox.deinit(alloc);
 
-    // Mutex is undefined: the queue is empty so send() takes the fast path (instant push).
     var parent_writer = ParentWriter{
         .mailbox = &mailbox,
         .alloc = alloc,
-        // Mutex is unused: the queue is empty so send() takes the fast path (instant push).
-        .mutex = undefined,
     };
     const writer = parent_writer.controlWriter();
 
@@ -1009,8 +1007,6 @@ test "ParentWriter handles large commands" {
     var parent_writer = ParentWriter{
         .mailbox = &mailbox,
         .alloc = alloc,
-        // Mutex is unused: the queue is empty so send() takes the fast path (instant push).
-        .mutex = undefined,
     };
     const writer = parent_writer.controlWriter();
 
@@ -1048,8 +1044,6 @@ test "ParentWriter used as backend ControlWriter" {
     var parent_writer = ParentWriter{
         .mailbox = &mailbox,
         .alloc = alloc,
-        // Mutex is unused: the queue is empty so send() takes the fast path (instant push).
-        .mutex = undefined,
     };
 
     var tmux = Tmux.init(.{
