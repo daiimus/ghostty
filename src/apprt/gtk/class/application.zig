@@ -23,7 +23,6 @@ const xev = @import("../../../global.zig").xev;
 const Binding = @import("../../../input.zig").Binding;
 const CoreConfig = configpkg.Config;
 const CoreSurface = @import("../../../Surface.zig");
-const termio = @import("../../../termio.zig");
 const lib = @import("../../../lib/main.zig");
 
 const ext = @import("../ext.zig");
@@ -2867,7 +2866,7 @@ const Action = struct {
 
                     // Heap-allocate a SurfaceRelayWriter so the ControlWriter's
                     // context pointer remains stable for the surface's lifetime.
-                    const relay_writer = alloc.create(termio.Tmux.SurfaceRelayWriter) catch |err| {
+                    const relay_writer = alloc.create(apprt.surface.SurfaceRelayWriter) catch |err| {
                         log.warn("tmux reconcile: failed to allocate relay writer: {}", .{err});
                         continue;
                     };

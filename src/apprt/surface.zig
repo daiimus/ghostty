@@ -232,6 +232,66 @@ pub const Message = union(enum) {
     };
 };
 
+/// A ControlWriter implementation that routes tmux commands through
+/// the app mailbox to the parent surface. When a child tmux pane runs
+/// on its own IO thread, it cannot safely write directly into the
+/// parent's SPSC termio mailbox.
+///
+/// Instead, command bytes are wrapped in an `apprt.surface.Message`
+/// (.tmux_write_command) and pushed to the parent surface's mailbox.
+/// The app mailbox is MPSC-safe, so any thread can push. The app
+/// thread delivers the message to the parent surface's `handleMessage`,
+/// which forwards the command bytes into the parent's termio mailbox
+/// via `queueIo` — preserving the SPSC invariant.
+///
+/// ## Relay Path
+///
+///   Child IO thread: SurfaceRelayWriter.writeFn()
+///     → constructs WriteReq from command bytes
+///     → pushes .tmux_write_command to parent surface mailbox
+///     → (app mailbox MPSC push, safe from any thread)
+///   App thread: drainMailbox → parent Surface.handleMessage
+///     → .tmux_write_command → queueIo(.write_small/.write_alloc)
+///     → parent termio mailbox (SPSC: app thread is single producer)
+///
+/// ## Lifetime
+///
+/// The `parent_mailbox` must remain valid for the lifetime of this
+/// writer. In practice, the parent surface outlives all child surfaces
+/// it creates.
+pub const SurfaceRelayWriter = struct {
+    const ControlWriter = terminal.tmux.ControlWriter;
+
+    parent_mailbox: Mailbox,
+    alloc: Allocator,
+
+    pub fn controlWriter(self: *SurfaceRelayWriter) ControlWriter {
+        return .{
+            .context = @ptrCast(self),
+            .writeFn = &writeFn,
+        };
+    }
+
+    fn writeFn(context: *anyopaque, data: []const u8) ControlWriter.WriteError!void {
+        const self: *SurfaceRelayWriter = @ptrCast(@alignCast(context));
+
+        // Construct a surface-level WriteReq from the command bytes.
+        // Surface WriteReq (MessageData(u8, 255)) can hold up to 255
+        // bytes inline; larger commands are heap-allocated.
+        const SurfaceWriteReq = Message.WriteReq;
+        const req = SurfaceWriteReq.init(self.alloc, data) catch
+            return error.WriteFailed;
+
+        // Push to the parent surface's mailbox. This goes through the
+        // app mailbox (MPSC-safe). Use .forever since we don't hold
+        // any mutex that could deadlock with the app thread.
+        _ = self.parent_mailbox.push(
+            .{ .tmux_write_command = req },
+            .{ .forever = {} },
+        );
+    }
+};
+
 /// A surface mailbox.
 pub const Mailbox = struct {
     surface: *Surface,
