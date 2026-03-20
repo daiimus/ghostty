@@ -186,7 +186,7 @@ pub const Message = union(enum) {
             var result: TmuxTitleChanged = .{
                 .tmux_window_id = tmux_window_id,
             };
-            const len: u8 = @intCast(@min(name.len, result.title_buf.len));
+            const len: u8 = @intCast(@min(name.len, result.title_buf.len - 1));
             @memcpy(result.title_buf[0..len], name[0..len]);
             result.title_len = len;
             return result;
