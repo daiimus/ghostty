@@ -31,6 +31,12 @@ const log = std.log.scoped(.terminal_tmux_viewer);
 /// our most realistic use cases without resizing.
 const COMMAND_QUEUE_INITIAL = 8;
 
+/// Number of bytes of output buffered server-side before tmux pauses the
+/// pane. Sent as `-f pause-after=<N>` in the initial `refresh-client`
+/// command. A low value keeps latency tight but increases pause/continue
+/// churn; 200 is empirically a good balance for interactive shells.
+const PAUSE_AFTER_BYTES = 200;
+
 /// A viewer is a tmux control mode client that attempts to create
 /// a remote view of a tmux session, including providing the ability to send
 /// new input to the session.
@@ -619,7 +625,7 @@ pub const Viewer = struct {
                 else
                     null;
                 if (pane != null and !pane.?.initialized) {
-                    log.info(
+                    log.debug(
                         "suppressing output for uninitialized pane id={}",
                         .{out.pane_id},
                     );
@@ -809,9 +815,9 @@ pub const Viewer = struct {
 
             // Pause/continue relate to refresh-client -A pause-after
             // functionality. When tmux pauses a pane, it stops sending
-            // %output for it (output is buffered server-side). Track
-            // the state and emit an action so the caller can decide
-            // whether to auto-continue (e.g. on pane focus).
+            // %output for it (output is buffered server-side). The viewer
+            // tracks the state, emits an action for runtime UI feedback,
+            // and immediately queues a continue command to resume output.
             .pause => |info| {
                 if (self.panes.getEntry(info.pane_id)) |entry| {
                     entry.value_ptr.*.paused = true;
@@ -1831,7 +1837,7 @@ const Command = union(enum) {
         enable_pause: bool = false,
     },
 
-    /// Resume a paused pane. Sent as `refresh-client -A %<id>:continue`.
+    /// Resume a paused pane. Sent as `refresh-client -A '%<id>:continue'`.
     continue_pane: usize,
 
     /// User command. This is a command provided by the user. Since
@@ -1919,7 +1925,7 @@ const Command = union(enum) {
             .client_size => |cs| {
                 try writer.print("refresh-client -C {d}x{d}", .{ cs.cols, cs.rows });
                 if (cs.enable_pause) {
-                    try writer.writeAll(" -f pause-after=200");
+                    try writer.print(" -f pause-after={d}", .{PAUSE_AFTER_BYTES});
                 }
                 try writer.writeAll("\n");
             },

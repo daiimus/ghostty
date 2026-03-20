@@ -769,7 +769,7 @@ pub const Parser = struct {
             // Recognized but intentionally ignored notifications. These relate
             // to other sessions' windows, clipboard buffers, or format
             // subscriptions that we do not currently use.
-            log.info("ignoring tmux notification: {s}", .{cmd});
+            log.debug("ignoring tmux notification: {s}", .{cmd});
         } else {
             // Unknown notification, log it and return to idle state.
             log.warn("unknown tmux control mode notification={s}", .{cmd});

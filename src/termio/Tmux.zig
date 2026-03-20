@@ -124,10 +124,11 @@ pub const ParentWriter = struct {
         const self: *ParentWriter = @ptrCast(@alignCast(context));
         const msg = termio.Message.writeReq(self.alloc, data) catch
             return error.WriteFailed;
-        // Pass null for the mutex: this writer runs on a child IO thread
-        // that does NOT hold the renderer mutex. The slow-path in
-        // Mailbox.send unlocks/relocks the mutex when non-null, which
-        // would be undefined behavior on an unlocked mutex.
+        // Pass null for the mutex: this writer is called from the
+        // parent's IO thread (see Threading Contract above) which does
+        // NOT hold the renderer mutex. The slow-path in Mailbox.send
+        // unlocks/relocks the mutex when non-null, which would be
+        // undefined behavior on an unlocked mutex.
         self.mailbox.send(msg, null);
         self.mailbox.notify();
     }
@@ -345,11 +346,11 @@ pub fn tmuxCommand(self: *Tmux, cmd: []const u8) void {
 /// including control characters and escape sequences.
 ///
 /// Large inputs (e.g. a 10KB paste) are split into multiple send-keys
-/// commands of at most `max_send_keys_bytes` input bytes each. While
-/// modern tmux (3.x) has no hard command-length limit in control mode,
-/// chunking avoids blocking the control channel with a single massive
-/// command (~30KB of hex for 10KB of input) and maintains compatibility
-/// with older tmux versions that crash on commands >1024 bytes.
+/// commands of at most `max_send_keys_bytes` *input* bytes each (before
+/// hex encoding). While modern tmux (3.x) has no hard command-length
+/// limit in control mode, chunking avoids blocking the control channel
+/// with a single massive command and maintains compatibility with older
+/// tmux versions.
 pub fn queueWrite(
     self: *Tmux,
     alloc: Allocator,
