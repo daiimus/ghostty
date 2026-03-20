@@ -18,20 +18,35 @@ pub fn parseFormatStruct(
     str: []const u8,
     delimiter: u8,
 ) ParseError!T {
-    // Parse all our fields
     const fields = @typeInfo(T).@"struct".fields;
     var it = std.mem.splitScalar(u8, str, delimiter);
     var result: T = undefined;
-    inline for (fields) |field| {
-        const part = it.next() orelse return error.MissingEntry;
+
+    // For the last field: if it is a string ([]const u8), consume the
+    // remainder of the input via rest() so the value may contain the
+    // delimiter character. This is important for list_windows where
+    // window_name (last field) can contain spaces.
+    const last_is_string = comptime blk: {
+        const last = fields[fields.len - 1];
+        break :blk @field(Variable, last.name).Type() == []const u8;
+    };
+
+    inline for (fields, 0..) |field, i| {
+        const part = if (comptime (last_is_string and i == fields.len - 1))
+            it.rest()
+        else
+            it.next() orelse return error.MissingEntry;
         @field(result, field.name) = Variable.parse(
             @field(Variable, field.name),
             part,
         ) catch return error.FormatError;
     }
 
-    // We should have consumed all parts now.
-    if (it.next() != null) return error.ExtraEntry;
+    // If the last field consumed the rest, no extra-entry check needed.
+    // Otherwise verify we consumed all parts.
+    if (!last_is_string) {
+        if (it.next() != null) return error.ExtraEntry;
+    }
 
     return result;
 }
@@ -568,6 +583,17 @@ test "parseFormatStruct with empty layout field" {
     const result = try parseFormatStruct(T, "$1,", ',');
     try testing.expectEqual(1, result.session_id);
     try testing.expectEqualStrings("", result.window_layout);
+}
+
+test "parseFormatStruct last string field contains delimiter" {
+    // Simulates list_windows where window_name (last field) contains spaces.
+    // The rest() approach for the last string field consumes the remainder
+    // of the input, allowing the delimiter to appear in the value.
+    const T = FormatStruct(&.{ .session_id, .window_id, .window_name });
+    const result = try parseFormatStruct(T, "$1 @2 my cool window", ' ');
+    try testing.expectEqual(1, result.session_id);
+    try testing.expectEqual(2, result.window_id);
+    try testing.expectEqualStrings("my cool window", result.window_name);
 }
 
 fn testFormat(
