@@ -14,10 +14,6 @@ const output = @import("output.zig");
 
 const log = std.log.scoped(.terminal_tmux_viewer);
 
-// TODO: A list of TODOs as I think about them.
-// - We need to make startup more robust so session and block can happen
-//   out of order.
-
 // NOTE: There is some fragility here that can possibly break if tmux
 // changes their implementation. In particular, the order of notifications
 // and assurances about what is sent when are based on reading the tmux
@@ -60,21 +56,16 @@ const COMMAND_QUEUE_INITIAL = 8;
 ///                                                │
 ///                                                ▼
 ///                              ┌─────────────────────────────────────────────┐
-///                              │            startup_block                    │
+///                              │              startup                        │
 ///                              │                                             │
-///                              │  Wait for initial %begin/%end block from    │
-///                              │  tmux. This is the response to the initial  │
-///                              │  command (e.g., "attach -t 0").             │
+///                              │  Wait for both:                             │
+///                              │  1. Initial %begin/%end block (response to  │
+///                              │     the attach command)                     │
+///                              │  2. %session-changed notification (gives    │
+///                              │     us the session ID)                      │
+///                              │  Either can arrive first.                   │
 ///                              └─────────────────┬───────────────────────────┘
-///                                                │ %end / %error
-///                                                ▼
-///                              ┌─────────────────────────────────────────────┐
-///                              │           startup_session                   │
-///                              │                                             │
-///                              │  Wait for %session-changed notification     │
-///                              │  to get the initial session ID.             │
-///                              └─────────────────┬───────────────────────────┘
-///                                                │ %session-changed
+///                                                │ both received
 ///                                                ▼
 ///                              ┌─────────────────────────────────────────────┐
 ///                              │           command_queue                     │
@@ -156,6 +147,15 @@ pub const Viewer = struct {
 
     /// Current state of the state machine.
     state: State,
+
+    /// During startup, tracks whether we've received the initial
+    /// %begin/%end block. Once both this and startup_got_session are
+    /// set, we transition to command_queue. Only meaningful in .startup state.
+    startup_got_block: bool,
+
+    /// During startup, tracks whether we've received %session-changed.
+    /// Only meaningful in .startup state.
+    startup_got_session: bool,
 
     /// The current session ID we're attached to.
     session_id: usize,
@@ -330,7 +330,9 @@ pub const Viewer = struct {
 
         return .{
             .alloc = alloc,
-            .state = .startup_block,
+            .state = .startup,
+            .startup_got_block = false,
+            .startup_got_session = false,
             // The default value here is meaningless. We don't get started
             // until we receive a session-changed notification which will
             // set this to a real value.
@@ -393,81 +395,66 @@ pub const Viewer = struct {
                 break :defunct &.{};
             },
 
-            .startup_block => self.nextStartupBlock(n),
-            .startup_session => self.nextStartupSession(n),
+            .startup => self.nextStartup(n),
             .command_queue => self.nextCommand(n),
         };
     }
 
-    fn nextStartupBlock(
+    fn nextStartup(
         self: *Viewer,
         n: control.Notification,
     ) []const Action {
-        assert(self.state == .startup_block);
+        assert(self.state == .startup);
 
         switch (n) {
             // This is only sent by the DCS parser when we first get
             // DCS 1000p, it should never reach us here.
             .enter => unreachable,
 
-            // I don't think this is technically possible (reading the
-            // tmux source code), but if we see an exit we can semantically
-            // handle this without issue.
             .exit => return self.defunct(),
 
-            // Any begin and end (even error) is fine! Now we wait for
-            // session-changed to get the initial session ID. session-changed
-            // is guaranteed to come after the initial command output
-            // since if the initial command is `attach` tmux will run that,
-            // queue the notification, then do notificatins.
+            // The initial %begin/%end block is the response to the
+            // attach command. Any end (even error) counts.
             .block_end, .block_err => {
-                self.state = .startup_session;
-                return &.{};
+                self.startup_got_block = true;
+                return self.tryFinishStartup();
             },
 
-            // I don't like catch-all else branches but startup is such
-            // a special case of looking for very specific things that
-            // are unlikely to expand.
-            else => return &.{},
-        }
-    }
-
-    fn nextStartupSession(
-        self: *Viewer,
-        n: control.Notification,
-    ) []const Action {
-        assert(self.state == .startup_session);
-
-        switch (n) {
-            .enter => unreachable,
-
-            .exit => return self.defunct(),
-
+            // %session-changed gives us the session ID. tmux currently
+            // sends this after the block, but we handle either order.
             .session_changed => |info| {
                 self.session_id = info.id;
-                // Store the session name on the windows arena so it
-                // can be surfaced to the caller for window title.
                 {
                     var win_arena = self.windows_arena.promote(self.alloc);
                     defer self.windows_arena = win_arena.state;
                     self.session_name = win_arena.allocator().dupe(u8, info.name) catch "";
                 }
-
-                var arena = self.action_arena.promote(self.alloc);
-                defer self.action_arena = arena.state;
-                _ = arena.reset(.free_all);
-
-                return self.enterCommandQueue(
-                    arena.allocator(),
-                    &.{ .tmux_version, .list_windows },
-                ) catch {
-                    log.warn("failed to queue command, becoming defunct", .{});
-                    return self.defunct();
-                };
+                self.startup_got_session = true;
+                return self.tryFinishStartup();
             },
 
+            // Startup is a special case of looking for very specific
+            // things that are unlikely to expand.
             else => return &.{},
         }
+    }
+
+    /// Check if both startup prerequisites are met and transition to
+    /// command_queue if so.
+    fn tryFinishStartup(self: *Viewer) []const Action {
+        if (!self.startup_got_block or !self.startup_got_session) return &.{};
+
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        _ = arena.reset(.free_all);
+
+        return self.enterCommandQueue(
+            arena.allocator(),
+            &.{ .tmux_version, .list_windows },
+        ) catch {
+            log.warn("failed to queue command, becoming defunct", .{});
+            return self.defunct();
+        };
     }
 
     fn nextCommand(
@@ -1551,15 +1538,12 @@ pub const Viewer = struct {
 
 const State = enum {
     /// We start in this state just after receiving the initial
-    /// DCS 1000p opening sequence. We wait for an initial
-    /// begin/end block that is guaranteed to be sent by tmux for
-    /// the initial control mode command. (See tmux server-client.c
-    /// where control mode starts).
-    startup_block,
-
-    /// After receiving the initial block, we wait for a session-changed
-    /// notification to record the initial session ID.
-    startup_session,
+    /// DCS 1000p opening sequence. We need two things before we can
+    /// proceed: (1) the initial %begin/%end block for the attach
+    /// command, and (2) a %session-changed notification for the
+    /// session ID. tmux currently sends the block first, but we
+    /// handle either order for robustness.
+    startup,
 
     /// Tmux has closed the control mode connection
     defunct,
@@ -2147,6 +2131,54 @@ test "initial flow" {
                     try testing.expectEqual(0, actions.len);
                 }
             }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "startup session before block" {
+    // Verify that %session-changed arriving before %begin/%end
+    // still completes startup correctly.
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Session arrives first (reversed order from normal)
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 7,
+                .name = "reversed",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // Session info should be stored
+                    try testing.expectEqual(7, v.session_id);
+                    // But we haven't finished startup yet (no block)
+                    try testing.expect(v.state == .startup);
+                    // No commands should be emitted yet
+                    try testing.expectEqual(0, actions.len);
+                }
+            }).check,
+        },
+        // Block arrives second — this should complete startup
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "display-message",
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Should now be in command_queue state
+                    try testing.expect(v.state == .command_queue);
+                    try testing.expectEqual(7, v.session_id);
+                }
+            }).check,
+        },
+        // Receive version response
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
         },
         .{
             .input = .{ .tmux = .exit },
