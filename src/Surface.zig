@@ -1218,11 +1218,15 @@ fn queueIo(
     mutex: termio.Termio.MutexState,
 ) void {
     // In readonly mode, we don't allow any writes through to the pty.
+    // This includes tmux structural commands (split-window, kill-pane,
+    // detach, etc.) which originate from keybindings rather than PTY
+    // input but still mutate the tmux session.
     if (self.readonly) {
         switch (msg) {
             .write_small,
             .write_stable,
             .write_alloc,
+            .tmux_command,
             => return,
 
             else => {},
