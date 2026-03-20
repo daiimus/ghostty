@@ -1443,24 +1443,34 @@ pub const Viewer = struct {
                 // "default" or unknown: leave as-is
             }
 
-            // Set alternate screen saved cursor position
-            if (t.screens.get(.alternate)) |alt_screen| cursor: {
-                const alt_x = std.math.cast(
-                    size.CellCountInt,
-                    data.alternate_saved_x,
-                ) orelse break :cursor;
-                const alt_y = std.math.cast(
-                    size.CellCountInt,
-                    data.alternate_saved_y,
-                ) orelse break :cursor;
+            // Set saved cursor position on the inactive screen.
+            //
+            // tmux's alternate_saved_x/y represents the cursor that was
+            // saved when switching screen modes (mode 1049). When alternate_on
+            // is true, this is the primary screen's cursor that was saved on
+            // entry to alternate mode. When alternate_on is false, this would
+            // apply to the alternate screen (though tmux typically sends
+            // MAX_INT when there's no saved position).
+            {
+                const saved_screen_key: ScreenSet.Key = if (data.alternate_on) .primary else .alternate;
+                if (t.screens.get(saved_screen_key)) |saved_screen| cursor: {
+                    const alt_x = std.math.cast(
+                        size.CellCountInt,
+                        data.alternate_saved_x,
+                    ) orelse break :cursor;
+                    const alt_y = std.math.cast(
+                        size.CellCountInt,
+                        data.alternate_saved_y,
+                    ) orelse break :cursor;
 
-                // If our coordinates are outside our screen we ignore it.
-                // tmux actually sends MAX_INT for when there isn't a set
-                // cursor position, so this isn't theoretical.
-                if (alt_x >= alt_screen.pages.cols or
-                    alt_y >= alt_screen.pages.rows) break :cursor;
+                    // If our coordinates are outside our screen we ignore it.
+                    // tmux actually sends MAX_INT for when there isn't a set
+                    // cursor position, so this isn't theoretical.
+                    if (alt_x >= saved_screen.pages.cols or
+                        alt_y >= saved_screen.pages.rows) break :cursor;
 
-                alt_screen.cursorAbsolute(alt_x, alt_y);
+                    saved_screen.cursorAbsolute(alt_x, alt_y);
+                }
             }
 
             // Set cursor visibility
@@ -4593,6 +4603,90 @@ test "layout_change mid-capture suppresses output for uninitialized pane" {
                     );
                     defer testing.allocator.free(str);
                     try testing.expect(std.mem.containsAtLeast(u8, str, 1, "post-init output"));
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "pane state alternate_saved cursor applies to primary screen" {
+    // When alternate_on=1, the alternate_saved_x/y values represent the
+    // cursor position saved from the primary screen on entry to alternate
+    // mode. They must be applied to the primary screen, not the alternate
+    // screen (which would overwrite the active cursor).
+    var viewer = try Viewer.init(testing.allocator, 80, 24);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Standard startup sequence
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "0",
+            } } },
+            .contains_command = "refresh-client",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Single pane layout
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 1 %0 80 24 b25d,80x24,0,0,0 bash
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // capture-pane pane 0 primary history (empty)
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // capture-pane pane 0 primary visible (empty)
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // capture-pane pane 0 alternate history (empty)
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // capture-pane pane 0 alternate visible (empty)
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // pane_state: alternate_on=1, cursor at (10,2) on alternate screen,
+        // alternate_saved at (5,3) which should go to primary screen.
+        //
+        // Format: pane_id;cursor_x;cursor_y;cursor_flag;cursor_shape;
+        //         cursor_blinking;alternate_on;alternate_saved_x;
+        //         alternate_saved_y;insert_flag;wrap_flag;keypad_flag;
+        //         keypad_cursor_flag;origin_flag;mouse_all_flag;
+        //         mouse_any_flag;mouse_button_flag;mouse_standard_flag;
+        //         mouse_utf8_flag;mouse_sgr_flag;focus_flag;
+        //         bracketed_paste;scroll_region_upper;scroll_region_lower;
+        //         pane_tabs
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\%0;10;2;1;;0;1;5;3;0;1;0;0;0;0;0;0;0;0;0;0;0;0;23;8,16,24,32,40,48,56,64,72,80
+                ,
+            } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
+                    const t: *Terminal = &pane.terminal;
+                    // Terminal should be on alternate screen
+                    try testing.expectEqual(ScreenSet.Key.alternate, t.screens.active_key);
+                    // Active (alternate) cursor should be at (10, 2)
+                    const alt_screen: *Screen = t.screens.get(.alternate).?;
+                    try testing.expectEqual(10, alt_screen.cursor.x);
+                    try testing.expectEqual(2, alt_screen.cursor.y);
+                    // Saved cursor (primary screen) should be at (5, 3)
+                    const pri_screen: *Screen = t.screens.get(.primary).?;
+                    try testing.expectEqual(5, pri_screen.cursor.x);
+                    try testing.expectEqual(3, pri_screen.cursor.y);
                 }
             }).check,
         },
